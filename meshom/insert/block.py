@@ -161,14 +161,23 @@ def harmonic_map(xyA, xyB, bS: Polyline, bN: Polyline, n_cells: int):
     return X, phi, {"fine": [int(Mf + 1), int(Nf + 1)], "aspect_rounds": [[int(m), float(a)] for m, a in rounds]}
 
 
+def side_slopes(L, g) -> np.ndarray:
+    """B201: the size slope per fine row: g, or a pair (side A, side B) split at the narrowest row."""
+    if np.ndim(g) == 0:
+        return np.full(len(L), float(g))
+    i_n = int(np.argmin(L))
+    return np.where(np.arange(len(L)) <= i_n, float(g[0]), float(g[1]))
+
+
 def size_target(X, n_neck, h_cap_a, h_cap_b, g=G_LAYOUT, h_min=0.0):
     """Along the fine lattice: (h (Mf+1,), row length L, centreline arc s, row-mean step ds) (module docstring,
-    step 2); never below h_min (the insert's size floor, B165)."""
+    step 2); never below h_min (the insert's size floor, B165). g: the slope, or (side A, side B) (B201)."""
     L = np.linalg.norm(np.diff(X, axis=1), axis=-1).sum(1)
     ds = np.linalg.norm(np.diff(X, axis=0), axis=-1).mean(1)
     s = np.r_[0, np.cumsum(ds)]
     hreq = L / n_neck
-    h = np.min(hreq[None, :] + g * np.abs(s[:, None] - s[None, :]), axis=1)
+    gr = side_slopes(L, g)
+    h = np.min(hreq[None, :] + gr[:, None] * np.abs(s[:, None] - s[None, :]), axis=1)
     xi = np.linspace(0, 1, len(L))
     return np.maximum(np.minimum(h, h_cap_a + (h_cap_b - h_cap_a) * xi), h_min), L, s, ds
 
@@ -183,7 +192,24 @@ def birth_rows(a: int, b: int) -> int:
     return k
 
 
-def layout(h, L, ds, nA, nB, fixed_count: bool = False):
+def monotone_counts(raw: np.ndarray, nA: int, nB: int, sides=(False, False), i_n: int | None = None) -> np.ndarray:
+    """B200: the count target of a side with a set join count runs monotonically from the neck (row i_n, the
+    shortest row; default the row with the fewest cells) to the join's count: clipped to between the two and made
+    monotone outward from the neck, so equal counts only widen the rows (no columns born and killed again)."""
+    raw = raw.copy()
+    i_n = int(np.argmin(raw)) if i_n is None else int(i_n)
+    rn = float(raw[i_n])
+    for on, idx, nj in ((sides[0], np.arange(i_n, -1, -1), nA), (sides[1], np.arange(i_n, len(raw)), nB)):
+        if not on:
+            continue
+        lo, hi = min(rn, nj), max(rn, nj)
+        v = np.clip(raw[idx], lo, hi)
+        v = np.maximum.accumulate(v) if nj >= rn else np.minimum.accumulate(v)
+        raw[idx] = v
+    return raw
+
+
+def layout(h, L, ds, nA, nB, fixed_count: bool = False, monotone=(False, False)):
     """Rows xi_i and counts N_i (module docstring, step 3). The row count is at least what the birth rule needs to
     go from the join A count down to the fewest cells the target asks for and up to the join B count (with a
     floor-raised target, Denmark's default-floor block got 3 rows for 17 -> 14 -> 17 -> 21 cells, its
@@ -200,6 +226,8 @@ def layout(h, L, ds, nA, nB, fixed_count: bool = False):
         return xi, np.full(M + 1, nA, dtype=int)
     Lr, hr = np.interp(xi, xi_f, L), np.interp(xi, xi_f, h)
     raw = gaussian_filter1d(Lr / hr, SMOOTH_ROWS, mode="nearest") if SMOOTH_ROWS else Lr / hr
+    if any(monotone):
+        raw = monotone_counts(raw, nA, nB, monotone, int(np.argmin(Lr)))
     raw[0], raw[-1] = nA, nB
     want = np.empty(M + 1, int)
     want[0] = nA
@@ -258,13 +286,14 @@ def bend_corners(xy: np.ndarray, region_xy: np.ndarray, deg: float | None = None
     return sorted(out)
 
 
-def _virtual(ids: np.ndarray, corners) -> tuple[np.ndarray, list]:
-    """A fixed row without its corner nodes (B180) and the corner triangles cut off at them."""
+def _virtual(ids: np.ndarray, corners, first: bool = False) -> tuple[np.ndarray, list]:
+    """A fixed row without its corner nodes (B180) and the corner triangles cut off at them; on row 0 (first) the
+    block lies on the other side of the row, so its triangles run the other way (one orientation, B186)."""
     keep = np.ones(len(ids), bool)
     tris = []
     for k in corners:
         keep[k] = False
-        tris.append([ids[k - 1], ids[k], ids[k + 1]])
+        tris.append([ids[k + 1], ids[k], ids[k - 1]] if first else [ids[k - 1], ids[k], ids[k + 1]])
     return ids[keep], tris
 
 
@@ -283,7 +312,7 @@ def topology(N, corners_a=(), corners_b=()):
     corner_tris = []
     for i, cs in ((0, corners_a), (M, corners_b)):
         if len(cs):
-            rows[i], t = _virtual(ids[i], cs)
+            rows[i], t = _virtual(ids[i], cs, first=i == 0)
             keep = np.ones(N[i] + 1, bool)
             keep[list(cs)] = False
             pos[i] = np.flatnonzero(keep)
@@ -470,17 +499,19 @@ def cell_sizes(xy, tris, quads, scale=None) -> np.ndarray:
 
 
 def _upper_envelope(f, s, g):
-    """max over j of f_j - g |s - s_j| (a floor profile whose slope along s is at most g)."""
-    return np.max(f[None, :] - g * np.abs(s[:, None] - s[None, :]), axis=1)
+    """max over j of f_j - g |s - s_j| (a floor profile whose slope along s is at most g; g per row allowed)."""
+    g = np.broadcast_to(np.asarray(g, dtype=float), s.shape)
+    return np.max(f[None, :] - g[:, None] * np.abs(s[:, None] - s[None, :]), axis=1)
 
 
 def build(xyA, xyB, bS: Polyline, bN: Polyline, n_neck: int, fixed_count: bool = False, h_min: float = 0.0,
-          cell_floor: float = 0.0, scale=None, corners=False) -> Block:
+          cell_floor: float = 0.0, scale=None, corners=False, growth=G_LAYOUT, monotone=(False, False)) -> Block:
     """The block of the module docstring: xyA, xyB (n+1,2) the join chains from bank S to bank N (exact host node
     positions), bS / bN the banks from join A to join B. h_min: the size target's floor (m); cell_floor: the floor of
     the cells' mean great-circle edge length (m, step 6; 0 = none); scale: the chart's scale (chart m per sphere m)
     for both (None: chart metres). corners: cut the convex bends of the fixed rows by corner triangles (B180): a bool
-    for both rows or a pair (row A, row B)."""
+    for both rows or a pair (row A, row B). growth: the size target's slope, or (side A, side B) (B201); monotone:
+    (side A, side B) counts run monotonically from the neck to the join's count (B200)."""
     nA, nB = len(xyA) - 1, len(xyB) - 1
     LA = np.linalg.norm(np.diff(xyA, axis=0), axis=1).sum()
     LB = np.linalg.norm(np.diff(xyB, axis=0), axis=1).sum()
@@ -490,7 +521,8 @@ def build(xyA, xyB, bS: Polyline, bN: Polyline, n_neck: int, fixed_count: bool =
     nA_v, nB_v = nA - len(cA), nB - len(cB)                  # the rows zipped next to them (B180)
     X, phi, info = harmonic_map(xyA, xyB, bS, bN, n_neck)
     sc_row = np.asarray(scale(X.reshape(-1, 2))).reshape(X.shape[:2]).max(1) if scale is not None else 1.0
-    h0, L, s, ds = size_target(X, n_neck, LA / nA, LB / nB, h_min=h_min * sc_row)
+    h0, L, s, ds = size_target(X, n_neck, LA / nA, LB / nB, g=growth, h_min=h_min * sc_row)
+    g_rows = side_slopes(L, growth)
     Mf = len(L) - 1
     xi_f = np.linspace(0, 1, Mf + 1)
     cap = LA / nA + (LB / nB - LA / nA) * xi_f                 # step 2's cap: the host size at the joins
@@ -498,7 +530,7 @@ def build(xyA, xyB, bS: Polyline, bN: Polyline, n_neck: int, fixed_count: bool =
     rounds = FLOOR_ROUNDS if cell_floor > 0 else 1
     for rnd in range(rounds):
         h = np.maximum(h0, np.minimum(floor, cap))           # never coarser than the host (then the caller refuses)
-        xi, N = layout(h, L, ds, nA_v, nB_v, fixed_count=fixed_count and nA == nB)
+        xi, N = layout(h, L, ds, nA_v, nB_v, fixed_count=fixed_count and nA == nB, monotone=monotone)
         N = N.copy()
         N[0], N[-1] = nA, nB
         row = np.concatenate([np.full(N[i] + 1, i) for i in range(len(N))])
@@ -523,9 +555,10 @@ def build(xyA, xyB, bS: Polyline, bN: Polyline, n_neck: int, fixed_count: bool =
             lo = max(int(np.searchsorted(xi_f, xi[i])) - 1, 0)
             hi = min(int(np.searchsorted(xi_f, xi[i + 1])) + 1, Mf)
             need[lo:hi + 1] = np.maximum(need[lo:hi + 1], h[lo:hi + 1] * deficit[i])
-        floor = _upper_envelope(np.maximum(floor, need), s, G_LAYOUT)
+        floor = _upper_envelope(np.maximum(floor, need), s, g_rows)
     info.update(rows=int(M), counts=[int(x) for x in N], n_neck_target=int(n_neck),
                 h_min_m=float(h.min()), h_max_m=float(h.max()), neck_row_len_m=float(L.min()),
                 y_splits=int(len(tris) - len(cA) - len(cB)), corners=[[int(k) for k in cA], [int(k) for k in cB]],
-                floor_raised=bool(floor.max() > 0))
+                floor_raised=bool(floor.max() > 0),
+                growth=[float(g) for g in np.atleast_1d(growth)], monotone=[bool(m) for m in monotone])
     return Block(xy, quads, tris, row, off, N, xi, X, h, info)

@@ -41,7 +41,8 @@ docs/config.md has the full description and an example. Tables (units: metres, k
     [[inserts]]  curvilinear inserts fitted into the finished run by `python -m meshom.insert` (not by
               `meshom run`; decisions B158-B169, B180-B185): kind ("strait" | "strip" | "corridor"), name, strait or
               path, mouth_a / mouth_b (join hints), cells or h_fine_m, reach_km, force, stages, ring_rows,
-              bank_sigma_h, width_km and band_km (strip, corridor), ljoins (meshom.config.InsertCfg)
+              bank_sigma_h, width_km and band_km (strip, corridor), ljoins, cells_a / cells_b, growth_a / growth_b,
+              bank_land_cells (B200-B202) (meshom.config.InsertCfg)
     [size]    grad_max (|grad h| limit of the gradient limiter, default 0.1; inf = no limiting), h_min_m / h_max_m
               (optional global clip), preview_deg (UI preview grid), limiter_max_nodes (grid size cap), from (an h
               variant file, relative to the config's folder: its [size] keys and layers first, this table's keys
@@ -250,6 +251,14 @@ class InsertCfg:
                                                        # bad cells next to the coast (B198)
     coast_shift_cells: float = 1.0                     # ... which moves the bank at most this many fine cells from
                                                        # where the base smoothing (bank_sigma_cells) put it
+    cells_a: int | None = None                         # strait: the join of side A / B has exactly this many
+    cells_b: int | None = None                         # edges, the counts run monotonically from the neck to it
+                                                       # (None: any count; B200)
+    growth_a: float | None = None                      # strait: the size slope along the block on side A / B
+    growth_b: float | None = None                      # (dh/ds; None: 0.12); the room and funnel rules scale with it
+                                                       # (B201)
+    bank_land_cells: float = 0.0                       # strait: the real banks may move into land by this many local
+                                                       # insert cells (smoother, squared at the joins; B202)
 
 
 @dataclass

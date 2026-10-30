@@ -70,6 +70,49 @@ STRUCTURED = 0.98                  # B193: a host window is structured when this
                                    # pure-quad valence-4 nodes (ORCA; meshom's own meshes stay below)
 
 
+@dataclass
+class SideRule:
+    """B200 / B201: what the block will do on one side of the neck, for the rules: `cells` = the count of the join
+    row (None: any count, the block's counts follow the size target); `growth` = the size target's slope along the
+    block on this side (dh/ds; block.G_LAYOUT by default). With `cells` the join must have exactly that many edges
+    and the block's counts run monotonically from the neck's count to it (equal counts: the rows only widen), so the
+    funnel rule takes N(s) within those two counts; `growth` scales the room rule's slope and the funnel's ratio
+    (ln 1.15 and ln 1.2 at the default 0.12) by growth / 0.12: a short, fast transition where it is asked for."""
+    cells: int | None = None
+    growth: float | None = None
+
+    @property
+    def scale(self) -> float:
+        from meshom.insert.block import G_LAYOUT
+
+        return 1.0 if self.growth is None else float(self.growth) / G_LAYOUT
+
+    @property
+    def g_rule(self) -> float:
+        return G_RULE * self.scale
+
+    @property
+    def ln_funnel(self) -> float:
+        return float(np.log(FUNNEL_RATIO)) * self.scale
+
+
+def side_target(prof, n: int, rule: "SideRule | None") -> np.ndarray:
+    """The room rule's size target with n cells across the neck and the side's slope (B158, B201)."""
+    if rule is None or rule.growth is None:
+        if n == prof.n_cells:
+            return prof.h_t
+        return cone_min(prof.s, np.where(np.isfinite(prof.W), prof.W / n, np.inf), G_RULE)
+    return cone_min(prof.s, np.where(np.isfinite(prof.W), prof.W / n, np.inf), rule.g_rule)
+
+
+def funnel_counts(Ns: np.ndarray, n_neck: int, rule: "SideRule | None") -> np.ndarray:
+    """B200: the cells across the funnel's sections as the block lays them: the square-cell count W / h, or with a
+    set join count clipped to between the neck's count and the join's (equal counts: the neck's count throughout)."""
+    if rule is None or rule.cells is None:
+        return Ns
+    return np.clip(Ns, min(n_neck, rule.cells), max(n_neck, rule.cells))
+
+
 def structured(g) -> tuple[bool, float]:
     """B193: (structured, share): the share of the window's interior nodes that are pure-quad valence-4 nodes."""
     inner = ~g.boundary
@@ -128,6 +171,9 @@ class Join:
     zig: float = 0.0               # B167: share of inner nodes off a host grid line (0 = tier 1)
     sec: tuple | None = None       # B184: (room index, section indices, widths, opening angles) to re-check the
                                    # room and funnel rules at another cell count
+    square: tuple = ()             # B202: per end, the squared bank end's depth into land over the allowance
+                                   # (<= 1: the end may be squared; empty: no allowance)
+    rule: object = None            # B200 / B201: the side's SideRule (None: the default rules)
 
     @property
     def ok(self) -> bool:
@@ -140,7 +186,8 @@ class Join:
                 "funnel": round(self.funnel, 3), "funnel_at_km": round(self.funnel_at_m / 1e3, 2),
                 "bend": round(self.bend, 3), "bend_cells": self.bend_cells,
                 "bend_wide": round(self.bend_wide, 3), "bend_cell": round(self.bend_cell, 3),
-                "zig": round(self.zig, 3), "fails": self.fails}
+                "zig": round(self.zig, 3), "fails": self.fails,
+                "square": [round(float(v), 3) for v in self.square]}
 
 
 def _nan_smooth(v: np.ndarray, sigma: float) -> np.ndarray:
@@ -365,10 +412,13 @@ def _chain_point(xy: np.ndarray, length: float) -> np.ndarray:
 
 
 def evaluate(side: str, sigma: int, chain: np.ndarray, shape: str, s_join: float, prof: Profile, ch: Chains,
-             axis: Axis, length_m: np.ndarray, bank_fn=None, bank_dir=None, bay_hit=None, leg=None) -> Join:
+             axis: Axis, length_m: np.ndarray, bank_fn=None, bank_dir=None, bay_hit=None, leg=None, rule=None,
+             square=None) -> Join:
     """A candidate join against the three rules (module docstring). bank_dir(end xy, length) -> the point of the
     bank the block will follow `length` from the join end toward the neck (the real coast, B164); None: the host
-    coast."""
+    coast. rule: the side's SideRule (B200, B201). square(end xy, unit chain direction into the join, join cell) ->
+    the squared bank end's depth into land over the allowance (B202): an end whose corner fails the angle passes
+    when it is <= 1."""
     xy = ch.xy[chain]
     n = len(chain) - 1
     hj = float(length_m / max(n, 1))
@@ -378,7 +428,9 @@ def evaluate(side: str, sigma: int, chain: np.ndarray, shape: str, s_join: float
         fails.append("crosses the neck")
     if n < 2:
         fails.append("fewer than 2 join edges")
-    corner, banks = [], []
+    if rule is not None and rule.cells is not None and n != rule.cells:
+        fails.append("count")                          # B200: the join row has the side's count, 1:1
+    corner, banks, sq = [], [], []
     for end, inner in ((0, xy), (len(chain) - 1, xy[::-1])):
         v0 = int(chain[end])
         u = _chain_point(inner, CORNER_CHORD_H * hj) - xy[end]
@@ -396,10 +448,15 @@ def evaluate(side: str, sigma: int, chain: np.ndarray, shape: str, s_join: float
                 v = q - xy[end]
         c = float(np.dot(u, v) / max(np.linalg.norm(u) * np.linalg.norm(v), 1e-12))
         corner.append(float(np.degrees(np.arccos(np.clip(c, -1, 1)))))
+        if square is not None:
+            sq.append(float(square(xy[end], u / max(np.linalg.norm(u), 1e-12), hj)))
         stop = lambda w: abs(float(axis.project(ch.xy[w][None])[0]) - prof.s0) <= prof.h_fine   # noqa: E731
         bank = coast_path(ch.nb, v0, nb[toward], ch.xy, stop, 3.0 * (abs(s_join - prof.s0) + prof.W[prof.i0]))
         banks.append(bank)
-    if not all(np.isfinite(a) and CORNER_DEG[0] <= a <= CORNER_DEG[1] for a in corner):
+    ends_ok = [np.isfinite(a) and CORNER_DEG[0] <= a <= CORNER_DEG[1] for a in corner]
+    if sq and len(sq) == len(ends_ok):                 # B202: a squared end within the allowance passes
+        ends_ok = [e or q <= 1.0 for e, q in zip(ends_ok, sq)]
+    if not all(ends_ok):
         fails.append("corner")
     if bay_hit is not None and bay_hit(xy):                # B166: a join must not cut a bay of the real coast
         fails.append("bay")
@@ -409,15 +466,16 @@ def evaluate(side: str, sigma: int, chain: np.ndarray, shape: str, s_join: float
         near = float(np.min(sigma * (sp - prof.s0)))     # the funnel on the width the L's leg bounds
         k = int(np.argmin(np.abs(prof.s - (prof.s0 + sigma * near))))
         W_use, alpha_use = l_width(prof, *leg)
-    room = float(RATIO * prof.h_t[k] / hj)
+    h_t = side_target(prof, prof.n_cells, rule)
+    room = float(RATIO * h_t[k] / hj)
     if room < 1.0:
         fails.append("room")
     kj = int(np.argmin(np.abs(prof.s - s_join)))
     lo, hi = sorted((prof.i0, kj))
     sec = np.arange(lo, hi + 1)
-    hh = np.minimum(prof.h_t[sec], hj)
-    Ns = W_use[sec] / hh
-    r = alpha_use[sec] / (np.maximum(Ns, 1e-9) * np.log(FUNNEL_RATIO))
+    hh = np.minimum(h_t[sec], hj)
+    Ns = funnel_counts(W_use[sec] / hh, prof.n_cells, rule)
+    r = alpha_use[sec] / (np.maximum(Ns, 1e-9) * (rule.ln_funnel if rule is not None else np.log(FUNNEL_RATIO)))
     r = np.where(np.isfinite(r), r, 0.0)
     j = int(np.argmax(r)) if len(r) else 0
     funnel = float(r[j]) if len(r) else 0.0
@@ -426,7 +484,7 @@ def evaluate(side: str, sigma: int, chain: np.ndarray, shape: str, s_join: float
     bend, need, bw, bc = bend_rule(banks, ch.xy, prof, axis, hj, bank_fn)
     return Join(side, chain, shape, abs(s_join - prof.s0), s_join, ch.tier(chain), n, hj, tuple(corner), room,
                 funnel, float(abs(prof.s[sec[j]] - prof.s0)) if len(sec) else 0.0, fails, bend, need, bw, bc,
-                ch.zig(chain), (k, sec, W_use[sec], alpha_use[sec]))
+                ch.zig(chain), (k, sec, W_use[sec], alpha_use[sec]), tuple(sq), rule)
 
 
 def bend_rule(banks: list, xy: np.ndarray, prof: Profile, axis: Axis, hj: float, bank_fn=None) -> tuple:
@@ -507,7 +565,8 @@ def _shape_points(prof: Profile, axis: Axis, sigma: int, d: float, bulge, span: 
 
 
 def candidates(side: str, prof: Profile, axis: Axis, seg: np.ndarray, coast_seg_nodes: np.ndarray, ch: Chains,
-               sphere_len, h_host: float, reach: float, bank_fn=None, bank_dir=None, bay_hit=None) -> list[Join]:
+               sphere_len, h_host: float, reach: float, bank_fn=None, bank_dir=None, bay_hit=None, rule=None,
+               square=None) -> list[Join]:
     """Every candidate join of one side (module docstring), nearest first."""
     sigma = -1 if side == "A" else 1
     step = 0.25 * h_host
@@ -542,7 +601,7 @@ def candidates(side: str, prof: Profile, axis: Axis, seg: np.ndarray, coast_seg_
                     continue
                 seen.add(key)
                 out.append(evaluate(side, sigma, chain, name, s_k, prof, ch, axis, sphere_len(chain), bank_fn,
-                                    bank_dir, bay_hit))
+                                    bank_dir, bay_hit, rule=rule, square=square))
         d += STEP_H * h_host
     # tier-1 candidates: host grid lines from the coast nodes of this side (B160)
     cn = np.unique(coast_seg_nodes)
@@ -566,13 +625,13 @@ def candidates(side: str, prof: Profile, axis: Axis, seg: np.ndarray, coast_seg_
         seen.add(key)
         s_k = float(sl[np.argmin(np.abs(side_n))])
         out.append(evaluate(side, sigma, line, "gridline", s_k, prof, ch, axis, sphere_len(line), bank_fn, bank_dir,
-                            bay_hit))
+                            bay_hit, rule=rule, square=square))
     out.sort(key=lambda c: c.d_m)
     return out
 
 
 def hinted(side: str, pts_xy: np.ndarray, prof: Profile, axis: Axis, coast_nodes: np.ndarray, ch: Chains,
-           sphere_len, bank_fn=None, bank_dir=None, bay_hit=None) -> Join:
+           sphere_len, bank_fn=None, bank_dir=None, bay_hit=None, rule=None, square=None) -> Join:
     """The join of a hint polyline (its ends snap to the nearest coast nodes; ordered right -> left)."""
     sigma = -1 if side == "A" else 1
     shape = Polyline(pts_xy)
@@ -586,7 +645,8 @@ def hinted(side: str, pts_xy: np.ndarray, prof: Profile, axis: Axis, coast_nodes
     chain = ch.path(a, b, shape)
     if chain is None:
         raise InsertError(f"side {side}: no host edge path follows the hint")
-    return evaluate(side, sigma, chain, "hint", s_mid, prof, ch, axis, sphere_len(chain), bank_fn, bank_dir, bay_hit)
+    return evaluate(side, sigma, chain, "hint", s_mid, prof, ch, axis, sphere_len(chain), bank_fn, bank_dir, bay_hit,
+                    rule=rule, square=square)
 
 
 def choose(cands: list[Join], h_host: float, force: bool, tier1: bool = False) -> Join | None:
@@ -603,6 +663,7 @@ def choose(cands: list[Join], h_host: float, force: bool, tier1: bool = False) -
     if not force or not cands:
         return None
     valid = [c for c in cands if "crosses the neck" not in c.fails and c.n >= 2] or cands
+    valid = [c for c in valid if "count" not in c.fails] or valid        # B200: the side's count first
 
     def violation(c):
         dev = max((max(CORNER_DEG[0] - a, a - CORNER_DEG[1], 0.0) if np.isfinite(a) else 90.0)
@@ -654,7 +715,7 @@ def refusal(side: str, cands: list[Join], prof: Profile, reach: float, h_host: f
                      f"{c.room * c.h_join_m * km:.1f} km there, now {c.h_join_m * km:.1f} km)")
         n_ok = None
         for n2 in range(prof.n_cells - 1, 1, -1):
-            ht = cone_min(prof.s, np.where(np.isfinite(prof.W), prof.W / n2, np.inf), G_RULE)
+            ht = side_target(prof, n2, c.rule)
             k = int(np.argmin(np.abs(prof.s - c.s_m)))
             if RATIO * ht[k] >= c.h_join_m:
                 n_ok = n2
@@ -674,6 +735,15 @@ def refusal(side: str, cands: list[Join], prof: Profile, reach: float, h_host: f
             msg += (f", which needs cells of {prof.W[prof.i0] / need * km:.2f} km, below the size floor h_min_m "
                     f"{prof.h_min * km:.2f} km (at most {prof.n_max} cells): only with a smaller h_min_m")
         fixes.append(msg)
+    c_cnt = [c for c in valid if "count" in c.fails]
+    if c_cnt:                                          # B200: the join count the side asks for
+        want = c_cnt[0].rule.cells
+        right = [c for c in valid if "count" not in c.fails]
+        other = sorted({c.n for c in valid if c.fails == ["count"]})
+        lines.append(f"{len(right)} candidate(s) have the side's {want} edges"
+                     + (f" (failing {sorted({f for c in right for f in c.fails})})" if right else "")
+                     + (f"; candidates passing every other rule have {other} edges: cells_{side.lower()} = one of "
+                        f"them" if other else ""))
     c_bay = [c for c in valid if "bay" in c.fails]
     if len(c_bay) == len(valid):
         fixes.append("every candidate cuts a bay of the real coast: a larger reach_km (joins beyond the bay) or "
@@ -706,7 +776,8 @@ def l_width(prof: Profile, side_l: float, ell: float) -> tuple[np.ndarray, np.nd
 
 
 def candidates_l(side: str, prof: Profile, axis: Axis, seg: np.ndarray, coast_seg_nodes: np.ndarray, ch: Chains,
-                 sphere_len, h_host: float, reach: float, bank_fn=None, bank_dir=None, bay_hit=None) -> list[Join]:
+                 sphere_len, h_host: float, reach: float, bank_fn=None, bank_dir=None, bay_hit=None, rule=None,
+                 square=None) -> list[Join]:
     """B183: L-shaped candidate joins (a strait mouth opening onto a coast, a cape at the mouth): from the axis point
     d beyond the neck a transect toward one side, but only out to ell from the axis (the coast there is farther), then
     a leg back toward the neck, parallel to the axis, to the coast beyond the cape; the region then holds the water
@@ -761,7 +832,7 @@ def candidates_l(side: str, prof: Profile, axis: Axis, seg: np.ndarray, coast_se
                         continue
                     seen.add(key)
                     out.append(evaluate(side, sigma, chain, "L", s_k, prof, ch, axis, sphere_len(chain), bank_fn,
-                                        bank_dir, bay_hit, leg=(side_l, ell)))
+                                        bank_dir, bay_hit, leg=(side_l, ell), rule=rule, square=square))
         d += STEP_H * h_host
     out.sort(key=lambda c: c.d_m)
     return out
@@ -773,11 +844,13 @@ def passes_at(c: Join, prof: Profile, n: int) -> bool:
     if any(f not in ("room", "funnel") for f in c.fails) or c.sec is None:
         return False
     k, sec, Wsec, asec = c.sec
-    ht = cone_min(prof.s, np.where(np.isfinite(prof.W), prof.W / n, np.inf), G_RULE)
+    rule = c.rule
+    ht = side_target(prof, n, rule)
     if RATIO * ht[k] < c.h_join_m:
         return False
     hh = np.minimum(ht[sec], c.h_join_m)
-    r = asec / (np.maximum(Wsec / hh, 1e-9) * np.log(FUNNEL_RATIO))
+    Ns = funnel_counts(Wsec / hh, n, rule)
+    r = asec / (np.maximum(Ns, 1e-9) * (rule.ln_funnel if rule is not None else np.log(FUNNEL_RATIO)))
     r = np.where(np.isfinite(r), r, 0.0)
     return not (len(r) and float(r.max()) > 1.0)
 

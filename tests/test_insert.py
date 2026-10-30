@@ -807,3 +807,105 @@ def test_strip_fields_parse():
     d = spec_from(_build(InsertCfg, parse_inline('name=s; kind="strip"; width_km=50; path=[[0, 0], [0, 1]]'),
                          "insert"))
     assert (d.rows, d.coast_rounds, d.coast_shift_cells) == ("harmonic", 3, 1.0)
+
+
+def test_monotone_counts_only_widen_rows_with_equal_counts():
+    """B200: with a set join count a side's count target runs monotonically from the neck to it: equal counts give
+    the neck's count throughout (no columns born and killed again), a larger join count a non-decreasing run."""
+    raw = np.array([9.0, 8, 7, 6.5, 6, 6.3, 7, 8, 7.5, 7, 6])
+    assert (block.monotone_counts(raw, 6, 6, (True, True), 4) == 6).all()
+    up = block.monotone_counts(raw, 9, 9, (True, True), 4)
+    assert (np.diff(up[4:]) >= 0).all() and (np.diff(up[:5]) <= 0).all() and up.max() <= 9
+    assert np.array_equal(block.monotone_counts(raw, 6, 6, (False, True), 4)[:4], raw[:4])   # side A untouched
+
+
+def test_side_rule_scales_the_room_and_counts_the_funnel(banana):
+    """B200 / B201: a faster side slope reaches the host size nearer the neck (the room rule's target, its slope
+    scaled by growth / 0.12), so more joins near the neck have the room; with a set join count the funnel takes the counts between
+    the neck's and the join's."""
+    from meshom.insert import region
+
+    win, res = banana
+    prof = res.profile
+    fast = region.side_target(prof, prof.n_cells, region.SideRule(None, 0.36))
+    assert np.allclose(region.side_target(prof, prof.n_cells, None), prof.h_t)
+    assert (fast >= prof.h_t - 1e-6).all() and (fast > prof.h_t * 1.5).any()
+    Ns = np.array([4.0, 8.0, 20.0])
+    assert np.array_equal(region.funnel_counts(Ns, 10, region.SideRule(10)), [10, 10, 10])
+    assert np.array_equal(region.funnel_counts(Ns, 10, region.SideRule(14)), [10, 10, 14])
+    assert np.array_equal(region.funnel_counts(Ns, 10, None), Ns)
+    win, ch, path = synth.butterfly(H=H, open_deg=120.0)              # opens fast: W / n grows faster than 0.14
+    quiet = lambda *a, **k: None                 # noqa: E731
+    slow = insert_window(win, Spec("g0", path, cells=6, stages=""), Uniform(H), log=quiet)
+    quick = insert_window(win, Spec("g3", path, cells=6, stages="", growth_a=0.3, growth_b=0.3), Uniform(H),
+                          log=quiet)
+    assert quick.ok and quick.record["valid"]
+    n_room = [sum("room" in c.fails for c in r.candidates) for r in (slow, quick)]
+    assert n_room[1] < n_room[0]                                       # more joins near the neck have the room
+    if slow.ok:
+        assert all(q.d_m <= s.d_m for q, s in zip(quick.joins, slow.joins))
+    assert quick.record["block"]["growth"] == [0.3, 0.3]
+
+
+def test_per_side_join_counts_are_met_one_to_one():
+    """B200: cells_a / cells_b: each join has exactly that many edges and the block's counts run monotonically from
+    the neck to them (equal counts: one count throughout, no Y-split); an unreachable count is refused with the
+    counts the passing candidates have."""
+    win, ch, path, loops = synth.strait_real(H=H, L=400e3)
+    quiet = lambda *a, **k: None                 # noqa: E731
+    r = insert_window(win, Spec("ab", path, cells=10, stages="", cells_a=10, cells_b=10, bank_land_cells=1.0),
+                      Uniform(H), real=loops, log=quiet)
+    assert r.ok and r.record["valid"]
+    assert [j.n for j in r.joins] == [10, 10]
+    assert r.record["block"]["counts"] == [10] * (r.record["block"]["rows"] + 1)
+    assert r.record["block"]["monotone"] == [True, True]
+    bad = insert_window(win, Spec("ab3", path, cells=10, stages="", cells_a=3), Uniform(H), real=loops, log=quiet)
+    assert not bad.ok
+    side_a = [x for x in bad.record["refused"] if x.startswith("side A")][0]
+    assert "the side's 3 edges" in side_a and "cells_a = one of them" in side_a
+
+
+def test_banks_into_land_cut_capes_and_never_enter_the_water():
+    """B202: the into-land move cuts a cape by about the allowance and leaves a pocket (and straight coast) where it
+    was; the moved line never lies on the water side."""
+    from meshom.insert import realcoast as rcm
+
+    x = np.linspace(0.0, 30.0, 601)
+    cape = np.where(np.abs(x - 3) < 1, 1 - np.abs(x - 3), 0.0)          # into the water (left of +x: y > 0)
+    pocket = -np.where(np.abs(x - 10) < 1, 1 - np.abs(x - 10), 0.0)     # into the land
+    q = np.c_[x, cape + pocket]
+    m, d = rcm.into_land(q, False, np.full(len(q), 0.5), np.full(len(q), 0.5))
+    assert (d >= 0).all() and d.max() <= 0.6                            # the last rounding passes D by a fraction
+    assert np.max(m[:, 1][np.abs(m[:, 0] - 3) < 0.3]) < 0.75             # the cape (tip at 1) is cut
+    near = lambda x0: np.abs(m[:, 0] - x0) < 0.2                         # noqa: E731
+    assert np.min(m[near(10), 1]) < -0.8                                # the pocket keeps its line
+    assert np.abs(m[(m[:, 0] > 20) & (m[:, 0] < 26), 1]).max() < 0.02    # so does a straight coast
+
+
+def test_squared_bank_end_leaves_the_join_at_a_right_angle():
+    """B202: an acute end (the coast heads back along the chain) is squared: the bank starts on the join end node at
+    a right angle to the chain and reaches the coast la along; an obtuse end keeps the blend."""
+    from meshom.insert import realcoast as rcm
+
+    t = np.linspace(0.0, 1.0, 400)
+    arc = np.c_[100e3 * t, 30e3 * t]                                    # the coast, 17 deg off the x axis
+    xa, xb = np.array([0.0, 0.0]), arc[-1].copy()
+    ua = np.array([1.0, 0.2])                                           # the chain from xa into the join: acute
+    ub = np.array([0.0, 1.0])                                           # obtuse at xb
+    b, sq = rcm.square_ends(arc, xa, xb, ua, ub, 20e3, 20e3)
+    assert sq == [True, False]
+    assert np.allclose(b[0], xa) and np.allclose(b[-1], xb)
+    d0 = (b[1] - b[0]) / np.linalg.norm(b[1] - b[0])
+    assert abs(np.dot(d0, ua / np.linalg.norm(ua))) < 0.05
+
+
+def test_side_fields_parse():
+    """B200-B202: the per-side counts and slopes and the into-land allowance are [[inserts]] fields."""
+    from meshom.config import InsertCfg, _build
+    from meshom.insert.core import spec_from
+
+    s = spec_from(_build(InsertCfg, parse_inline('name=g; path=[[0, 0], [0, 1]]; cells_a=6; cells_b=9; '
+                                                 'growth_a=0.3; bank_land_cells=1'), "insert"))
+    assert (s.cells_a, s.cells_b, s.growth_a, s.growth_b, s.bank_land_cells) == (6, 9, 0.3, None, 1.0)
+    d = spec_from(_build(InsertCfg, parse_inline('name=g; path=[[0, 0], [0, 1]]'), "insert"))
+    assert (d.cells_a, d.cells_b, d.growth_a, d.growth_b, d.bank_land_cells) == (None, None, None, None, 0.0)

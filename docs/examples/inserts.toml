@@ -1,5 +1,5 @@
 # Curvilinear inserts: a finer structured patch fitted into a mesh that is already built (decisions B158-B169,
-# B180-B199). Nothing here runs by default: `meshom run` never makes an insert; an insert is made only by the command
+# B180-B202). Nothing here runs by default: `meshom run` never makes an insert; an insert is made only by the command
 # below, on any finished run (meshom's own meshes, triangle meshes, ORCA grids).
 #
 # 1. Build or pick a finished run folder (`meshom run CONFIG`; `--mesh NAME` picks another mesh of the folder).
@@ -28,6 +28,19 @@
 name = "gibraltar"
 strait = "Gibraltar"
 cells = 10
+
+# Fitted to an ORCA host side by side: 6 cells across the neck, a near join with 6 host edges on the side where the
+# strait opens fast (a fast transition there), 9 host edges on the other side, the banks free to move up to one local
+# cell into land (smoother banks, squared ends at the joins).
+[[inserts]]
+name = "gibraltar_fitted"
+strait = "Gibraltar"
+cells = 6
+cells_a = 6
+growth_a = 0.3
+cells_b = 9
+growth_b = 0.15
+bank_land_cells = 1.0
 
 [[inserts]]
 name = "denmark"

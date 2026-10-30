@@ -45,6 +45,9 @@ AUTO_DEPTH_RATIO = 1.0       # B190: ... and it reaches at least this x its mout
 NEST_PASSES = 3              # B195: a strip's spine (bridge = "narrow") repeats the pocket search on the bridged coast
                              # this many times, bridging only mouths below AUTO_MOUTH_H cells there: the outer part of
                              # an estuary whose narrows were bridged first
+LAND_ITERS = 30             # B202: rounds of the into-land smoothing (a Gaussian of one local cell, then the line
+                             # put back into its band: today's coast .. bank_land_cells local cells into land)
+LAND_BAY_H = 2.0             # B202: no into-land move within this many local cells of a meshed bay's mouth end
 AUTO_WIDTH_AT = (0.25, 0.5)  # B190: the bay's width (its water across, parallel to the mouth) at these fractions of
                              # its depth, recorded (it does not separate a pocket from a large bay once smoothed)
 
@@ -82,7 +85,9 @@ class RealCoast:
     pieces: list                 # chart (K,2), water on the left
     closed: list                 # bool per piece
     source: str = ""
-    main: list = field(default_factory=list)       # the smoothed pieces with bays bridged
+    main: list = field(default_factory=list)       # the smoothed pieces with bays bridged (and moved into land)
+    base: list = field(default_factory=list)       # B202: main before the into-land move (= main without it)
+    land: dict = field(default_factory=dict)       # B202: the move's record
     smooth: list = field(default_factory=list)     # the smoothed pieces
     bays: list = field(default_factory=list)       # Bay
     _pl: list = field(default_factory=list)
@@ -121,20 +126,21 @@ class RealCoast:
         return np.concatenate(out) if out else np.zeros((0, 2, 2))
 
     def segments(self, which: str = "raw") -> np.ndarray:
-        pcs = {"raw": self.pieces, "smooth": self.smooth, "main": self.main}[which]
+        pcs = {"raw": self.pieces, "smooth": self.smooth, "main": self.main, "base": self.base or self.main}[which]
         return self._segs(pcs, self.closed)
 
     # ------------------------------------------------------------------------------------- smoothing and bays
     def prepare(self, h_loc, w_loc, h_floor: float, sigma_cells: float = SIGMA_CELLS, bays="auto",
-                bridge: str = "all", sigma_mult=None):
+                bridge: str = "all", sigma_mult=None, land_cells: float = 0.0):
         """Smooth every piece at sigma_cells x h_loc and find its bays (module docstring). h_loc, w_loc: callables
         (K,2) -> (K,) of the local cell size and the local channel width (inf where not in a channel). bays: which
         pockets are meshed as bays (`bay_meshed`): "auto" (large ones, B190), True (every one with a mouth of
         MOUTH_MIN_H cells, B166) or False (none: every pocket bridged). bridge: "all" (the main coast takes every
         pocket's chord) or "narrow" (only the pockets not meshed: a coastal strip keeps its bays in its spine,
         B181). sigma_mult: a callable (K,2) -> (K,) multiplying the smoothing width only (a strip's extra smoothing
-        round bad cells, B198)."""
-        self.smooth, self.main, self.bays = [], [], []
+        round bad cells, B198). land_cells: the main coast may move into land by up to this many local cells where
+        that makes it smoother, never into the water beyond it (B202; `into_land`)."""
+        self.smooth, self.main, self.bays, self.base, self.land = [], [], [], [], {}
         step = max(STEP_CELLS * h_floor, 1.0)
         for ip, (p, cl) in enumerate(zip(self.pieces, self.closed)):
             q = _resample(p, cl, step)
@@ -187,14 +193,57 @@ class RealCoast:
                 parts.append(q[last:])
                 q = np.vstack(parts)
             self.main.append(q)
+        if land_cells > 0:
+            self.base = [m.copy() for m in self.main]
+            ends = np.array([e for b in self.bays if b.meshed for e in (b.a, b.b)]).reshape(-1, 2)
+            moved = []
+            for k, (m, cl) in enumerate(zip(self.main, self.closed)):
+                if len(m) < 4:
+                    continue
+                hq = np.asarray(h_loc(m), dtype=float)
+                D = land_cells * hq
+                if len(ends):
+                    dn = np.min(np.linalg.norm(m[:, None] - ends[None], axis=-1), axis=1)
+                    D = D * np.clip(dn / (LAND_BAY_H * hq) - 1.0, 0.0, 1.0)
+                self.main[k], dk = into_land(m, cl, D, hq)
+                moved.append(dk)
+            dmax = max((float(d.max()) for d in moved if len(d)), default=0.0)
+            self.land = {"cells": float(land_cells), "max_m": dmax}
         self._pl = [Polyline(np.vstack([m, m[:1]]) if cl else m) for m, cl in zip(self.main, self.closed)]
+        self._plb = [Polyline(np.vstack([m, m[:1]]) if cl else m) for m, cl in zip(self.base, self.closed)]
         return self
 
+    def depth(self, xy: np.ndarray, which: str = "base") -> np.ndarray:
+        """B202: signed distance of points to the nearest (base or main) coast piece, positive on its land side (the
+        pieces have the water on their left)."""
+        pcs = self.base if (which == "base" and self.base) else self.main
+        xy = np.atleast_2d(xy)
+        best = np.full(len(xy), np.inf)
+        out = np.zeros(len(xy))
+        for m, cl in zip(pcs, self.closed):
+            if len(m) < 2:
+                continue
+            pl = Polyline(np.vstack([m, m[:1]]) if cl else m)
+            sp = pl.project(xy)
+            foot = pl.at(sp)
+            t = pl.tangent(sp, max(1e-3 * pl.L, 1.0))
+            d = np.linalg.norm(xy - foot, axis=1)
+            cr = t[:, 0] * (xy[:, 1] - foot[:, 1]) - t[:, 1] * (xy[:, 0] - foot[:, 0])
+            near = d < best
+            best = np.where(near, d, best)
+            out = np.where(near, np.where(cr > 0, -d, d), out)
+        return out
+
     # ------------------------------------------------------------------------------------------ banks
-    def nearest(self, xy: np.ndarray) -> tuple[int, float, float]:
+    def _pls(self, which: str = "main") -> list:
+        if which == "base" and self.base:
+            return self._plb
+        return self._pl
+
+    def nearest(self, xy: np.ndarray, which: str = "main") -> tuple[int, float, float]:
         """(piece, arc length on its main polyline, distance) of the main coast point nearest to xy."""
         best = (-1, 0.0, np.inf)
-        for k, pl in enumerate(self._pl):
+        for k, pl in enumerate(self._pls(which)):
             if pl.L <= 0:
                 continue
             s = float(pl.project(xy[None])[0])
@@ -213,15 +262,16 @@ class RealCoast:
             return [pl.at((s + dist) % pl.L)[0], pl.at((s - dist) % pl.L)[0]]
         return [pl.at(min(s + dist, pl.L))[0], pl.at(max(s - dist, 0.0))[0]]
 
-    def arc(self, xa: np.ndarray, xb: np.ndarray, guide: np.ndarray | None = None) -> tuple[np.ndarray | None, str]:
+    def arc(self, xa: np.ndarray, xb: np.ndarray, guide: np.ndarray | None = None,
+            which: str = "main") -> tuple[np.ndarray | None, str]:
         """The main coast from the point nearest to xa to the point nearest to xb (both on one piece; on a closed
         piece the way nearer to `guide`, the host's bank), blended at both ends onto xa and xb exactly (BLEND_H
         join cells; the caller passes the join cell sizes through `blend`). Returns (polyline or None, why)."""
-        ka, sa, _ = self.nearest(xa)
-        kb, sb, _ = self.nearest(xb)
+        ka, sa, _ = self.nearest(xa, which)
+        kb, sb, _ = self.nearest(xb, which)
         if ka < 0 or ka != kb:
             return None, "the two ends lie on different coast pieces"
-        pl = self._pl[ka]
+        pl = self._pls(which)[ka]
         if not self.closed[ka]:
             ways = [_sub(pl, sa, sb)]
         else:
@@ -233,6 +283,47 @@ class RealCoast:
             gp = Polyline(guide)
             ways.sort(key=lambda w: float(np.mean(Polyline(w).distance(gp.xy))) + float(np.mean(gp.distance(w))))
         return ways[0], ""
+
+
+def into_land(q: np.ndarray, closed: bool, D: np.ndarray, h: np.ndarray, iters: int | None = None):
+    """B202: the coast q (water on its left) moved into land by at most D (per point of q) where a smoother line lies
+    there, never into the water: each round smooths the line with a Gaussian of one local cell h along the arc, then
+    puts every point back into the band between q and D into land: a point on the water side of q goes to its
+    nearest point of q, a point farther than D (taken at that nearest point) into land is pulled back to D along the
+    same direction (a smoothing inside a band: capes are cut by up to D, pockets keep today's line; nearest points,
+    not offsets along normals, so tight corners of q make no loops); a last Gaussian of one cell rounds the corners
+    where the band held the line (it may pass D there by a fraction of a cell, never into the water). Returns (the
+    moved line, its depth into land per point)."""
+    base = Polyline(np.vstack([q, q[:1]]) if closed else q)
+    Db = np.r_[D, D[:1]] if closed else D
+    eps = max(1e-3 * base.L, 1.0)
+
+    def place(p, cap=True):
+        sp = base.project(p)
+        foot = base.at(sp)
+        t = base.tangent(sp, eps)
+        v = p - foot
+        d = np.linalg.norm(v, axis=1)
+        land = t[:, 0] * v[:, 1] - t[:, 1] * v[:, 0] < 0                 # right of the coast: land
+        lim = np.interp(sp, base.s, Db) if cap else np.full(len(p), np.inf)
+        f = np.where(land, np.minimum(1.0, lim / np.maximum(d, 1e-12)), 0.0)
+        return foot + f[:, None] * v, np.where(land, np.minimum(d, lim), 0.0)
+
+    hb = np.r_[h, h[:1]] if closed else h
+
+    def step(x, cap=True):                             # resampled evenly (a Gaussian alone gathers the points at the
+        pl = Polyline(np.vstack([x, x[:1]]) if closed else x)          # corners), smoothed at the local cell
+        u = pl.at(np.linspace(0.0, pl.L, len(q) + (1 if closed else 0)))
+        u = u[:-1] if closed else u
+        hx = np.interp(base.project(u), base.s, hb)
+        su = _arc(u, closed)
+        per = float(su[-1] + (np.linalg.norm(u[0] - u[-1]) if closed else 0.0))
+        return place(_smooth_var(u, su, hx, closed, per), cap)
+
+    x = q.copy()
+    for _ in range(LAND_ITERS if iters is None else iters):
+        x, _ = step(x)
+    return step(x, cap=False)                          # the corners where the band held the line, rounded
 
 
 def bay_widths(arc: np.ndarray, fracs) -> tuple:
@@ -305,6 +396,46 @@ def blend_ends(arc: np.ndarray, xa: np.ndarray, xb: np.ndarray, la: float, lb: f
     out = arc + wa[:, None] * (xa - arc[0]) + wb[:, None] * (xb - arc[-1])
     out[0], out[-1] = xa, xb
     return out
+
+
+def hermite_end(p0: np.ndarray, u: np.ndarray, q1: np.ndarray, t1: np.ndarray, m: int = 32) -> np.ndarray:
+    """B202: a bank's squared end: the cubic Hermite curve from the join end p0, leaving it at a right angle to the
+    join chain (u: the chain's direction into the join; the normal toward q1 taken), to the coast point q1 with the
+    coast's direction t1 there; tangents scaled by the chord |q1 - p0|. (m+1, 2) points."""
+    c = float(np.linalg.norm(q1 - p0))
+    u = u / max(np.linalg.norm(u), 1e-12)
+    t0 = np.array([-u[1], u[0]])
+    if np.dot(t0, q1 - p0) < 0:
+        t0 = -t0
+    t1 = t1 / max(np.linalg.norm(t1), 1e-12)
+    w = np.linspace(0.0, 1.0, m + 1)[:, None]
+    h00, h10, h01, h11 = 2 * w ** 3 - 3 * w ** 2 + 1, w ** 3 - 2 * w ** 2 + w, -2 * w ** 3 + 3 * w ** 2, w ** 3 - w ** 2
+    return h00 * p0 + h10 * c * t0 + h01 * q1 + h11 * c * t1
+
+
+def square_ends(arc: np.ndarray, xa: np.ndarray, xb: np.ndarray, ua: np.ndarray, ub: np.ndarray, la: float,
+                lb: float) -> tuple[np.ndarray, list]:
+    """B202: the bank arc (the coast from near xa to near xb) blended onto xa and xb (blend_ends), its ends squared
+    where the coast meets the join chain at an acute angle (the coast point la (lb) along the arc lies on the
+    chain's inner side): there the first la (last lb) of arc length is replaced by hermite_end from the join end
+    node, at a right angle to its join chain (ua, ub: each chain's direction into the join from that end), onto the
+    coast with its direction; such an end moves into land. An obtuse end keeps the blend (squaring it would move the
+    bank into the water). Returns (the bank, [end A squared, end B squared])."""
+    b = blend_ends(arc, xa, xb, la, lb)
+    pl = Polyline(b)
+    la, lb = min(la, 0.45 * pl.L), min(lb, 0.45 * pl.L)
+    step = max(float(np.median(np.linalg.norm(np.diff(pl.xy, axis=0), axis=1))), 1e-6)
+    eps = max(min(step, 0.05 * la, 0.05 * lb), 1e-6)
+    qa, qb = pl.at([la, pl.L - lb])
+    sq = [bool(np.dot(ua, qa - xa) > 0), bool(np.dot(ub, qb - xb) > 0)]
+    head = pl.xy[pl.s <= la] if not sq[0] else hermite_end(xa, ua, qa, pl.at([la + eps])[0] - qa,
+                                                           max(int(np.ceil(la / step)), 8))
+    tail = pl.xy[pl.s >= pl.L - lb] if not sq[1] else hermite_end(xb, ub, qb, qb - pl.at([pl.L - lb - eps])[0],
+                                                                  max(int(np.ceil(lb / step)), 8))[::-1]
+    mid = pl.xy[(pl.s > la) & (pl.s < pl.L - lb)]
+    out = np.vstack([head, mid, tail])
+    out[0], out[-1] = xa, xb
+    return out, sq
 
 
 def _sub(pl: Polyline, s0: float, s1: float, wrap: float | None = None) -> np.ndarray:

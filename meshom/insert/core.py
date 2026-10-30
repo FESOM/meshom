@@ -50,6 +50,11 @@ class Spec:
     rows: str = "harmonic"                   # B195-B198: a strip's rows: "harmonic" (a harmonic map) | "offset" (B181)
     coast_rounds: int = 3                    # B198: rounds of extra coast smoothing round bad cells (harmonic strip)
     coast_shift_cells: float = 1.0           # B198: the extra smoothing moves the bank at most this many fine cells
+    cells_a: int | None = None               # B200: the join count of side A / B (None: any, today's rules)
+    cells_b: int | None = None
+    growth_a: float | None = None            # B201: the size slope along the block on side A / B (None: 0.12)
+    growth_b: float | None = None
+    bank_land_cells: float = 0.0             # B202: the banks may move into land by this many local insert cells
 
 
 @dataclass
@@ -106,7 +111,7 @@ def spec_from(cfg_entry, cfg=None) -> Spec:
                 e.stages, e.ring_rows, e.bank_sigma_h, e.bank_cap_h, e.collar_rings, e.clean_h, e.h_min_m, e.coast,
                 e.coast_source, e.bank_sigma_cells, e.bays, e.kind, e.width_km * 1e3 if e.width_km else None,
                 e.band_km * 1e3 if e.band_km is not None else None, e.ljoins, e.rows, e.coast_rounds,
-                e.coast_shift_cells)
+                e.coast_shift_cells, e.cells_a, e.cells_b, e.growth_a, e.growth_b, e.bank_land_cells)
 
 
 def _path_frame(path: np.ndarray):
@@ -164,16 +169,25 @@ def insert_window(win: Window, spec: Spec, h_run, tol=0.20, gates=None, log=prin
         rc = rcm.RealCoast.from_loops(real, chart, c, win_r + 2 * h_host, spec.coast_source or "run")
         if not rc.pieces:
             rc = None
+    rules = {"A": None, "B": None}                     # B200 / B201: per-side join counts and size slopes
+    for sd, nj, gr in (("A", spec.cells_a, spec.growth_a), ("B", spec.cells_b, spec.growth_b)):
+        if nj is not None or gr is not None:
+            rules[sd] = region.SideRule(nj, gr)
+    g_side = tuple(r.growth if r is not None and r.growth is not None else block.G_LAYOUT
+                   for r in (rules["A"], rules["B"]))
     if rc is not None:
         t = time.perf_counter()
         prof1 = region.width_profile(axis, rc.segments("raw"), in_water, h_host, spec.cells, spec.h_fine_m, h_min)
+        ht1 = np.where(prof1.s < prof1.s0, region.side_target(prof1, prof1.n_cells, rules["A"]),
+                       region.side_target(prof1, prof1.n_cells, rules["B"]))
 
         def h_loc(q):
             s = axis.project(q)
             k = np.clip(np.searchsorted(prof1.s, s), 0, len(prof1.s) - 1)
             lat = np.linalg.norm(q - prof1.xy[k], axis=1)
             W = np.where(np.isfinite(prof1.W[k]), prof1.W[k], 0.0)
-            h = prof1.h_t[k] + block.G_LAYOUT * np.maximum(0.0, lat - 0.5 * W)
+            g = np.where(prof1.s[k] < prof1.s0, g_side[0], g_side[1])
+            h = ht1[k] + g * np.maximum(0.0, lat - 0.5 * W)
             return np.clip(np.where(np.isfinite(h), h, h_host), prof1.h_fine, h_host)
 
         def w_loc(q):
@@ -183,12 +197,13 @@ def insert_window(win: Window, spec: Spec, h_run, tol=0.20, gates=None, log=prin
             W = prof1.W[k]
             return np.where(np.isfinite(W) & (lat <= W), W, np.inf)
 
-        rc.prepare(h_loc, w_loc, prof1.h_fine, spec.bank_sigma_cells, spec.bays)
+        rc.prepare(h_loc, w_loc, prof1.h_fine, spec.bank_sigma_cells, spec.bays, land_cells=spec.bank_land_cells)
         rec["real_coast"] = {"source": rc.source, "pieces": len(rc.pieces),
                              "raw_neck_km": float(prof1.W[prof1.i0] / 1e3),
                              "bays_found": [b.record() | {"mouth_lonlat": [round(float(v[0]), 4) for v in xyz_to_lonlat(
                                  chart.inv((0.5 * (b.a + b.b))[None]))]} for b in rc.bays],
-                             "prepare_s": time.perf_counter() - t}
+                             "prepare_s": time.perf_counter() - t,
+                             "land": rc.land or None}
         prof_seg = rc.segments("main")
     else:
         prof_seg = seg
@@ -240,6 +255,23 @@ def insert_window(win: Window, spec: Spec, h_run, tol=0.20, gates=None, log=prin
             dn = [abs(float(axis.project(q[None])[0]) - prof.s0) for q in pts]
             return pts[int(np.argmin(dn))]
 
+    square = None
+    if rc is not None and spec.bank_land_cells > 0:
+        def square(p, u, hj):                          # B202: the squared bank end's depth into land / allowance
+            L = rcm.BLEND_H * hj
+            pts = rc.walk(p, L)
+            if not pts:
+                return np.inf
+            dn = [abs(float(axis.project(q[None])[0]) - prof.s0) for q in pts]
+            q1 = pts[int(np.argmin(dn))]
+            if np.dot(u, q1 - p) <= 0:                 # an obtuse end is not squared (it would go into the water)
+                return np.inf
+            pts2 = rc.walk(p, L + 0.25 * hj)
+            q2 = pts2[int(np.argmin([abs(float(axis.project(q[None])[0]) - prof.s0) for q in pts2]))]
+            curve = rcm.hermite_end(p, u, q1, q2 - q1)
+            dep = rc.depth(curve, "base")
+            return float(np.max(dep / np.maximum(spec.bank_land_cells * h_loc(curve), 1.0)))
+
     bay_hit = None
     if rc is not None and any(b.meshed for b in rc.bays):
         from meshom.insert.geom import point_in_polygon
@@ -258,15 +290,15 @@ def insert_window(win: Window, spec: Spec, h_run, tol=0.20, gates=None, log=prin
     for side, hint in (("A", spec.mouth_a), ("B", spec.mouth_b)):
         if hint is not None:
             j = region.hinted(side, chart.fwd(hint), prof, axis, coast_nodes, ch, sphere_len, bank_fn, bank_dir,
-                              bay_hit)
+                              bay_hit, rule=rules[side], square=square)
             cs = [j]
         else:
             cs = region.candidates(side, prof, axis, seg, win.coast_edges, ch, sphere_len, h_host, reach, bank_fn,
-                                   bank_dir, bay_hit)
+                                   bank_dir, bay_hit, rule=rules[side], square=square)
             j = region.choose(cs, h_host, False, rec["host"]["structured"])
             if j is None and spec.ljoins:                       # B183: L-joins when no plain join passes
                 cl = region.candidates_l(side, prof, axis, seg, win.coast_edges, ch, sphere_len, h_host, reach,
-                                         bank_fn, bank_dir, bay_hit)
+                                         bank_fn, bank_dir, bay_hit, rule=rules[side], square=square)
                 jl = region.choose(cl, h_host, False, rec["host"]["structured"])
                 cs = cs + cl
                 if jl is not None:
@@ -298,8 +330,9 @@ def insert_window(win: Window, spec: Spec, h_run, tol=0.20, gates=None, log=prin
     seed = int(stm.locate(mesh, chart.inv(prof.xy[prof.i0][None]), tree)[0])
     reg = assemble.region_between(mesh, seed, [cA, cB], win.kind)
     bS_ids, bN_ids = assemble.banks(mesh, reg, cA, cB)
-    banks_xy, bank_src = [], []
-    for ids in (bS_ids, bN_ids):
+    banks_xy, bank_src, base_xy, squared = [], [], [], []
+    inward = ((xy[cA[1]] - xy[cA[0]], xy[cB[1]] - xy[cB[0]]), (xy[cA[-2]] - xy[cA[-1]], xy[cB[-2]] - xy[cB[-1]]))
+    for ids, (ua, ub) in zip((bS_ids, bN_ids), inward):
         b = None
         if rc is not None:
             arc, why = rc.arc(xy[ids[0]], xy[ids[-1]], guide=xy[ids])
@@ -307,7 +340,15 @@ def insert_window(win: Window, spec: Spec, h_run, tol=0.20, gates=None, log=prin
             if arc is not None and Polyline(arc).L > 3.0 * host_len + 4 * h_host:
                 arc, why = None, "the real coast between the ends is far longer than the host's (around an island)"
             if arc is not None:
-                b = rcm.blend_ends(arc, xy[ids[0]], xy[ids[-1]], rcm.BLEND_H * jA.h_join_m, rcm.BLEND_H * jB.h_join_m)
+                la, lb = rcm.BLEND_H * jA.h_join_m, rcm.BLEND_H * jB.h_join_m
+                if spec.bank_land_cells > 0:           # B202: square ends, today's bank kept for the measures
+                    arc = trim_to_joins(arc, xy[cA], xy[cB])
+                    b, sq = rcm.square_ends(arc, xy[ids[0]], xy[ids[-1]], ua, ub, la, lb)
+                    squared.append(sq)
+                    a0, _ = rc.arc(xy[ids[0]], xy[ids[-1]], guide=xy[ids], which="base")
+                    base_xy.append(rcm.blend_ends(a0, xy[ids[0]], xy[ids[-1]], la, lb) if a0 is not None else None)
+                else:
+                    b = rcm.blend_ends(arc, xy[ids[0]], xy[ids[-1]], la, lb)
                 bank_src.append("real")
             else:
                 bank_src.append(f"host ({why})")
@@ -317,10 +358,17 @@ def insert_window(win: Window, spec: Spec, h_run, tol=0.20, gates=None, log=prin
                 bank_src.append("host")
         banks_xy.append(b)
     rec["banks"] = bank_src
+    if len(base_xy) == 2 and all(b is not None for b in base_xy):
+        rec["bank_land"] = land_record(rc, chart, xy[cA], xy[cB], banks_xy, base_xy) | {"squared": squared}
+        log(f"[insert {spec.name}] banks into land: max {rec['bank_land']['max_km']:.2f} km, water added "
+            f"{rec['bank_land']['added_km2']:.1f} km^2 (removed {rec['bank_land']['removed_km2']:.1f} km^2)",
+            flush=True)
     bS, bN = Polyline(banks_xy[0]), Polyline(banks_xy[1])
     t = time.perf_counter()
     blk = block.build(xy[cA], xy[cB], bS, bN, prof.n_cells, h_min=h_min, cell_floor=h_min, scale=chart.scale,
-                      corners=(jA.shape == "L", jB.shape == "L"))       # B180: corner triangles at an L's bend
+                      corners=(jA.shape in ("L", "hint"), jB.shape in ("L", "hint")),   # B180 / B203: at a bend
+                      growth=g_side if any(r is not None for r in rules.values()) else block.G_LAYOUT,
+                      monotone=(spec.cells_a is not None, spec.cells_b is not None))       # B200, B201
     rec["timing"]["block_s"] = time.perf_counter() - t
     rec["block"] = blk.info
     log(f"[insert {spec.name}] block: {blk.M} rows, counts {blk.N.min()}-{blk.N.max()}, {len(blk.tris)} Y-splits, "
@@ -338,7 +386,7 @@ def insert_window(win: Window, spec: Spec, h_run, tol=0.20, gates=None, log=prin
     rec["merge"] = {"removed_host_elems": int(reg.sum()), "block_quads": int(m.block_q.sum()),
                     "block_tris": int(m.block_t.sum()), "inverted_block_cells": m.inverted}
     sp, sh = net.samples
-    h_ins = assemble.InsertH(h_run, chart.inv(sp), sh, block.G_LAYOUT)
+    h_ins = assemble.InsertH(h_run, chart.inv(sp), sh, max(g_side))     # B201: the faster side's slope
     bsx = net.bank_s if net.bank_s is not None else banks_xy[0]
     bnx = net.bank_n if net.bank_n is not None else banks_xy[1]
     outline = np.vstack([xy[cA], bnx, xy[cB][::-1], bsx[::-1]])
@@ -438,6 +486,52 @@ def insert_window(win: Window, spec: Spec, h_run, tol=0.20, gates=None, log=prin
     res = Result(True, rec, out, m.mesh, win, chart, prof, joins, cands, outline, h_ins, case)
     res.real, res.ring_out = rc, ring_out
     return res
+
+
+def trim_to_joins(arc: np.ndarray, xyA: np.ndarray, xyB: np.ndarray) -> np.ndarray:
+    """B202: a moved coast can pass a join's coast end node on the outer side, so the coast point nearest to the node
+    lies beyond the join: the bank arc is cut where it crosses join A in its first half (it starts there) and join B
+    in its second half (it ends there)."""
+    segA = np.stack([xyA[:-1], xyA[1:]], axis=1)
+    segB = np.stack([xyB[:-1], xyB[1:]], axis=1)
+    n = len(arc)
+    k, p, _ = region.first_crossing(arc[::-1], segA)       # the last crossing with join A
+    if k >= 0 and n - 2 - k < n // 2:
+        arc = np.vstack([p[None], arc[n - 1 - k:]])
+    n = len(arc)
+    k, p, _ = region.first_crossing(arc, segB)
+    if k >= 0 and k >= n // 2:
+        arc = np.vstack([arc[:k + 1], p[None]])
+    return arc
+
+
+def land_record(rc, chart: Chart, xyA, xyB, banks, base) -> dict:
+    """B202: how far the insert's banks moved into land from today's banks (the smoothed real coast, blended onto the
+    join ends) and the water area this adds and removes between the joins (sphere km, chart lengths over the chart
+    scale)."""
+    from meshom.insert.geom import point_in_polygon
+
+    dep = []
+    for b, b0, right in ((banks[0], base[0], True), (banks[1], base[1], False)):     # bank S: land on its right
+        pl = Polyline(b0)
+        sp = pl.project(b)
+        foot, t = pl.at(sp), pl.tangent(sp, max(1e-3 * pl.L, 1.0))
+        cr = t[:, 0] * (b[:, 1] - foot[:, 1]) - t[:, 1] * (b[:, 0] - foot[:, 0])
+        d = np.linalg.norm(b - foot, axis=1)
+        dep.append(np.where((cr < 0) == right, d, -d))
+    dep = np.concatenate(dep)
+    sc = float(np.mean(chart.scale(np.vstack(banks))))
+    new = np.vstack([xyA, banks[1], xyB[::-1], banks[0][::-1]])
+    old = np.vstack([xyA, base[1], xyB[::-1], base[0][::-1]])
+    lo, hi = np.minimum(new.min(0), old.min(0)), np.maximum(new.max(0), old.max(0))
+    step = max(float(np.min(hi - lo)) / 400.0, 50.0)
+    gx, gy = np.meshgrid(np.arange(lo[0], hi[0], step), np.arange(lo[1], hi[1], step))
+    g = np.c_[gx.ravel(), gy.ravel()]
+    a, b = point_in_polygon(g, new), point_in_polygon(g, old)
+    cell = (step / sc) ** 2 / 1e6
+    return {"max_km": float(max(dep.max(), 0.0) * 1e-3 / sc), "into_water_km": float(max(-dep.min(), 0.0) * 1e-3 / sc),
+            "added_km2": float((a & ~b).sum() * cell), "removed_km2": float((b & ~a).sum() * cell),
+            "coast_max_km": float(rc.land.get("max_m", 0.0) * 1e-3 / sc)}
 
 
 def collar_record(host: Mesh, reg: np.ndarray, m, case, ring_out: Mesh, out: Mesh, h_host: float, rings: int,

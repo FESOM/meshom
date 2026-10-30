@@ -67,6 +67,9 @@ h_min_m = 1000.0                   # the size floor (default: the host mesh's sm
 | `width_km`, `band_km` | | strip: coast to the host chain; corridor: the full width; the fine band's width |
 | `rows` | `"harmonic"` | strip rows from a harmonic map of the band: they cannot cross (B195-B197); `"offset"` can fold and is then invalid |
 | `coast_rounds`, `coast_shift_cells` | 3, 1 | harmonic strips: extra coast smoothing round quads above 125°, moving the coast at most 1 fine cell (B198) |
+| `cells_a`, `cells_b` | any | strait: the join of side A / B has exactly this many host edges, the counts run monotonically from the neck to it (B200) |
+| `growth_a`, `growth_b` | 0.12 | strait: the size slope along the block on side A / B; the room and funnel rules scale with it (B201) |
+| `bank_land_cells` | 0 | strait: the real banks may move up to this many local cells into land (smoother, ends squared at acute joins) (B202) |
 | `stages` | `"d,b,e,a"` | the clean-up stages on the join ring ([`cleanup.md`](cleanup.md); B162) |
 | `force` | false | build with the least-violating joins when none passes |
 
@@ -100,7 +103,7 @@ depth by the run's rules) when the run wrote model files.
 
 ## Config keys used
 
-- `[[inserts]]`: `name`, `kind`, `strait`, `path`, `cells`, `h_fine_m`, `h_min_m`, `reach_km`, `mouth_a`, `mouth_b`, `ljoins`, `bays`, `collar_rings`, `coast`, `coast_source`, `bank_sigma_cells`, `width_km`, `band_km`, `rows`, `coast_rounds`, `coast_shift_cells`, `stages`, `force`
+- `[[inserts]]`: `name`, `kind`, `strait`, `path`, `cells`, `h_fine_m`, `h_min_m`, `reach_km`, `mouth_a`, `mouth_b`, `ljoins`, `bays`, `collar_rings`, `coast`, `coast_source`, `bank_sigma_cells`, `width_km`, `band_km`, `rows`, `coast_rounds`, `coast_shift_cells`, `cells_a`, `cells_b`, `growth_a`, `growth_b`, `bank_land_cells`, `stages`, `force`
 
 ## Sources
 

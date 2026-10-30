@@ -645,9 +645,17 @@ levels. Every preset but ORCA025 takes the strait edits by place where the strai
 ### `[[inserts]]` (`python -m meshom.insert`)
 
 Curvilinear inserts are fitted into a finished run afterwards (`python -m meshom.insert --run RUN_DIR --config
-FILE.toml`), not by `meshom run` (decisions B158-B169, B180-B186, B190-B199). `kind = "strait"` (default): a strait
+FILE.toml`), not by `meshom run` (decisions B158-B169, B180-B186, B190-B202). `kind = "strait"` (default): a strait
 (`strait` or `path`, `cells` or `h_fine_m`, `reach_km`, join hints `mouth_a` / `mouth_b`, `ljoins`); refused inserts say
-which rule fails and which cell counts both sides accept. `bays = "auto"` (default) gives a bay of the real coast a
+which rule fails and which cell counts both sides accept. A strait can be fitted to its host side by side (all off by
+default): `cells_a` / `cells_b` ask for a join with exactly that many host edges on side A / B, the block's counts
+running monotonically from the neck to it (equal counts: the rows only widen, no Y-split); `growth_a` / `growth_b` set
+the size slope along the block on that side (default 0.12; the room and funnel rules scale with it), so a short, fast
+transition is allowed where a strait opens fast; `bank_land_cells` lets the real banks move into land by up to that
+many local insert cells where a smoother line lies there (capes cut, never into the water beyond the smoothed coast)
+and squares a bank's end where it meets its join at an acute angle (the record's `bank_land`: how far the banks moved
+and the water added; the added water gets its depth by the run's bathymetry rules, from the grid's ocean cells round
+it and at least the depth floor). `bays = "auto"` (default) gives a bay of the real coast a
 block of its own when its mouth holds 3 insert cells and the bay reaches at least its mouth's width inland; smaller
 pockets and lagoons are bridged (`true`: every bay with a mouth of 2 cells; `false`: none). `collar_rings`: on meshom's
 own meshes and triangle hosts the host cells within this many element rings of the joins (default 10) are cleaned

@@ -59,6 +59,8 @@ class Spec:
     fill_rows: int | None = None             # B204: rows of the strip behind a fill line (None: by its depth)
     corner_steps: bool = False               # B206: a hinted join cuts every convex step of its staircase
     widen: bool = False                      # B207: target lowered where a block cell > 1.1 x host; counts not capped
+    corner_split: bool = False               # B208: corner triangles split at the diagonal's midpoint (a block node)
+    join_margin: float = 1.0                 # B209: the size target's cap at the joins in host cell sizes
 
 
 @dataclass
@@ -116,7 +118,7 @@ def spec_from(cfg_entry, cfg=None) -> Spec:
                 e.coast_source, e.bank_sigma_cells, e.bays, e.kind, e.width_km * 1e3 if e.width_km else None,
                 e.band_km * 1e3 if e.band_km is not None else None, e.ljoins, e.rows, e.coast_rounds,
                 e.coast_shift_cells, e.cells_a, e.cells_b, e.growth_a, e.growth_b, e.bank_land_cells,
-                [_ll(f) for f in e.fill], e.fill_rows, e.corner_steps, e.widen)
+                [_ll(f) for f in e.fill], e.fill_rows, e.corner_steps, e.widen, e.corner_split, e.join_margin)
 
 
 def _path_frame(path: np.ndarray):
@@ -376,7 +378,8 @@ def insert_window(win: Window, spec: Spec, h_run, tol=0.20, gates=None, log=prin
                       growth=g_side if any(r is not None for r in rules.values()) else block.G_LAYOUT,
                       monotone=(spec.cells_a is not None, spec.cells_b is not None),       # B200, B201
                       steps=(spec.corner_steps and jA.shape == "hint", spec.corner_steps and jB.shape == "hint"),
-                      widen=spec.widen)                                                    # B207
+                      widen=spec.widen,                                                    # B207
+                      split=spec.corner_split, margin=spec.join_margin)                    # B208, B209
     rec["timing"]["block_s"] = time.perf_counter() - t
     rec["block"] = blk.info
     log(f"[insert {spec.name}] block: {blk.M} rows, counts {blk.N.min()}-{blk.N.max()}, {len(blk.tris)} Y-splits, "

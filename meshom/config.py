@@ -42,7 +42,8 @@ docs/config.md has the full description and an example. Tables (units: metres, k
               `meshom run`; decisions B158-B169, B180-B185): kind ("strait" | "strip" | "corridor"), name, strait or
               path, mouth_a / mouth_b (join hints), cells or h_fine_m, reach_km, force, stages, ring_rows,
               bank_sigma_h, width_km and band_km (strip, corridor), ljoins, cells_a / cells_b, growth_a / growth_b,
-              bank_land_cells (B200-B202), fill, fill_rows (B204), corner_steps (B206), widen (B207)
+              bank_land_cells (B200-B202), fill, fill_rows (B204), corner_steps (B206), widen (B207),
+              corner_split (B208), join_margin (B209)
               (meshom.config.InsertCfg)
     [size]    grad_max (|grad h| limit of the gradient limiter, default 0.1; inf = no limiting), h_min_m / h_max_m
               (optional global clip), preview_deg (UI preview grid), limiter_max_nodes (grid size cap), from (an h
@@ -271,6 +272,11 @@ class InsertCfg:
                                                        # above 1.1 x the host cell (more columns and rows); with
                                                        # cells_a / cells_b the counts may rise above the neck's and the
                                                        # join's and come back to the join's count before the join (B207)
+    corner_split: bool = False                         # strait: each corner triangle of a join is split at the
+                                                       # midpoint of its diagonal, a node of the block's first row:
+                                                       # two triangles of ~0.8 x the host cell, no long diagonal (B208)
+    join_margin: float = 1.0                           # strait: the block's size target at the joins is capped at this
+                                                       # times the host cell size (B209)
 
 
 @dataclass

@@ -32,6 +32,11 @@ on the left bank "N"). Steps:
    WIDEN_CAP x the host size, at most WIDEN_ROUNDS rounds (the floor wins over it): where the harmonic map fans out
    (the outer bank of a bend, a convex bank corner) the rows get more columns and more rows, and the counts come back
    to the join's count before the join (the birth rule of step 3).
+8. Split corners (B208, an option): each corner triangle of a fixed row (B180, B206) is split at the midpoint of its
+   diagonal into two triangles, and the midpoint takes the corner node's place in the row the block is built on
+   (step 1's Dirichlet chain, the zipped row 0 / M): the block's first row meets the row's full count of segments,
+   the diagonal halves, not the diagonals. Join margin (B209, an option): step 2's cap at the joins is that factor
+   times the host size, so the outermost rows are a little finer than the host.
 """
 from dataclasses import dataclass, field
 
@@ -328,6 +333,27 @@ def _virtual(ids: np.ndarray, corners, first: bool = False) -> tuple[np.ndarray,
     return ids[keep], tris
 
 
+def split_chain(xy: np.ndarray, corners) -> np.ndarray:
+    """B208: a fixed row with each corner node replaced by the midpoint of the chord between its two neighbours
+    (corners at least 2 nodes apart, never an end node)."""
+    out = np.array(xy, dtype=np.float64, copy=True)
+    for k in corners:
+        out[k] = 0.5 * (xy[k - 1] + xy[k + 1])
+    return out
+
+
+def split_corner_tris(ids: np.ndarray, corners, first: bool, nxt: int) -> tuple[list, list]:
+    """B208: the two triangles of each split corner of a fixed row (ids: the row's node ids, the corner's place
+    holding the midpoint node; the corner node itself gets the new id nxt, nxt + 1, ...), oriented as _virtual's
+    corner triangle. Returns (triangles, corner node ids)."""
+    tris, cn = [], []
+    for j, k in enumerate(corners):
+        c, m, a, b = nxt + j, ids[k], ids[k - 1], ids[k + 1]
+        tris += [[b, c, m], [m, c, a]] if first else [[a, c, m], [m, c, b]]
+        cn.append(c)
+    return tris, cn
+
+
 def topology(N, corners_a=(), corners_b=()):
     """(row node ids, quads, tris, vertical links) in labels (module docstring, step 4). corners_a / corners_b: node
     indices of row 0 / row M that are convex bends (B180): the corner node is cut off by a triangle (its two
@@ -506,6 +532,15 @@ class Block:
     fine_xy: np.ndarray          # (Mf+1, Nf+1, 2) the harmonic map lattice
     fine_h: np.ndarray           # (Mf+1,) the size target per fine row (m, chart)
     info: dict = field(default_factory=dict)
+    join_a: np.ndarray | None = None   # B208: ids of join A's host nodes in chain order (None: row 0)
+    join_b: np.ndarray | None = None   # B208: ids of join B's host nodes in chain order (None: row M)
+
+    def joins(self) -> tuple[np.ndarray, np.ndarray]:
+        """Local ids of the two join chains' host nodes (chain order)."""
+        M = self.M
+        ia = np.arange(self.off[0], self.off[0] + self.N[0] + 1) if self.join_a is None else self.join_a
+        ib = np.arange(self.off[M], self.off[M] + self.N[M] + 1) if self.join_b is None else self.join_b
+        return ia, ib
 
     @property
     def M(self) -> int:
@@ -537,7 +572,7 @@ def _upper_envelope(f, s, g):
 
 def build(xyA, xyB, bS: Polyline, bN: Polyline, n_neck: int, fixed_count: bool = False, h_min: float = 0.0,
           cell_floor: float = 0.0, scale=None, corners=False, growth=G_LAYOUT, monotone=(False, False),
-          rows: int | None = None, steps=(False, False), widen=False) -> Block:
+          rows: int | None = None, steps=(False, False), widen=False, split=False, margin: float = 1.0) -> Block:
     """The block of the module docstring: xyA, xyB (n+1,2) the join chains from bank S to bank N (exact host node
     positions), bS / bN the banks from join A to join B. h_min: the size target's floor (m); cell_floor: the floor of
     the cells' mean great-circle edge length (m, step 6; 0 = none); scale: the chart's scale (chart m per sphere m)
@@ -547,7 +582,9 @@ def build(xyA, xyB, bS: Polyline, bN: Polyline, n_neck: int, fixed_count: bool =
     None: by the size target); steps: (row A, row B) cut every convex step of a staircase row, not only its bends
     over CORNER_W edges (B206; with corners on); widen: a bool for both sides or a pair (side A, side B): on that
     side the counts are not held between the neck's and the join's (B200) and the layout rounds lower the target
-    where a cell exceeds WIDEN_CAP x the host size (step 7, B207)."""
+    where a cell exceeds WIDEN_CAP x the host size (step 7, B207); split: a bool for both rows or a pair (row A, row
+    B): split the corner triangles at their diagonal's midpoint, a node of the block's row (step 8, B208); margin: the
+    cap at the joins in host sizes (step 8, B209)."""
     nA, nB = len(xyA) - 1, len(xyB) - 1
     widen = widen if isinstance(widen, tuple) else (bool(widen), bool(widen))
     LA = np.linalg.norm(np.diff(xyA, axis=0), axis=1).sum()
@@ -556,14 +593,20 @@ def build(xyA, xyB, bS: Polyline, bN: Polyline, n_neck: int, fixed_count: bool =
     sa, sb = steps
     cA = (bend_corners(xyA, xyB.mean(0), w=1, gap=2) if sa else bend_corners(xyA, xyB.mean(0))) if ca_on else []
     cB = (bend_corners(xyB, xyA.mean(0), w=1, gap=2) if sb else bend_corners(xyB, xyA.mean(0))) if cb_on else []
-    nA_v, nB_v = nA - len(cA), nB - len(cB)                  # the rows zipped next to them (B180)
-    X, phi, info = harmonic_map(xyA, xyB, bS, bN, n_neck)
+    spa, spb = split if isinstance(split, tuple) else (split, split)
+    sA, sB = (cA if spa else []), (cB if spb else [])        # B208: the split corners
+    tA, tB = ([] if spa else cA), ([] if spb else cB)        # the corners cut by one triangle (B180)
+    xyA_r = split_chain(xyA, sA) if len(sA) else xyA         # B208: the rows the block is built on
+    xyB_r = split_chain(xyB, sB) if len(sB) else xyB
+    nA_v, nB_v = nA - len(tA), nB - len(tB)                  # the rows zipped next to them (B180)
+    X, phi, info = harmonic_map(xyA_r, xyB_r, bS, bN, n_neck)
     sc_row = np.asarray(scale(X.reshape(-1, 2))).reshape(X.shape[:2]).max(1) if scale is not None else 1.0
-    h0, L, s, ds = size_target(X, n_neck, LA / nA, LB / nB, g=growth, h_min=h_min * sc_row)
+    h0, L, s, ds = size_target(X, n_neck, margin * LA / nA, margin * LB / nB, g=growth, h_min=h_min * sc_row)
     g_rows = side_slopes(L, growth)
     Mf = len(L) - 1
     xi_f = np.linspace(0, 1, Mf + 1)
-    cap = LA / nA + (LB / nB - LA / nA) * xi_f                 # step 2's cap: the host size at the joins
+    host_f = LA / nA + (LB / nB - LA / nA) * xi_f              # the host size at the joins, linear between them
+    cap = margin * host_f                                    # step 2's cap (B209: margin x the host size)
     floor = np.zeros(Mf + 1)
     ceil = np.full(Mf + 1, np.inf)                           # B207: the target's ceiling from the widen rounds
     i_nf = int(np.argmin(L))
@@ -580,11 +623,21 @@ def build(xyA, xyB, bS: Polyline, bN: Polyline, n_neck: int, fixed_count: bool =
         N[0], N[-1] = nA, nB
         row = np.concatenate([np.full(N[i] + 1, i) for i in range(len(N))])
         M = len(N) - 1
-        ids, quads, tris, vert = topology(N, cA, cB)
+        ids, quads, tris, vert = topology(N, tA, tB)
         eta, off = eta_solve(N, vert, np.arange(nA + 1) / nA, np.arange(nB + 1) / nB)
         xy = phi(np.c_[np.clip(xi[row], 0, 1), np.clip(eta, 0, 1)])
-        xy[off[0]:off[0] + nA + 1] = xyA
-        xy[off[M]:off[M] + nB + 1] = xyB
+        xy[off[0]:off[0] + nA + 1] = xyA_r
+        xy[off[M]:off[M] + nB + 1] = xyB_r
+        join_a = join_b = None
+        if len(sA) or len(sB):                               # B208: the corner nodes appended, two triangles each
+            ta, na = split_corner_tris(ids[0], sA, True, len(xy))
+            tb, nb = split_corner_tris(ids[M], sB, False, len(xy) + len(sA))
+            xy = np.vstack([xy, xyA[sA].reshape(-1, 2), xyB[sB].reshape(-1, 2)])
+            row = np.r_[row, np.zeros(len(sA), int), np.full(len(sB), M)]
+            tris = np.vstack([tris, np.array(ta + tb, dtype=np.int64).reshape(-1, 3)])
+            join_a, join_b = ids[0].copy(), ids[M].copy()
+            join_a[list(sA)] = na
+            join_b[list(sB)] = nb
         if cell_floor <= 0 and not wide.any():
             break
         sz = cell_sizes(xy, tris, quads, scale)
@@ -596,7 +649,7 @@ def build(xyA, xyB, bS: Polyline, bN: Polyline, n_neck: int, fixed_count: bool =
         excess = np.zeros(M)                                 # B207: per row interval, largest cell / its cap
         if wide.any():
             xm = 0.5 * (xi[1:] + xi[:-1])
-            host = np.interp(xm, xi_f, cap) / np.interp(xm, xi_f, np.broadcast_to(sc_row, xi_f.shape))
+            host = np.interp(xm, xi_f, host_f) / np.interp(xm, xi_f, np.broadcast_to(sc_row, xi_f.shape))
             np.maximum.at(excess, np.minimum(rc, M - 1), sz / (WIDEN_CAP * host[np.minimum(rc, M - 1)]))
             excess[~np.interp(xm, xi_f, wide.astype(float)).astype(bool)] = 0.0
             info["widen_rounds"] = rnd
@@ -622,8 +675,10 @@ def build(xyA, xyB, bS: Polyline, bN: Polyline, n_neck: int, fixed_count: bool =
             ceil = np.minimum(ceil, -_upper_envelope(top, s, g_rows))
     info.update(rows=int(M), counts=[int(x) for x in N], n_neck_target=int(n_neck),
                 h_min_m=float(h.min()), h_max_m=float(h.max()), neck_row_len_m=float(L.min()),
-                y_splits=int(len(tris) - len(cA) - len(cB)), corners=[[int(k) for k in cA], [int(k) for k in cB]],
+                y_splits=int(len(tris) - len(tA) - len(tB) - 2 * (len(sA) + len(sB))),
+                corners=[[int(k) for k in cA], [int(k) for k in cB]], split=[bool(len(sA)), bool(len(sB))],
+                margin=float(margin),
                 floor_raised=bool(floor.max() > 0), ceiling_lowered=bool(np.isfinite(ceil).any()),
                 growth=[float(g) for g in np.atleast_1d(growth)], monotone=[bool(m) for m in monotone],
                 widen=[bool(w) for w in widen])
-    return Block(xy, quads, tris, row, off, N, xi, X, h, info)
+    return Block(xy, quads, tris, row, off, N, xi, X, h, info, join_a, join_b)

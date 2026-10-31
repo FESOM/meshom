@@ -72,6 +72,8 @@ h_min_m = 1000.0                   # the size floor (default: the host mesh's sm
 | `bank_land_cells` | 0 | strait: the real banks may move up to this many local cells into land (smoother, ends squared at acute joins) (B202) |
 | `fill`, `fill_rows` | none, by depth | strait: lines `[[[lon, lat], ...], ...]` that cut water off a bank: the bank follows a line where it lies at least half a local cell off the coast, the water behind it becomes a strip of its own, `fill_rows` rows (default its depth / the local cell, at least 1) (B204) |
 | `corner_steps` | false | strait: a join from a hint cuts every convex step of its host staircase by a corner triangle, not only its bends (B206) |
+| `corner_split` | false | strait: each corner triangle of a join is split at the midpoint of its diagonal, the midpoint a node of the block's first row: two triangles of ~0.8 x the host cell instead of one of 1.14 x and a diagonal edge of 1.41 host edges (B208) |
+| `join_margin` | 1.0 | strait: the block's size target at the joins is capped at this many host cell sizes (0.85: the outermost rows a little finer than the host) (B209) |
 | `widen` | false | strait: where a block cell is above 1.1 x the host cell the size target is lowered (more columns and rows); on a side with `cells_a` / `cells_b` the counts may then rise above the neck's and the join's and come back to the join's count before the join (B207); it helps where the block fans out at a bank's turn, not at a staircase join's diagonal steps |
 | `stages` | `"d,b,e,a"` | the clean-up stages on the join ring ([`cleanup.md`](cleanup.md); B162) |
 | `force` | false | build with the least-violating joins when none passes |
@@ -106,7 +108,7 @@ depth by the run's rules) when the run wrote model files.
 
 ## Config keys used
 
-- `[[inserts]]`: `name`, `kind`, `strait`, `path`, `cells`, `h_fine_m`, `h_min_m`, `reach_km`, `mouth_a`, `mouth_b`, `ljoins`, `bays`, `collar_rings`, `coast`, `coast_source`, `bank_sigma_cells`, `width_km`, `band_km`, `rows`, `coast_rounds`, `coast_shift_cells`, `cells_a`, `cells_b`, `growth_a`, `growth_b`, `bank_land_cells`, `fill`, `fill_rows`, `corner_steps`, `widen`, `stages`, `force`
+- `[[inserts]]`: `name`, `kind`, `strait`, `path`, `cells`, `h_fine_m`, `h_min_m`, `reach_km`, `mouth_a`, `mouth_b`, `ljoins`, `bays`, `collar_rings`, `coast`, `coast_source`, `bank_sigma_cells`, `width_km`, `band_km`, `rows`, `coast_rounds`, `coast_shift_cells`, `cells_a`, `cells_b`, `growth_a`, `growth_b`, `bank_land_cells`, `fill`, `fill_rows`, `corner_steps`, `corner_split`, `join_margin`, `widen`, `stages`, `force`
 
 ## Sources
 

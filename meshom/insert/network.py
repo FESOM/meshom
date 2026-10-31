@@ -238,8 +238,7 @@ def build(blk, bank_s: Polyline, bank_n: Polyline, bays: list, chart_scale, h_mi
     T = np.vstack(tris) if sum(len(t) for t in tris) else np.zeros((0, 3), np.int64)
     sp = np.vstack([s[0] for s in samples])
     sh = np.concatenate([s[1] for s in samples])
-    ia = np.arange(blk.off[0], blk.off[0] + blk.N[0] + 1)
-    ib = np.arange(blk.off[M], blk.off[M] + blk.N[M] + 1)
+    ia, ib = blk.joins()                                  # B208: the join chains' host nodes
     net = Net(xy, Q.astype(np.int64), T.astype(np.int64), ia, ib, np.concatenate(core_q), np.concatenate(core_t), blk,
               recs, (sp, sh), banks_out["S"], banks_out["N"], fine_bad)
     return net
@@ -282,8 +281,7 @@ def from_block(blk, ring_rows: int, chart_scale) -> Net:
     M = blk.M
     rq = np.minimum(blk.row[blk.quads].min(1), M)
     rt = blk.row[blk.tris].min(1) if len(blk.tris) else np.zeros(0, int)
-    ia = np.arange(blk.off[0], blk.off[0] + blk.N[0] + 1)
-    ib = np.arange(blk.off[M], blk.off[M] + blk.N[M] + 1)
+    ia, ib = blk.joins()                                  # B208: the join chains' host nodes
     return Net(blk.xy, blk.quads, blk.tris, ia, ib, (rq >= ring_rows) & (rq < M - ring_rows),
                (rt >= ring_rows) & (rt < M - ring_rows), blk, [], _samples(blk, chart_scale),
                fine_inverted=fine_inverted(blk.fine_xy))

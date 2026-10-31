@@ -645,7 +645,7 @@ levels. Every preset but ORCA025 takes the strait edits by place where the strai
 ### `[[inserts]]` (`python -m meshom.insert`)
 
 Curvilinear inserts are fitted into a finished run afterwards (`python -m meshom.insert --run RUN_DIR --config
-FILE.toml`), not by `meshom run` (decisions B158-B169, B180-B186, B190-B207). `kind = "strait"` (default): a strait
+FILE.toml`), not by `meshom run` (decisions B158-B169, B180-B186, B190-B209). `kind = "strait"` (default): a strait
 (`strait` or `path`, `cells` or `h_fine_m`, `reach_km`, join hints `mouth_a` / `mouth_b`, `ljoins`); refused inserts say
 which rule fails and which cell counts both sides accept. A strait can be fitted to its host side by side (all off by
 default): `cells_a` / `cells_b` ask for a join with exactly that many host edges on side A / B, the block's counts
@@ -664,7 +664,12 @@ it lies at least half a local insert cell off the coast the main block's bank fo
 found on that stretch included) is meshed as a strip of its own hanging off that bank, `fill_rows` rows deep (default
 its depth / the local cell, at least 1), its columns fewer by Y-splits where the coast behind is shorter; where the line
 comes closer to the coast than half a cell the bank stays on the coast. `corner_steps = true` cuts every convex step
-of a hinted join's host staircase by a corner triangle, not only its bends over two edges. The cell count across the
+of a hinted join's host staircase by a corner triangle, not only its bends over two edges; `corner_split = true`
+splits each corner triangle of a join at the midpoint of its diagonal, the midpoint a node of the block's first row (two
+triangles of ~0.8 x the host cell and no long diagonal edge next to the block); `join_margin` (default 1.0) caps the
+block's size target at the joins at that many host cell sizes, so the outermost rows are a little finer than the host
+(with both, 0.85 and `widen`, a staircase join at Gibraltar keeps the insert's cells within 1 % of the host cell next to
+them, at the cost of a size step of up to ~1.4 across the join). The cell count across the
 narrowest row is the requested `cells` (the count smoothing never lifts it). `bays = "auto"` (default) gives a bay of the real coast a
 block of its own when its mouth holds 3 insert cells and the bay reaches at least its mouth's width inland; smaller
 pockets and lagoons are bridged (`true`: every bay with a mouth of 2 cells; `false`: none). `collar_rings`: on meshom's

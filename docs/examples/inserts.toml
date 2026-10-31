@@ -1,5 +1,5 @@
 # Curvilinear inserts: a finer structured patch fitted into a mesh that is already built (decisions B158-B169,
-# B180-B207). Nothing here runs by default: `meshom run` never makes an insert; an insert is made only by the command
+# B180-B209). Nothing here runs by default: `meshom run` never makes an insert; an insert is made only by the command
 # below, on any finished run (meshom's own meshes, triangle meshes, ORCA grids).
 #
 # 1. Build or pick a finished run folder (`meshom run CONFIG`; `--mesh NAME` picks another mesh of the folder).
@@ -55,13 +55,13 @@ bank_land_cells = 1.0
 fill = [[[-1.25, 49.60], [-0.5, 49.65], [0.0, 49.72], [0.3, 49.77], [0.5, 49.88], [1.0, 49.90], [1.3, 50.05], [1.6, 50.18]],
         [[1.05, 51.42], [1.25, 51.55], [1.45, 51.68], [1.50, 51.85], [1.50, 52.10]]]
 
-# Wider rows: the same strait with 6 cells across the neck and `widen`: the Channel join keeps its 6 host edges, but
-# where the rows are long (the Channel west of Dover, the bank's turn at the Somme) the block gets more columns and
-# rows, so its cells stay near the host's size, and the counts come back to 6 before the join.
+# Wider rows: the same strait with `widen`: the Channel join keeps its 6 host edges, but where the rows are long (the
+# Channel west of Dover, the bank's turn at the Somme) the block gets more columns and rows, so its cells stay near the
+# host's size, and the counts come back to 6 before the join.
 [[inserts]]
-name = "dover_widened"
+name = "dover"
 path = [[-1.9, 50.15], [-0.6, 50.35], [0.7, 50.65], [1.45, 51.0], [2.1, 51.45], [2.9, 51.95], [3.2, 52.6]]
-cells = 6
+cells = 5
 reach_km = 450.0
 cells_a = 6
 cells_b = 11
@@ -69,6 +69,26 @@ widen = true
 bank_land_cells = 1.0
 fill = [[[-1.25, 49.60], [-0.5, 49.65], [0.0, 49.72], [0.3, 49.77], [0.5, 49.88], [1.0, 49.90], [1.3, 50.05], [1.6, 50.18]],
         [[1.05, 51.42], [1.25, 51.55], [1.45, 51.68], [1.50, 51.85], [1.50, 52.10]]]
+
+# Split corners: the Atlantic join of Gibraltar along the host's staircase far out (a hint; every step cut by a corner
+# triangle), each corner triangle split at its diagonal's midpoint, the size target 0.85 x the host cell at the joins,
+# a slower slope on the Mediterranean side and wider rows where the block fans out: the insert's cells stay within 1 %
+# of the host cell next to them (before the corner split: up to 1.17 x), with a size step of up to ~1.4 across the join.
+[[inserts]]
+name = "gibraltar_split"
+strait = "Gibraltar"
+cells = 5
+reach_km = 500.0
+cells_b = 8
+growth_b = 0.10
+bank_land_cells = 1.0
+corner_steps = true
+corner_split = true
+join_margin = 0.85
+widen = true
+force = true
+mouth_a = [[-6.549, 34.321], [-6.992, 34.547], [-7.357, 34.849], [-7.625, 35.213], [-7.781, 35.618], [-7.817, 36.041],
+           [-7.729, 36.459], [-7.523, 36.849], [-7.212, 37.189]]
 
 [[inserts]]
 name = "denmark"

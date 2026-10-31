@@ -645,7 +645,7 @@ levels. Every preset but ORCA025 takes the strait edits by place where the strai
 ### `[[inserts]]` (`python -m meshom.insert`)
 
 Curvilinear inserts are fitted into a finished run afterwards (`python -m meshom.insert --run RUN_DIR --config
-FILE.toml`), not by `meshom run` (decisions B158-B169, B180-B186, B190-B202). `kind = "strait"` (default): a strait
+FILE.toml`), not by `meshom run` (decisions B158-B169, B180-B186, B190-B206). `kind = "strait"` (default): a strait
 (`strait` or `path`, `cells` or `h_fine_m`, `reach_km`, join hints `mouth_a` / `mouth_b`, `ljoins`); refused inserts say
 which rule fails and which cell counts both sides accept. A strait can be fitted to its host side by side (all off by
 default): `cells_a` / `cells_b` ask for a join with exactly that many host edges on side A / B, the block's counts
@@ -655,7 +655,14 @@ transition is allowed where a strait opens fast; `bank_land_cells` lets the real
 many local insert cells where a smoother line lies there (capes cut, never into the water beyond the smoothed coast)
 and squares a bank's end where it meets its join at an acute angle (the record's `bank_land`: how far the banks moved
 and the water added; the added water gets its depth by the run's bathymetry rules, from the grid's ocean cells round
-it and at least the depth floor). `bays = "auto"` (default) gives a bay of the real coast a
+it and at least the depth floor). `fill = [[[lon, lat], ...], ...]` (strait; none by default) draws lines that cut
+water off a bank: each line's ends move onto the nearest real coast, the line is smoothed as the banks are, and where
+it lies at least half a local insert cell off the coast the main block's bank follows it; the water behind it (bays
+found on that stretch included) is meshed as a strip of its own hanging off that bank, `fill_rows` rows deep (default
+its depth / the local cell, at least 1), its columns fewer by Y-splits where the coast behind is shorter; where the line
+comes closer to the coast than half a cell the bank stays on the coast. `corner_steps = true` cuts every convex step
+of a hinted join's host staircase by a corner triangle, not only its bends over two edges. The cell count across the
+narrowest row is the requested `cells` (the count smoothing never lifts it). `bays = "auto"` (default) gives a bay of the real coast a
 block of its own when its mouth holds 3 insert cells and the bay reaches at least its mouth's width inland; smaller
 pockets and lagoons are bridged (`true`: every bay with a mouth of 2 cells; `false`: none). `collar_rings`: on meshom's
 own meshes and triangle hosts the host cells within this many element rings of the joins (default 10) are cleaned

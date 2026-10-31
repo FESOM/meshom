@@ -55,6 +55,9 @@ class Spec:
     growth_a: float | None = None            # B201: the size slope along the block on side A / B (None: 0.12)
     growth_b: float | None = None
     bank_land_cells: float = 0.0             # B202: the banks may move into land by this many local insert cells
+    fill: list = field(default_factory=list)  # B204: fill lines, each (K,3) unit vectors: the bank follows them
+    fill_rows: int | None = None             # B204: rows of the strip behind a fill line (None: by its depth)
+    corner_steps: bool = False               # B206: a hinted join cuts every convex step of its staircase
 
 
 @dataclass
@@ -111,7 +114,8 @@ def spec_from(cfg_entry, cfg=None) -> Spec:
                 e.stages, e.ring_rows, e.bank_sigma_h, e.bank_cap_h, e.collar_rings, e.clean_h, e.h_min_m, e.coast,
                 e.coast_source, e.bank_sigma_cells, e.bays, e.kind, e.width_km * 1e3 if e.width_km else None,
                 e.band_km * 1e3 if e.band_km is not None else None, e.ljoins, e.rows, e.coast_rounds,
-                e.coast_shift_cells, e.cells_a, e.cells_b, e.growth_a, e.growth_b, e.bank_land_cells)
+                e.coast_shift_cells, e.cells_a, e.cells_b, e.growth_a, e.growth_b, e.bank_land_cells,
+                [_ll(f) for f in e.fill], e.fill_rows, e.corner_steps)
 
 
 def _path_frame(path: np.ndarray):
@@ -197,7 +201,8 @@ def insert_window(win: Window, spec: Spec, h_run, tol=0.20, gates=None, log=prin
             W = prof1.W[k]
             return np.where(np.isfinite(W) & (lat <= W), W, np.inf)
 
-        rc.prepare(h_loc, w_loc, prof1.h_fine, spec.bank_sigma_cells, spec.bays, land_cells=spec.bank_land_cells)
+        rc.prepare(h_loc, w_loc, prof1.h_fine, spec.bank_sigma_cells, spec.bays, land_cells=spec.bank_land_cells,
+                   fill=[chart.fwd(f) for f in spec.fill])
         rec["real_coast"] = {"source": rc.source, "pieces": len(rc.pieces),
                              "raw_neck_km": float(prof1.W[prof1.i0] / 1e3),
                              "bays_found": [b.record() | {"mouth_lonlat": [round(float(v[0]), 4) for v in xyz_to_lonlat(
@@ -368,13 +373,14 @@ def insert_window(win: Window, spec: Spec, h_run, tol=0.20, gates=None, log=prin
     blk = block.build(xy[cA], xy[cB], bS, bN, prof.n_cells, h_min=h_min, cell_floor=h_min, scale=chart.scale,
                       corners=(jA.shape in ("L", "hint"), jB.shape in ("L", "hint")),   # B180 / B203: at a bend
                       growth=g_side if any(r is not None for r in rules.values()) else block.G_LAYOUT,
-                      monotone=(spec.cells_a is not None, spec.cells_b is not None))       # B200, B201
+                      monotone=(spec.cells_a is not None, spec.cells_b is not None),       # B200, B201
+                      steps=(spec.corner_steps and jA.shape == "hint", spec.corner_steps and jB.shape == "hint"))
     rec["timing"]["block_s"] = time.perf_counter() - t
     rec["block"] = blk.info
     log(f"[insert {spec.name}] block: {blk.M} rows, counts {blk.N.min()}-{blk.N.max()}, {len(blk.tris)} Y-splits, "
         f"fine lattice {blk.info['fine']} ({rec['timing']['block_s']:.0f} s)", flush=True)
     if rc is not None and any(b.meshed for b in rc.bays):
-        net = network.build(blk, bS, bN, rc.bays, chart.scale, h_min, spec.ring_rows, log)
+        net = network.build(blk, bS, bN, rc.bays, chart.scale, h_min, spec.ring_rows, log, fill_rows=spec.fill_rows)
     else:
         net = network.from_block(blk, spec.ring_rows, chart.scale)
     rec["bays"] = net.bays

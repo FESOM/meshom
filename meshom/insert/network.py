@@ -129,7 +129,7 @@ def _bank_nodes(blk, side: str) -> np.ndarray:
 
 
 def build(blk, bank_s: Polyline, bank_n: Polyline, bays: list, chart_scale, h_min: float = 0.0, ring_rows: int = 2,
-          log=print, clean_bays: bool = True) -> Net:
+          log=print, clean_bays: bool = True, fill_rows: int | None = None) -> Net:
     """The network of the main block `blk` (meshom.insert.block.Block, banks bank_s / bank_n: the main coast with
     the bays bridged) and its bays (meshom.insert.realcoast.Bay of the window; those whose two mouth ends lie on a
     bank are used)."""
@@ -195,10 +195,16 @@ def build(blk, bank_s: Polyline, bank_n: Polyline, bays: list, chart_scale, h_mi
         hp = Polyline(head)
         h_mouth = float(np.mean(np.linalg.norm(np.diff(mouth, axis=0), axis=1)))
         n_head = int(min(n, max(2, round(hp.L / h_mouth))))      # B166: a narrowing bay loses columns (Y-splits)
+        rows = None
+        if bay.fill >= 0:                                 # B204: the strip behind a fill line: its rows by its depth,
+            rows = fill_rows if fill_rows is not None else max(1, int(round(bay.depth_m / h_mouth)))
+            while n_head < n and blockmod.birth_rows(n, n_head) > rows:      # its column changes within them
+                n_head += 1
         head_xy = hp.at(np.linspace(0, hp.L, n_head + 1))
         try:
             bb = blockmod.build(mouth, head_xy, Polyline(wall_a), Polyline(wall_b), n, fixed_count=n_head == n,
-                                h_min=max(h_min, BAY_H_FLOOR * h_mouth), cell_floor=h_min, scale=chart_scale)
+                                h_min=max(h_min, BAY_H_FLOOR * h_mouth), cell_floor=h_min, scale=chart_scale,
+                                rows=rows)
         except Exception as ex:                           # a degenerate bay: report and leave it out
             rec["status"] = f"failed ({type(ex).__name__}: {ex}); its water is left out"
             recs.append(rec)

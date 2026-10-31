@@ -47,6 +47,7 @@ FINE_MAX_NODES = 1_500_000   # B161: cap of the fine lattice (columns reduced to
 G_LAYOUT = 0.12              # B161: slope of the size target along the block (dh/ds; per-cell ratio ~ e^0.12)
 BIRTH_FRAC = 0.2             # B161: at most max(1, BIRTH_FRAC N_i) column births / deaths between two rows
 HYST = 0.75                  # B161: a row's count changes only when its target moved by more than this
+NECK_BAND = 0.5              # B205: rows whose own count target is within this of the narrowest row's keep it unsmoothed
 SMOOTH_ROWS = 3.0            # B161: Gaussian (in rows) on the count target before rounding
 GAP_ROWS = 2                 # B161 / B116: a column and its neighbours do not split again within this many rows
 GOLDEN = 0.6180339887
@@ -209,15 +210,16 @@ def monotone_counts(raw: np.ndarray, nA: int, nB: int, sides=(False, False), i_n
     return raw
 
 
-def layout(h, L, ds, nA, nB, fixed_count: bool = False, monotone=(False, False)):
+def layout(h, L, ds, nA, nB, fixed_count: bool = False, monotone=(False, False), rows: int | None = None):
     """Rows xi_i and counts N_i (module docstring, step 3). The row count is at least what the birth rule needs to
     go from the join A count down to the fewest cells the target asks for and up to the join B count (with a
     floor-raised target, Denmark's default-floor block got 3 rows for 17 -> 14 -> 17 -> 21 cells, its
-    Y-splits crowded and a quad folded at 350 deg)."""
+    Y-splits crowded and a quad folded at 350 deg). rows: the row count asked for (B204; the birth rule may add
+    rows), else by the size target, at least 2."""
     Mf = len(L) - 1
     xi_f = np.linspace(0, 1, Mf + 1)
     q = np.r_[0, np.cumsum(ds / (0.5 * (h[1:] + h[:-1])))]
-    M = max(2, int(round(q[-1])))
+    M = max(2, int(round(q[-1]))) if rows is None else max(1, int(rows))
     if not fixed_count:
         n_low = int(np.clip(np.round(np.min(L / h)), 2, min(nA, nB)))
         M = max(M, birth_rows(nA, n_low) + birth_rows(n_low, nB))
@@ -226,13 +228,24 @@ def layout(h, L, ds, nA, nB, fixed_count: bool = False, monotone=(False, False))
         return xi, np.full(M + 1, nA, dtype=int)
     Lr, hr = np.interp(xi, xi_f, L), np.interp(xi, xi_f, h)
     raw = gaussian_filter1d(Lr / hr, SMOOTH_ROWS, mode="nearest") if SMOOTH_ROWS else Lr / hr
+    unsm = Lr / hr                                # B205: the smoothing must not lift the count at the neck: the
+    i_short = int(np.argmin(Lr))                  # narrowest row and its neighbours whose own count is within
+    neck = np.zeros(len(unsm), bool)              # NECK_BAND of it keep their own (unsmoothed) count, no hysteresis
+    lo = hi = i_short
+    while lo > 0 and unsm[lo - 1] < unsm[i_short] + NECK_BAND:
+        lo -= 1
+    while hi < len(unsm) - 1 and unsm[hi + 1] < unsm[i_short] + NECK_BAND:
+        hi += 1
+    neck[lo:hi + 1] = True
+    raw = np.where(neck, np.minimum(raw, unsm), raw)
     if any(monotone):
         raw = monotone_counts(raw, nA, nB, monotone, int(np.argmin(Lr)))
     raw[0], raw[-1] = nA, nB
     want = np.empty(M + 1, int)
     want[0] = nA
     for i in range(1, M + 1):
-        want[i] = want[i - 1] if abs(raw[i] - want[i - 1]) <= HYST else int(np.round(raw[i]))
+        keep = abs(raw[i] - want[i - 1]) <= HYST and not neck[i]           # B205: no hysteresis at the neck
+        want[i] = want[i - 1] if keep else int(np.round(raw[i]))
     want = np.maximum(2, want)
     want[-1] = nB
     N = want.copy()
@@ -252,13 +265,15 @@ def layout(h, L, ds, nA, nB, fixed_count: bool = False, monotone=(False, False))
     return xi, N
 
 
-def bend_corners(xy: np.ndarray, region_xy: np.ndarray, deg: float | None = None, w: int | None = None) -> list:
+def bend_corners(xy: np.ndarray, region_xy: np.ndarray, deg: float | None = None, w: int | None = None,
+                 gap: int = 3) -> list:
     """B180: the convex bends of a fixed row (a join chain that turns a corner: an L-join, a strip's or a corridor's
     host chain): nodes where the chain turns toward the block's side by at least CORNER_TURN_DEG, measured between
     the chords over CORNER_W edges before and after the node (a host staircase alternates +-90 deg turns node by
     node; over 2 edges it does not turn); local maxima at least 3 nodes apart, never the two end nodes. The block's
     side: the sign of the chain's total turning when it turns by more than 45 deg, else the side of region_xy (a
-    point inside the block). Returns the node indices."""
+    point inside the block). gap: the least index distance of two bends (B206: 2 with w = 1, every step of a
+    staircase). Returns the node indices."""
     deg = CORNER_TURN_DEG if deg is None else deg
     w = CORNER_W if w is None else w
     n = len(xy) - 1
@@ -281,7 +296,7 @@ def bend_corners(xy: np.ndarray, region_xy: np.ndarray, deg: float | None = None
     for k in np.argsort(-turn):
         if turn[k] < deg or k in (0, n):
             break
-        if all(abs(int(k) - j) >= 3 for j in out):
+        if all(abs(int(k) - j) >= gap for j in out):
             out.append(int(k))
     return sorted(out)
 
@@ -505,19 +520,23 @@ def _upper_envelope(f, s, g):
 
 
 def build(xyA, xyB, bS: Polyline, bN: Polyline, n_neck: int, fixed_count: bool = False, h_min: float = 0.0,
-          cell_floor: float = 0.0, scale=None, corners=False, growth=G_LAYOUT, monotone=(False, False)) -> Block:
+          cell_floor: float = 0.0, scale=None, corners=False, growth=G_LAYOUT, monotone=(False, False),
+          rows: int | None = None, steps=(False, False)) -> Block:
     """The block of the module docstring: xyA, xyB (n+1,2) the join chains from bank S to bank N (exact host node
     positions), bS / bN the banks from join A to join B. h_min: the size target's floor (m); cell_floor: the floor of
     the cells' mean great-circle edge length (m, step 6; 0 = none); scale: the chart's scale (chart m per sphere m)
     for both (None: chart metres). corners: cut the convex bends of the fixed rows by corner triangles (B180): a bool
     for both rows or a pair (row A, row B). growth: the size target's slope, or (side A, side B) (B201); monotone:
-    (side A, side B) counts run monotonically from the neck to the join's count (B200)."""
+    (side A, side B) counts run monotonically from the neck to the join's count (B200); rows: the row count (B204;
+    None: by the size target); steps: (row A, row B) cut every convex step of a staircase row, not only its bends
+    over CORNER_W edges (B206; with corners on)."""
     nA, nB = len(xyA) - 1, len(xyB) - 1
     LA = np.linalg.norm(np.diff(xyA, axis=0), axis=1).sum()
     LB = np.linalg.norm(np.diff(xyB, axis=0), axis=1).sum()
     ca_on, cb_on = corners if isinstance(corners, tuple) else (corners, corners)
-    cA = bend_corners(xyA, xyB.mean(0)) if ca_on else []
-    cB = bend_corners(xyB, xyA.mean(0)) if cb_on else []
+    sa, sb = steps
+    cA = (bend_corners(xyA, xyB.mean(0), w=1, gap=2) if sa else bend_corners(xyA, xyB.mean(0))) if ca_on else []
+    cB = (bend_corners(xyB, xyA.mean(0), w=1, gap=2) if sb else bend_corners(xyB, xyA.mean(0))) if cb_on else []
     nA_v, nB_v = nA - len(cA), nB - len(cB)                  # the rows zipped next to them (B180)
     X, phi, info = harmonic_map(xyA, xyB, bS, bN, n_neck)
     sc_row = np.asarray(scale(X.reshape(-1, 2))).reshape(X.shape[:2]).max(1) if scale is not None else 1.0
@@ -530,7 +549,7 @@ def build(xyA, xyB, bS: Polyline, bN: Polyline, n_neck: int, fixed_count: bool =
     rounds = FLOOR_ROUNDS if cell_floor > 0 else 1
     for rnd in range(rounds):
         h = np.maximum(h0, np.minimum(floor, cap))           # never coarser than the host (then the caller refuses)
-        xi, N = layout(h, L, ds, nA_v, nB_v, fixed_count=fixed_count and nA == nB, monotone=monotone)
+        xi, N = layout(h, L, ds, nA_v, nB_v, fixed_count=fixed_count and nA == nB, monotone=monotone, rows=rows)
         N = N.copy()
         N[0], N[-1] = nA, nB
         row = np.concatenate([np.full(N[i] + 1, i) for i in range(len(N))])

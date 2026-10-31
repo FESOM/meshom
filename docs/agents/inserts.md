@@ -70,6 +70,8 @@ h_min_m = 1000.0                   # the size floor (default: the host mesh's sm
 | `cells_a`, `cells_b` | any | strait: the join of side A / B has exactly this many host edges, the counts run monotonically from the neck to it (B200) |
 | `growth_a`, `growth_b` | 0.12 | strait: the size slope along the block on side A / B; the room and funnel rules scale with it (B201) |
 | `bank_land_cells` | 0 | strait: the real banks may move up to this many local cells into land (smoother, ends squared at acute joins) (B202) |
+| `fill`, `fill_rows` | none, by depth | strait: lines `[[[lon, lat], ...], ...]` that cut water off a bank: the bank follows a line where it lies at least half a local cell off the coast, the water behind it becomes a strip of its own, `fill_rows` rows (default its depth / the local cell, at least 1) (B204) |
+| `corner_steps` | false | strait: a join from a hint cuts every convex step of its host staircase by a corner triangle, not only its bends (B206) |
 | `stages` | `"d,b,e,a"` | the clean-up stages on the join ring ([`cleanup.md`](cleanup.md); B162) |
 | `force` | false | build with the least-violating joins when none passes |
 
@@ -103,7 +105,7 @@ depth by the run's rules) when the run wrote model files.
 
 ## Config keys used
 
-- `[[inserts]]`: `name`, `kind`, `strait`, `path`, `cells`, `h_fine_m`, `h_min_m`, `reach_km`, `mouth_a`, `mouth_b`, `ljoins`, `bays`, `collar_rings`, `coast`, `coast_source`, `bank_sigma_cells`, `width_km`, `band_km`, `rows`, `coast_rounds`, `coast_shift_cells`, `cells_a`, `cells_b`, `growth_a`, `growth_b`, `bank_land_cells`, `stages`, `force`
+- `[[inserts]]`: `name`, `kind`, `strait`, `path`, `cells`, `h_fine_m`, `h_min_m`, `reach_km`, `mouth_a`, `mouth_b`, `ljoins`, `bays`, `collar_rings`, `coast`, `coast_source`, `bank_sigma_cells`, `width_km`, `band_km`, `rows`, `coast_rounds`, `coast_shift_cells`, `cells_a`, `cells_b`, `growth_a`, `growth_b`, `bank_land_cells`, `fill`, `fill_rows`, `corner_steps`, `stages`, `force`
 
 ## Sources
 

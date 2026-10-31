@@ -42,7 +42,8 @@ docs/config.md has the full description and an example. Tables (units: metres, k
               `meshom run`; decisions B158-B169, B180-B185): kind ("strait" | "strip" | "corridor"), name, strait or
               path, mouth_a / mouth_b (join hints), cells or h_fine_m, reach_km, force, stages, ring_rows,
               bank_sigma_h, width_km and band_km (strip, corridor), ljoins, cells_a / cells_b, growth_a / growth_b,
-              bank_land_cells (B200-B202) (meshom.config.InsertCfg)
+              bank_land_cells (B200-B202), fill, fill_rows (B204), corner_steps (B206)
+              (meshom.config.InsertCfg)
     [size]    grad_max (|grad h| limit of the gradient limiter, default 0.1; inf = no limiting), h_min_m / h_max_m
               (optional global clip), preview_deg (UI preview grid), limiter_max_nodes (grid size cap), from (an h
               variant file, relative to the config's folder: its [size] keys and layers first, this table's keys
@@ -259,6 +260,13 @@ class InsertCfg:
                                                        # (B201)
     bank_land_cells: float = 0.0                       # strait: the real banks may move into land by this many local
                                                        # insert cells (smoother, squared at the joins; B202)
+    fill: list = field(default_factory=list)          # strait: fill lines [[[lon, lat], ...], ...]: each replaces the
+                                                       # real coast between its ends (snapped onto it) where it lies
+                                                       # seaward; the water cut off is meshed as a strip of its own
+                                                       # hanging off that bank (B204)
+    fill_rows: int | None = None                       # rows of that strip (None: its depth / the local cell, >= 1)
+    corner_steps: bool = False                         # strait: a join from a hint cuts every convex step of its
+                                                       # host staircase by a corner triangle, not only its bends (B206)
 
 
 @dataclass

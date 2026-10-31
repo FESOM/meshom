@@ -48,6 +48,10 @@ NEST_PASSES = 3              # B195: a strip's spine (bridge = "narrow") repeats
 LAND_ITERS = 30             # B202: rounds of the into-land smoothing (a Gaussian of one local cell, then the line
                              # put back into its band: today's coast .. bank_land_cells local cells into land)
 LAND_BAY_H = 2.0             # B202: no into-land move within this many local cells of a meshed bay's mouth end
+FILL_DEPTH_H = 0.5           # B204: water cut off by a fill line is meshed (a strip of its own) when it reaches this
+                             # many local cells behind the line; a shallower sliver is left out
+FILL_FREE_H = 1.0            # B204: the into-land move may round a fill line within this many local cells of its ends
+FILL_EPS_H = 0.1             # B204: the cut-off water ends where the moved bank comes this close to the coast behind
 AUTO_WIDTH_AT = (0.25, 0.5)  # B190: the bay's width (its water across, parallel to the mouth) at these fractions of
                              # its depth, recorded (it does not separate a pocket from a large bay once smoothed)
 
@@ -63,6 +67,8 @@ class Bay:
     h_m: float                   # local cell size at the mouth
     meshed: bool                 # a bay block (by the `bays` mode, B166 / B190); else bridged
     widths_m: tuple = ()         # B190: the bay's width at the depth fractions AUTO_WIDTH_AT
+    fill: int = -1               # B204: the fill line that cut this water off (-1: a pocket found by the bay search)
+    mouth: np.ndarray | None = None   # B204: the fill line's part across this water (a -> b; None: the chord)
 
     @property
     def a(self):
@@ -73,11 +79,14 @@ class Bay:
         return self.arc[-1]
 
     def record(self) -> dict:
-        return {"depth_km": round(self.depth_m / 1e3, 3), "mouth_km": round(self.mouth_m / 1e3, 3),
-                "h_km": round(self.h_m / 1e3, 3), "depth_cells": round(self.depth_m / self.h_m, 2),
-                "mouth_cells": round(self.mouth_m / self.h_m, 2), "meshed": self.meshed,
-                "width_km": [round(w / 1e3, 3) for w in self.widths_m],
-                "width_mouth": [round(w / max(self.mouth_m, 1e-9), 3) for w in self.widths_m]}
+        r = {"depth_km": round(self.depth_m / 1e3, 3), "mouth_km": round(self.mouth_m / 1e3, 3),
+             "h_km": round(self.h_m / 1e3, 3), "depth_cells": round(self.depth_m / self.h_m, 2),
+             "mouth_cells": round(self.mouth_m / self.h_m, 2), "meshed": self.meshed,
+             "width_km": [round(w / 1e3, 3) for w in self.widths_m],
+             "width_mouth": [round(w / max(self.mouth_m, 1e-9), 3) for w in self.widths_m]}
+        if self.fill >= 0:
+            r["fill"] = self.fill
+        return r
 
 
 @dataclass
@@ -91,6 +100,7 @@ class RealCoast:
     smooth: list = field(default_factory=list)     # the smoothed pieces
     bays: list = field(default_factory=list)       # Bay
     _pl: list = field(default_factory=list)
+    _open: list = field(default_factory=list)      # B204: the smoothed pieces with only the unmeshed bays bridged
 
     @classmethod
     def from_loops(cls, loops_xyz: list, chart, centre: np.ndarray, radius_m: float, source: str = ""):
@@ -131,7 +141,7 @@ class RealCoast:
 
     # ------------------------------------------------------------------------------------- smoothing and bays
     def prepare(self, h_loc, w_loc, h_floor: float, sigma_cells: float = SIGMA_CELLS, bays="auto",
-                bridge: str = "all", sigma_mult=None, land_cells: float = 0.0):
+                bridge: str = "all", sigma_mult=None, land_cells: float = 0.0, fill=None):
         """Smooth every piece at sigma_cells x h_loc and find its bays (module docstring). h_loc, w_loc: callables
         (K,2) -> (K,) of the local cell size and the local channel width (inf where not in a channel). bays: which
         pockets are meshed as bays (`bay_meshed`): "auto" (large ones, B190), True (every one with a mouth of
@@ -139,8 +149,9 @@ class RealCoast:
         pocket's chord) or "narrow" (only the pockets not meshed: a coastal strip keeps its bays in its spine,
         B181). sigma_mult: a callable (K,2) -> (K,) multiplying the smoothing width only (a strip's extra smoothing
         round bad cells, B198). land_cells: the main coast may move into land by up to this many local cells where
-        that makes it smoother, never into the water beyond it (B202; `into_land`)."""
-        self.smooth, self.main, self.bays, self.base, self.land = [], [], [], [], {}
+        that makes it smoother, never into the water beyond it (B202; `into_land`). fill: polylines (chart) that
+        replace the main coast between their end points where they lie on its water side (B204; `_fill`)."""
+        self.smooth, self.main, self.bays, self.base, self.land, self._open = [], [], [], [], {}, []
         step = max(STEP_CELLS * h_floor, 1.0)
         for ip, (p, cl) in enumerate(zip(self.pieces, self.closed)):
             q = _resample(p, cl, step)
@@ -154,6 +165,7 @@ class RealCoast:
                 q = 2.0 * g1 - _smooth_var(g1, s, sig, cl, per)          # twicing (B164): 2G - G^2 keeps capes
 
             self.smooth.append(q)
+            self._open.append(q)
             if len(q) < 4:
                 self.main.append(q)
                 continue
@@ -182,20 +194,18 @@ class RealCoast:
                         continue
                     m = max(int(np.ceil(L / step)), 1)
                     tt = np.linspace(0, 1, m + 1)[1:-1, None]
-                    extra.append((i, j, q[i] + tt * (q[j] - q[i])))
+                    extra.append((i, j, q[i] + tt * (q[j] - q[i]), meshed))
                 extra.sort(key=lambda e: e[0])
                 if not extra:
                     break
-                parts, last = [], 0
-                for i0, j0, pts in extra:
-                    parts += [q[last:i0 + 1], pts]
-                    last = j0
-                parts.append(q[last:])
-                q = np.vstack(parts)
+                if npass == 0 and bridge != "narrow":          # B204: the coast with the meshed bays open
+                    self._open[-1] = _bridged(q, [e for e in extra if not e[3]])
+                q = _bridged(q, extra)
             self.main.append(q)
+        placed = self._fill(fill, h_loc, step, sigma_cells) if fill else []
         if land_cells > 0:
             self.base = [m.copy() for m in self.main]
-            ends = np.array([e for b in self.bays if b.meshed for e in (b.a, b.b)]).reshape(-1, 2)
+            ends = np.array([e for b in self.bays if b.meshed and b.fill < 0 for e in (b.a, b.b)]).reshape(-1, 2)
             moved = []
             for k, (m, cl) in enumerate(zip(self.main, self.closed)):
                 if len(m) < 4:
@@ -205,13 +215,217 @@ class RealCoast:
                 if len(ends):
                     dn = np.min(np.linalg.norm(m[:, None] - ends[None], axis=-1), axis=1)
                     D = D * np.clip(dn / (LAND_BAY_H * hq) - 1.0, 0.0, 1.0)
+                for pk, fl in placed:                    # B204: a fill line stays where it was drawn, but within
+                    if pk == k:                          # FILL_FREE_H cells of its ends (its corners are rounded)
+                        on = fl.distance(m) <= 0.5 * step
+                        sp = fl.project(m)
+                        inner = on & (np.minimum(sp, fl.L - sp) > FILL_FREE_H * hq)
+                        D = np.where(inner, 0.0, D)
                 self.main[k], dk = into_land(m, cl, D, hq)
                 moved.append(dk)
             dmax = max((float(d.max()) for d in moved if len(d)), default=0.0)
             self.land = {"cells": float(land_cells), "max_m": dmax}
+        if placed and land_cells > 0:
+            self._refit_fill(h_loc, step)
         self._pl = [Polyline(np.vstack([m, m[:1]]) if cl else m) for m, cl in zip(self.main, self.closed)]
         self._plb = [Polyline(np.vstack([m, m[:1]]) if cl else m) for m, cl in zip(self.base, self.closed)]
         return self
+
+    def _fill(self, lines, h_loc, step: float, sigma_cells: float) -> list:
+        """B204: fill lines. Each line (chart polyline) is resampled, its ends moved onto the nearest main-coast
+        piece (the one nearest to both ends, blended over one local cell) and smoothed as the coast is (B164); on a
+        closed piece the shorter way between the two end points is replaced. Between the crossings of the line with
+        that coast, a part of the line on the coast's water side cuts water off: the main coast takes the line
+        there and the coast behind it becomes a Bay (fill = the line's index, mouth = that part of the line), meshed
+        when it reaches FILL_DEPTH_H local cells behind the line; where the line lies on land the coast is kept.
+        Bays of the bay search inside the replaced coast are dropped (the cut-off water holds them). Returns
+        [(piece, Polyline of the line's parts the main coast took)]."""
+        placed, work = [], {}
+        for li, F0 in enumerate(lines):
+            F = _resample(np.asarray(F0, dtype=float), False, step)
+            best = None
+            for k, cl in enumerate(self.closed):
+                m = work.get(k, self._open[k] if k < len(self._open) else self.main[k])
+                if len(m) < 4:
+                    continue
+                pl = Polyline(np.vstack([m, m[:1]]) if cl else m)
+                se = pl.project(F[[0, -1]])
+                d = float(np.max(np.linalg.norm(pl.at(se) - F[[0, -1]], axis=1)))
+                if best is None or d < best[0]:
+                    best = (d, k, pl, float(se[0]), float(se[1]))
+            if best is None:
+                continue
+            _, k, pl, sa, sb = best
+            cl = self.closed[k]
+            if cl:
+                if (sa - sb) % pl.L < (sb - sa) % pl.L:          # the shorter way round
+                    F, sa, sb = F[::-1], sb, sa
+                C = _sub(pl, sa, sb if sb >= sa else sb + pl.L, wrap=pl.L)
+                rest = _sub(pl, sb, sa if sa >= sb else sa + pl.L, wrap=pl.L)
+            else:
+                if sa > sb:
+                    F, sa, sb = F[::-1], sb, sa
+                C = _sub(pl, sa, sb)
+            C = _bridge_narrow(C, h_loc, step)                   # the narrow inlets behind the line closed
+            hF = np.asarray(h_loc(F), dtype=float)
+            F = blend_ends(F, C[0], C[-1], float(hF[0]), float(hF[-1]))
+            if sigma_cells > 0 and len(F) >= 4:
+                sF = _arc(F, False)
+                sig = sigma_cells * np.asarray(h_loc(F), dtype=float)
+                g1 = _smooth_var(F, sF, sig, False, float(sF[-1]))
+                F = 2.0 * g1 - _smooth_var(g1, sF, sig, False, float(sF[-1]))
+            # the crossings of the line with the coast between its ends: (arc on F, arc on C)
+            pf, pc = Polyline(F), Polyline(C)
+            cut = [(0.0, 0.0)]
+            o, d = F[:-1], np.diff(F, axis=0)
+            a, e = C[:-1], np.diff(C, axis=0)
+            den = d[:, None, 0] * e[None, :, 1] - d[:, None, 1] * e[None, :, 0]
+            w = a[None] - o[:, None]
+            with np.errstate(divide="ignore", invalid="ignore"):
+                t = (w[..., 0] * e[None, :, 1] - w[..., 1] * e[None, :, 0]) / den
+                u = (w[..., 0] * d[:, None, 1] - w[..., 1] * d[:, None, 0]) / den
+            ok = (np.abs(den) > 1e-12) & (t >= 0) & (t < 1) & (u >= 0) & (u < 1)
+            for i, j in zip(*np.nonzero(ok)):
+                tf = pf.s[i] + t[i, j] * (pf.s[i + 1] - pf.s[i])
+                tc = pc.s[j] + u[i, j] * (pc.s[j + 1] - pc.s[j])
+                if step < tf < pf.L - step and step < tc < pc.L - step:
+                    cut.append((float(tf), float(tc)))
+            cut.append((pf.L, pc.L))
+            cut.sort()
+            tcs = np.maximum.accumulate([c[1] for c in cut])             # crossings in order along both
+            parts = []
+            for (f0, _), (f1, _), c0, c1 in zip(cut[:-1], cut[1:], tcs[:-1], tcs[1:]):
+                if f1 - f0 < step:
+                    continue
+                fp = _sub(pf, f0, f1)
+                mid = pf.at([0.5 * (f0 + f1)])[0]
+                sm = float(pc.project(mid[None])[0])
+                tg = pc.tangent([sm], max(step, 1.0))[0]
+                foot = pc.at([sm])[0]
+                water = tg[0] * (mid[1] - foot[1]) - tg[1] * (mid[0] - foot[0]) > 0
+                if not water or c1 - c0 < step:
+                    parts.append(_sub(pc, c0, c1))
+                    continue
+                arc = _sub(pc, c0, c1)
+                arc[0], arc[-1] = fp[0], fp[-1]
+                parts += self._fill_runs(k, li, fp, arc, h_loc, step, placed)
+            sec = np.vstack([parts[0]] + [p[1:] for p in parts[1:]])
+            keep = []
+            for b in self.bays:                     # the bay search's pockets behind the line, and meshed bays it cuts
+                if b.fill >= 0 or b.piece != k:
+                    keep.append(b)
+                    continue
+                on = pc.distance(np.stack([b.a, b.b])) < step
+                cut = b.meshed and (on.any() or bool(np.any(Polyline(b.arc).distance(C[[0, -1]]) < step)))
+                if not (on.all() or cut):
+                    keep.append(b)
+            self.bays = keep
+            if cl:
+                work[k] = np.vstack([sec, rest[1:-1]])
+            else:
+                work[k] = np.vstack([pl.xy[pl.s < sa], sec, pl.xy[pl.s > sb]])
+        for k, p in work.items():                   # the meshed bays elsewhere on a filled piece bridged again
+            for b in self.bays:
+                if b.fill < 0 and b.piece == k and b.meshed:
+                    p = _bridge_at(p, self.closed[k], b.a, b.b, step)
+            self.main[k] = p
+        return placed
+
+    def _fill_runs(self, k: int, li: int, fp: np.ndarray, arc: np.ndarray, h_loc, step: float, placed: list) -> list:
+        """B204: one part of a fill line on the water side of the coast (fp, both from the same crossing to the
+        next; arc: the coast between them). The line is used where it lies at least FILL_DEPTH_H local cells off the
+        coast (a run at least one local cell long); a run that starts (ends) where the coast leaves the line, its
+        foot within FILL_DEPTH_H cells of the part's end, starts (ends) there, else it is joined to the coast by the
+        straight step from its end to the end's nearest coast point. Elsewhere the coast is kept (water thinner than
+        half a cell). Each run's water becomes a Bay (meshed), its mouth the run with its steps. Returns the parts of
+        the main coast from arc[0] to arc[-1] in order."""
+        pa = Polyline(arc)
+        hf = np.asarray(h_loc(fp), dtype=float)
+        deep = pa.distance(fp) >= FILL_DEPTH_H * hf
+        sf = _arc(fp, False)
+        d = np.diff(np.r_[0, deep.astype(int), 0])
+        out, pos = [], 0.0                                    # pos: where the coast taken so far ends (on pa)
+        for i0, i1 in zip(np.flatnonzero(d == 1), np.flatnonzero(d == -1) - 1):
+            if sf[i1] - sf[i0] < float(np.mean(hf[i0:i1 + 1])):
+                continue
+            ca, cb = (float(v) for v in pa.project(fp[[i0, i1]]))
+            if np.linalg.norm(pa.at([ca])[0] - arc[0]) <= FILL_DEPTH_H * hf[i0] or i0 == 0:
+                i0, ca = 0, 0.0
+            if np.linalg.norm(pa.at([cb])[0] - arc[-1]) <= FILL_DEPTH_H * hf[i1] or i1 == len(fp) - 1:
+                i1, cb = len(fp) - 1, pa.L
+            if ca < pos or cb <= ca:
+                continue
+            mouth = fp[i0:i1 + 1]
+            if ca > 0:
+                mouth = np.vstack([pa.at([ca]), mouth])
+            if cb < pa.L:
+                mouth = np.vstack([mouth, pa.at([cb])])
+            bay_arc = _sub(pa, ca, cb)
+            bay_arc[0], bay_arc[-1] = mouth[0], mouth[-1]
+            if ca > pos:
+                out.append(_sub(pa, pos, ca))
+            out.append(mouth)
+            pos = cb
+            dep = float(np.max(Polyline(mouth).distance(bay_arc)))
+            h_m = float(np.mean(np.asarray(h_loc(mouth[[0, -1]]), dtype=float)))
+            L = float(np.linalg.norm(mouth[-1] - mouth[0]))
+            self.bays.append(Bay(k, -1, -1, bay_arc, dep, max(L, 1.0), h_m, True,
+                                 bay_widths(bay_arc, AUTO_WIDTH_AT), fill=li, mouth=mouth))
+            placed.append((k, Polyline(mouth)))
+        if pos < pa.L:
+            out.append(_sub(pa, pos, pa.L))
+        return out
+
+    def _refit_fill(self, h_loc, step: float):
+        """B204: after the into-land move (which may round a fill line's corners at its ends, into the cut-off water)
+        each meshed fill bay is taken again between the moved main coast and the coast behind the line: its mouth is
+        the moved main coast from where it leaves that coast to where it meets it again (farther than FILL_EPS_H
+        local cells), its arc that coast between the two points."""
+        for b in self.bays:
+            if b.fill < 0 or not b.meshed or b.mouth is None:
+                continue
+            k, cl, base = b.piece, self.closed[b.piece], self.base[b.piece]
+            ia = int(np.argmin(np.linalg.norm(base - b.a, axis=1)))
+            ib = int(np.argmin(np.linalg.norm(base - b.b, axis=1)))
+            if cl:                                   # the coast round the loop, centred on the bay
+                R = np.roll(base, -ib, axis=0)
+                j = (ia - ib) % len(base)
+                mid = j // 2
+                full = np.vstack([R[mid:j + 1], b.arc[1:], R[1:mid + 1]])
+            else:
+                full = np.vstack([base[:ia + 1], b.arc[1:-1], base[ib:]])
+            C = Polyline(full)
+            P = Polyline(np.vstack([self.main[k], self.main[k][:1]]) if cl else self.main[k])
+            tm = float(P.project(b.mouth[len(b.mouth) // 2][None])[0])
+            eps = FILL_EPS_H * b.h_m
+            t = np.arange(0.0, P.L, max(step, 1.0))
+            dist = C.distance(P.at(t))
+            i = int(np.argmin(np.abs(t - tm)))
+            n = len(t)
+            lo = i
+            for _ in range(n):
+                nx = (lo - 1) % n if cl else lo - 1
+                if nx < 0 or dist[nx] < eps:
+                    break
+                lo = nx
+            hi = i
+            for _ in range(n):
+                nx = (hi + 1) % n if cl else hi + 1
+                if nx >= n or dist[nx] < eps:
+                    break
+                hi = nx
+            ta, tb = t[(lo - 1) % n if cl else max(lo - 1, 0)], t[(hi + 1) % n if cl else min(hi + 1, n - 1)]
+            mouth = _sub(P, ta, tb if tb >= ta else tb + P.L, wrap=P.L if cl else None)
+            ca, cb = (float(v) for v in C.project(mouth[[0, -1]]))
+            if cb <= ca:
+                continue
+            arc = _sub(C, ca, cb)
+            arc[0], arc[-1] = mouth[0], mouth[-1]
+            b.arc, b.mouth = arc, mouth
+            b.depth_m = float(np.max(Polyline(mouth).distance(arc)))
+            b.mouth_m = max(float(np.linalg.norm(mouth[-1] - mouth[0])), 1.0)
+            b.h_m = float(np.mean(np.asarray(h_loc(mouth[[0, -1]]), dtype=float)))
+            b.widths_m = bay_widths(arc, AUTO_WIDTH_AT)
 
     def depth(self, xy: np.ndarray, which: str = "base") -> np.ndarray:
         """B202: signed distance of points to the nearest (base or main) coast piece, positive on its land side (the
@@ -283,6 +497,59 @@ class RealCoast:
             gp = Polyline(guide)
             ways.sort(key=lambda w: float(np.mean(Polyline(w).distance(gp.xy))) + float(np.mean(gp.distance(w))))
         return ways[0], ""
+
+
+def _bridge_narrow(C: np.ndarray, h_loc, step: float) -> np.ndarray:
+    """B204: the coast behind a fill line with every pocket whose mouth holds fewer than AUTO_MOUTH_H local cells
+    bridged (the pocket rules of B166, one pass, deepest for its mouth first): an estuary's narrows close, the
+    cut-off water keeps only what its own rows can carry. The ends stay."""
+    for _ in range(1):
+        if len(C) < 4:
+            break
+        hq = np.asarray(h_loc(C), dtype=float)
+        lmax = AUTO_MOUTH_H * hq
+        far, dep = _far_chords(C, _arc(C, False), lmax, ARC_MAX_MOUTH * lmax, SIDE_TOL_H * hq, DEPTH_H * hq,
+                               DEPTH_RATIO)
+        cand = sorted(((dep[i] ** 2 / np.linalg.norm(C[far[i]] - C[i]), i, int(far[i]))
+                       for i in np.flatnonzero(far >= 0)), reverse=True)
+        taken = np.zeros(len(C), bool)
+        extra = []
+        for _, i, j in cand:
+            if taken[i:j + 1].any():
+                continue
+            taken[i:j + 1] = True
+            m = max(int(np.ceil(np.linalg.norm(C[j] - C[i]) / step)), 1)
+            tt = np.linspace(0, 1, m + 1)[1:-1, None]
+            extra.append((i, j, C[i] + tt * (C[j] - C[i])))
+        if not extra:
+            break
+        extra.sort(key=lambda e: e[0])
+        C = _bridged(C, extra)
+    return C
+
+
+def _bridged(q: np.ndarray, extra: list) -> np.ndarray:
+    """q with each (i, j, chord points, ...) of extra (sorted by i, no overlaps) in place of q[i+1 .. j-1]."""
+    if not extra:
+        return q
+    parts, last = [], 0
+    for e in extra:
+        parts += [q[last:e[0] + 1], e[2]]
+        last = e[1]
+    parts.append(q[last:])
+    return np.vstack(parts)
+
+
+def _bridge_at(p: np.ndarray, closed: bool, a: np.ndarray, b: np.ndarray, step: float) -> np.ndarray:
+    """B204: p with its run from the point nearest to a to the point nearest to b (forward) replaced by the chord."""
+    ia, ib = int(np.argmin(np.linalg.norm(p - a, axis=1))), int(np.argmin(np.linalg.norm(p - b, axis=1)))
+    if closed:
+        p, ib, ia = np.roll(p, -ia, axis=0), (ib - ia) % len(p), 0
+    if ib <= ia + 1:
+        return p
+    m = max(int(np.ceil(np.linalg.norm(p[ib] - p[ia]) / step)), 1)
+    tt = np.linspace(0, 1, m + 1)[1:-1, None]
+    return np.vstack([p[:ia + 1], p[ia] + tt * (p[ib] - p[ia]), p[ib:]])
 
 
 def into_land(q: np.ndarray, closed: bool, D: np.ndarray, h: np.ndarray, iters: int | None = None):

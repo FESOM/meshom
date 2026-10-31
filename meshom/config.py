@@ -44,7 +44,7 @@ docs/config.md has the full description and an example. Tables (units: metres, k
               bank_sigma_h, width_km and band_km (strip, corridor), ljoins, cells_a / cells_b, growth_a / growth_b,
               bank_land_cells (B200-B202), fill, fill_rows (B204), corner_steps (B206), add_columns (B207),
               corner_split (B208), join_margin (B209), fix_rings (B210), depth_at, depth_smooth, strait_floor
-              (B211), sill_level (B212)
+              (B211), sill_level (B212, B215), depth_channel (B213), depth_quantile (B214)
               (meshom.config.InsertCfg)
     [size]    grad_max (|grad h| limit of the gradient limiter, default 0.1; inf = no limiting), h_min_m / h_max_m
               (optional global clip), preview_deg (UI preview grid), limiter_max_nodes (grid size cap), from (an h
@@ -288,7 +288,15 @@ class InsertCfg:
                                                        # over the insert's own nodes only (B211)
     strait_floor: bool = True                          # ... the run's strait depth floors also on them (B211)
     sill_level: str = ""                               # "" | "shallower": the insert's sill gets the shallower of the
-                                                       # two levels round its depth in the model's levels (B212)
+                                                       # two levels round its depth in the model's levels (B212) |
+                                                       # "grid": the grid's saddle between the joins held at the
+                                                       # deepest level not below its depth by a dam of nodes (B215)
+    depth_channel: str = ""                            # "" | "cells" | "near": the grid's deepest channel between
+                                                       # the joins (box means at the fine size) raises the insert's
+                                                       # nodes of the cells it crosses / within one spacing of it to
+                                                       # its box-mean depth there (B213)
+    depth_quantile: float = 0.0                        # the insert's nodes take this quantile of the grid's ocean
+                                                       # cells in their node box instead of the mean (0: off, B214)
 
 
 @dataclass

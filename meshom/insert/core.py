@@ -66,7 +66,9 @@ class Spec:
     depth_at: str = ""                       # B211: the insert's own nodes' depth rule ("": the run's)
     depth_smooth: int | None = None          # B211: smoothing passes over the insert's nodes (None: the run's)
     strait_floor: bool = True                # B211: the run's strait depth floors on the insert's nodes
-    sill_level: str = ""                     # B212: "shallower": the sill's level rounded up
+    sill_level: str = ""                     # B212: "shallower": the sill's level rounded up; B215: "grid"
+    depth_channel: str = ""                  # B213: "cells" | "near": the grid's deepest channel raises the insert
+    depth_quantile: float = 0.0              # B214: the node box's quantile instead of its mean (0: the mean)
 
 
 @dataclass
@@ -125,7 +127,8 @@ def spec_from(cfg_entry, cfg=None) -> Spec:
                 e.band_km * 1e3 if e.band_km is not None else None, e.ljoins, e.rows, e.coast_rounds,
                 e.coast_shift_cells, e.cells_a, e.cells_b, e.growth_a, e.growth_b, e.bank_land_cells,
                 [_ll(f) for f in e.fill], e.fill_rows, e.corner_steps, e.add_columns, e.corner_split, e.join_margin,
-                e.fix_rings, e.depth_at, e.depth_smooth, e.strait_floor, e.sill_level)
+                e.fix_rings, e.depth_at, e.depth_smooth, e.strait_floor, e.sill_level, e.depth_channel,
+                e.depth_quantile)
 
 
 def _path_frame(path: np.ndarray):
@@ -696,8 +699,10 @@ def insert_depth(depth: np.ndarray, mesh: Mesh, win: Window, res: Result, full: 
     own nodes (those the splice appended) take that rule on the window's part of the mesh: the grid rule, the
     smoothing (None: the run's passes over the whole part; a number: that many passes among the insert's nodes only),
     the run's slope limiter, the strait depth floors when strait_floor, the depth floor and the run's regions;
-    sill_level "shallower" (B212) then rounds the sill up in the model's levels (sill_shallower). Returns
-    (depth, record)."""
+    depth_quantile (B214) replaces the grid rule's value by a quantile of the node box, depth_channel (B213) raises
+    the nodes along the grid's deepest channel between the joins, and sill_level "shallower" (B212) then rounds the
+    sill up in the model's levels (sill_shallower), "grid" (B215) holds the grid's saddle at its level
+    (meshom.insert.channel). Returns (depth, record)."""
     from meshom import run as runmod
     from meshom.bathymetry import (apply_regions, cells_deepest_depth, depth_policy, levels, node_area_m2,
                                    node_depth, node_spacing_m, smooth_depth)
@@ -717,7 +722,8 @@ def insert_depth(depth: np.ndarray, mesh: Mesh, win: Window, res: Result, full: 
         rec["host_moved_kept"] = int(len(moved))
         rec["host_moved_change_m"] = float(np.abs(depth[moved] - hd[k]).max())
         depth[moved] = hd[k]
-    own = bool(spec.depth_at) or spec.depth_smooth is not None or not spec.strait_floor or bool(spec.sill_level)
+    own = (bool(spec.depth_at) or spec.depth_smooth is not None or not spec.strait_floor or bool(spec.sill_level)
+           or bool(spec.depth_channel) or spec.depth_quantile > 0)
     if b.source == "none" or not own:
         return depth, rec
     part = _part(full, res.window)
@@ -731,6 +737,19 @@ def insert_depth(depth: np.ndarray, mesh: Mesh, win: Window, res: Result, full: 
     floor = runmod.depth_floor_m(cfg, fmt)
     at = spec.depth_at or b.depth_at
     d, info = (cells_deepest_depth if at == "cells_deepest" else node_depth)(sub, Path(b.source), b.variable, floor)
+    grid = None
+    if spec.depth_quantile > 0 or spec.depth_channel or spec.sill_level == "grid":
+        from meshom.insert import channel as chan
+        from meshom.mesh import signed_area
+
+        sp, _, _ = node_spacing_m(sub)
+        cells_ins = np.r_[ins[sub.tris].any(1) if sub.n_tris else np.zeros(0, bool), ins[sub.quads].any(1)]
+        r_max = max(float(sp[ins].max()), float(np.sqrt(np.abs(signed_area(sub))[cells_ins].max())))
+        nodes_ins = np.unique(np.r_[sub.tris[cells_ins[:sub.n_tris]].ravel(), sub.quads[cells_ins[sub.n_tris:]].ravel()])
+        lo_, la_ = xyz_to_lonlat(sub.points[nodes_ins])
+        grid = chan.read_window(Path(b.source), b.variable, lo_, la_, 2.0 * r_max)
+    if spec.depth_quantile > 0:
+        d, rec["quantile"] = chan.node_quantile(sub, d, ins, grid, spec.depth_quantile, floor)
     _, edges, _ = node_spacing_m(sub)
     area = node_area_m2(sub)
     passes = b.smooth_passes if spec.depth_smooth is None else int(spec.depth_smooth)
@@ -739,16 +758,41 @@ def insert_depth(depth: np.ndarray, mesh: Mesh, win: Window, res: Result, full: 
     if b.regions:
         d, _ = apply_regions(sub, d, b.regions, floor)
     rec.update(rule={"depth_at": at, "smooth_passes": passes, "smooth_among": "run" if spec.depth_smooth is None
-                     else "insert", "strait_floor": bool(spec.strait_floor), "sill_level": spec.sill_level or None},
+                     else "insert", "strait_floor": bool(spec.strait_floor), "sill_level": spec.sill_level or None,
+                     "depth_channel": spec.depth_channel or None, "depth_quantile": spec.depth_quantile or None},
                insert_nodes=int(ins.sum()), grid=info.get("depth_m"),
                strait_depth_floor=pol.get("strait_depth_floor"),
                run_rule_m={"min": float(depth[wid[ins]].min()), "max": float(depth[wid[ins]].max())})
+    line = None
+    if spec.depth_channel or spec.sill_level == "grid":
+        h_f = res.profile.h_fine if res.profile is not None else float(np.median(node_spacing_m(sub)[0][ins]))
+        line = chan.channel_line(sub, ins, depth[wid], grid, h_f)
+        rec["channel"] = line.record if line is not None else {"skipped": "the insert has no two joins"}
+        if line is not None:
+            log(f"[insert {spec.name}] channel line {line.record['km']:.0f} km (box means at {h_f / 1e3:.2f} km), "
+                f"its deepest connection {line.record['deepest_connection_box_m']:.0f} m; the grid's saddle "
+                f"{line.saddle[0]:.0f} m at {line.record['grid_saddle']['at']}", flush=True)
+        if line is not None and spec.depth_channel:
+            d, rec["channel"]["raise"] = chan.line_raise(sub, d, ins, grid, line, spec.depth_channel)
+            r = rec["channel"]["raise"]
+            log(f"[insert {spec.name}] depth_channel {spec.depth_channel}: {r['nodes_raised']} nodes raised, by up to "
+                f"{r['raise_max_m']:.0f} m (mean {r['raise_mean_m']:.0f} m)", flush=True)
     if spec.sill_level == "shallower":
         d, rec["sill"] = sill_shallower(sub, d, ins, levels(b.levels))
         s = rec["sill"]
         if "barrier_m" in s:
             log(f"[insert {spec.name}] sill {s['barrier_m']:.1f} m at {s['at']}: level {s['level_m']:.0f} m, "
                 f"{s['capped']} nodes capped at {s['cap_m']:.1f} m (largest cut {s['cut_max_m']:.1f} m)", flush=True)
+    elif spec.sill_level == "grid":
+        d, rec["sill"] = (chan.grid_sill(sub, d, ins, line, levels(b.levels)) if line is not None
+                          else (d, {"skipped": "no channel line"}))
+        s = rec["sill"]
+        if "cap_m" in s:
+            log(f"[insert {spec.name}] the grid's saddle {s['saddle_m']:.0f} m at {s['saddle_at']}: level "
+                f"{s['level_m']:.0f} m, a dam of {s['chain_nodes']} nodes through {s['via']}, {s['capped']} nodes "
+                f"capped at {s['cap_m']:.1f} m (largest cut {s['cut_max_m']:.0f} m)", flush=True)
+        else:
+            log(f"[insert {spec.name}] sill_level grid: {s}", flush=True)
     depth[wid[ins]] = d[ins]
     rec["insert_m"] = {"min": float(d[ins].min()), "max": float(d[ins].max())}
     log(f"[insert {spec.name}] depth of the insert's {int(ins.sum())} nodes: {at}, {passes} smoothing passes "
@@ -856,7 +900,7 @@ def run(run_dir: Path, spec: Spec, out_dir: Path | None = None, mesh_name: str |
     """The insert in a finished run (module docstring): writes <out>/insert_<name>.npz, .json (the record),
     .score.json (zone scores and the ring's meshfix score), .map.png, .profile.png and, when the run wrote model
     files, fesom-insert_<name>/ in the run's format with depth by the run's bathymetry rules (insert_depth: the
-    insert's own rule, B211, B212). With fix_rings the spliced mesh is smoothed first (fix_spliced, B210). Returns the
+    insert's own rule, B211-B215). With fix_rings the spliced mesh is smoothed first (fix_spliced, B210). Returns the
     record."""
     from meshom import compete
     from meshom import run as runmod

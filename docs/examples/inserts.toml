@@ -70,14 +70,16 @@ bank_land_cells = 1.0
 fill = [[[-1.25, 49.60], [-0.5, 49.65], [0.0, 49.72], [0.3, 49.77], [0.5, 49.88], [1.0, 49.90], [1.3, 50.05], [1.6, 50.18]],
         [[1.05, 51.42], [1.25, 51.55], [1.45, 51.68], [1.50, 51.85], [1.50, 52.10]]]
 
-# Gibraltar on an ORCA025 host, the full recipe for a strait on a structured host (decisions B200-B211): 5 cells
+# Gibraltar on an ORCA025 host, the full recipe for a strait on a structured host (decisions B200-B215): 5 cells
 # across the neck on the real coast; the Atlantic join along the host's staircase far out (an arc hint
 # across the Gulf of Cadiz, every step cut by a corner triangle split at its diagonal's midpoint), the Mediterranean
 # join along a host grid line with 8 edges and a slower size slope; the size target 0.85 x the host cell at the joins
 # and more columns where the block fans out; then the insert and 10 element rings round it smoothed; the insert's own
-# depth from the grid's box mean per node, without smoothing and without the strait list's depth floor, so the sills
-# keep their depth: worst quad 106 deg, smallest cell 2.5 km, the insert's cells at most 0.93 x the host cell next to
-# them, the deepest connection 280 m in FESOM3's levels (GEBCO: 300 m at Camarinal), 29 km wide at 5.75 W (GEBCO 30).
+# depth from the grid's box mean per node, without smoothing and without the strait list's depth floor, the nodes
+# within one cell of the grid's deepest channel at the channel's box-mean depth and the grid's saddle held at its level
+# by a dam (B213, B215): worst quad 106 deg, smallest cell 2.5 km, the insert's cells at most 0.93 x the host cell next
+# to them, the deepest connection 280 m in FESOM3's levels (GEBCO: 300 m at Camarinal), the element bottom 580 m at
+# 5.60 W and 910 m at 5.45 W (GEBCO 682 and 976 m), 29 km wide at 5.75 W (GEBCO 30).
 [[inserts]]
 name = "gibraltar"
 strait = "Gibraltar"
@@ -96,6 +98,8 @@ fix_rings = 10
 depth_at = "node"
 depth_smooth = 0
 strait_floor = false
+depth_channel = "near"
+sill_level = "grid"
 
 [[inserts]]
 name = "denmark"

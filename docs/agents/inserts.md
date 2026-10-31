@@ -77,7 +77,9 @@ h_min_m = 1000.0                   # the size floor (default: the host mesh's sm
 | `add_columns` | false | strait: where a block cell is above 1.1 x the host cell the size target is lowered (more columns and rows); on a side with `cells_a` / `cells_b` the counts may then rise above the neck's and the join's and come back to the join's count before the join (B207); it helps where the block fans out at a bank's turn, not at a staircase join's diagonal steps |
 | `fix_rings` | 0 | after the splice, meshom's mesh fixer stage a on the insert's cells and this many element rings round them (the host's coast and every other node held, the banks sliding); host nodes in the rings move less than a host cell and keep their host depth (B210) |
 | `depth_at`, `depth_smooth`, `strait_floor` | the run's | the insert's own nodes: `"node"` (box mean per node) or `"cells_deepest"`; smoothing passes among the insert's nodes only; whether the run's strait depth floors carve them (B211) |
-| `sill_level` | `""` | `"shallower"`: the insert's sill gets the shallower of the two model levels round its depth (B212) |
+| `sill_level` | `""` | `"shallower"`: the insert's sill gets the shallower of the two model levels round its depth (B212); `"grid"`: the grid's own saddle between the joins is held at the deepest level not below its depth by a dam of the insert's nodes (B215) |
+| `depth_channel` | `""` | the grid's deepest channel between the joins (box means at the fine size): `"cells"`: the insert's nodes of every cell it crosses take at least its box-mean depth there; `"near"`: the insert's nodes within one spacing of it take at least the box mean of their own box centred on it (B213) |
+| `depth_quantile` | 0 | the insert's nodes take this quantile of the grid's ocean cells in their node box instead of the mean (B214) |
 | `stages` | `"d,b,e,a"` | the clean-up stages on the join ring ([`cleanup.md`](cleanup.md); B162) |
 | `force` | false | build with the least-violating joins when none passes |
 
@@ -143,11 +145,23 @@ grid lines as they are. Choose in this order; the worked examples are the `gibra
    in FESOM3's levels with the run's rules and 280 m with the insert's (GEBCO 2024: 300 m at Camarinal).
    `sill_level = "shallower"` (B212) rounds the insert's own sill to the shallower level; use it only when the level
    bottoms leave the sill a level too deep (at Gibraltar they do not: 280 m with and without it).
+9. **The deep channel.** Where the strait's deep channel is about as wide as the insert's cells, the box mean per
+   node puts its flank nodes on the shelf and the model's element bottoms (the level nearest the mean of the
+   element's nodes) come out levels too shallow. `depth_channel = "near"` moves the box of every insert node within
+   one cell of the grid's deepest channel onto the channel (B213), and `sill_level = "grid"` then holds the grid's
+   own saddle between the joins at its level with a dam of nodes across the strait (B215); use the two together,
+   since deepening the channel alone also deepens the sill. Gibraltar (FESOM3 element bottoms, GEBCO 2024 in
+   brackets): 5.60 W 410 -> 580 m (682), 5.45 W 790 -> 910 m (976), 6.30-5.85 W 280 -> 340 m (400-600), the deepest
+   connection 280 m before and after (300 m at Camarinal); the section areas grow (5.75 W +22 -> +34 %, 5.60 W
+   -14 -> +12 % against GEBCO). `depth_channel = "cells"` raises every node of the cells the channel crosses: deeper
+   at the narrows (5.60 W 680 m) with larger sections (+48 % at 5.75 W, +34 % at 5.60 W). `depth_quantile` (a
+   quantile of the node box, B214) deepens the shelves as much as the channel; it is not part of the recipe.
 
 Gibraltar with this recipe (the `gibraltar` entry): neck 14.7 km, smallest cell 2.51 km, worst quad 106 deg, 0 above
-110 deg, the insert's cells at most 0.93 x the host cell next to them; at 5.75 W 29 km wide and 4.7 km^2 (GEBCO 30 km,
-3.8 km^2), the deepest element bottom there 280 m. Dover (the `dover` entry, without steps 7-8): worst quad 120 deg,
-none above 120 deg (B207).
+110 deg, the insert's cells at most 0.93 x the host cell next to them; at 5.75 W 29 km wide (GEBCO 30 km), 5.0 km^2 in
+FESOM3's element bottoms (GEBCO 3.7 km^2), the deepest element bottom there 280 m; the deepest connection between the
+basins 280 m (GEBCO 300 m), the element bottom 580 m at 5.60 W and 910 m at 5.45 W (GEBCO 682 and 976 m). Dover (the
+`dover` entry, without steps 7-9): worst quad 120 deg, none above 120 deg (B207).
 
 **Judging a variant** (record `insert_<name>.json`, then the model files):
 
@@ -168,17 +182,22 @@ none above 120 deg (B207).
   coast at Gibraltar);
 - banks moved into land (`bank_land_cells`) widen the strait and its sections;
 - a sill narrower than the insert's cells comes out deeper in the box mean than the grid's crest (Camarinal: 335-390 m
-  by linear interpolation at the crest against GEBCO's 300 m); the level bottoms hold the passage at 280 m.
+  by linear interpolation at the crest against GEBCO's 300 m); the level bottoms hold the passage at 280 m;
+- a sill holds its level in FESOM3's element bottoms only over two cells along the channel: the dam of
+  `sill_level = "grid"` caps the cells within one cell of it (Camarinal, cells of 4-5 km: 230-340 m from 5.80 to
+  5.70 W, GEBCO 520-540 m); only the grid's deepest connection between the joins is held, not the other saddles;
+- a node's depth is shared by every cell round it, so a deepened channel one or two cells wide deepens its flank cells
+  too: the section areas grow (B213).
 
 ## Config keys used
 
-- `[[inserts]]`: `name`, `kind`, `strait`, `path`, `cells`, `h_fine_m`, `h_min_m`, `reach_km`, `mouth_a`, `mouth_b`, `ljoins`, `bays`, `collar_rings`, `coast`, `coast_source`, `bank_sigma_cells`, `width_km`, `band_km`, `rows`, `coast_rounds`, `coast_shift_cells`, `cells_a`, `cells_b`, `growth_a`, `growth_b`, `bank_land_cells`, `fill`, `fill_rows`, `corner_steps`, `corner_split`, `join_margin`, `add_columns`, `fix_rings`, `depth_at`, `depth_smooth`, `strait_floor`, `sill_level`, `stages`, `force`
+- `[[inserts]]`: `name`, `kind`, `strait`, `path`, `cells`, `h_fine_m`, `h_min_m`, `reach_km`, `mouth_a`, `mouth_b`, `ljoins`, `bays`, `collar_rings`, `coast`, `coast_source`, `bank_sigma_cells`, `width_km`, `band_km`, `rows`, `coast_rounds`, `coast_shift_cells`, `cells_a`, `cells_b`, `growth_a`, `growth_b`, `bank_land_cells`, `fill`, `fill_rows`, `corner_steps`, `corner_split`, `join_margin`, `add_columns`, `fix_rings`, `depth_at`, `depth_smooth`, `strait_floor`, `sill_level`, `depth_channel`, `depth_quantile`, `stages`, `force`
 
 ## Sources
 
 - Code: `meshom/insert/` (`__main__.py` the command, `core.py`, `region.py` the rules, `block.py`, `band.py`,
-  `harmonic.py`, `realcoast.py`, `network.py` the bays, `assemble.py` the collar, `measure.py`),
-  `meshom/config.py` (`InsertCfg`).
+  `harmonic.py`, `realcoast.py`, `network.py` the bays, `assemble.py` the collar, `measure.py`, `channel.py` the
+  channel depth rules), `meshom/config.py` (`InsertCfg`).
 - Docs: [`docs/config.md` "`[[inserts]]`"](../config.md#inserts-python--m-meshominsert), `docs/examples/inserts.toml`,
   `docs/examples/inserts_gulf_stream.toml`.
 - Decisions: B158-B169, B180-B186, B190, B192-B212.

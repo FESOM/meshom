@@ -70,6 +70,9 @@ DEFAULTS = dict(
                               # fine ORCA in the box, the coarse ORCA outside the widened box, meshom.orca.nest's frame;
                               # B230: inner = {fine_orca (refines nest.fine_orca by 3), width, theta_deg, relax}: a
                               # second frame inside the fine box and that preset's cells inside it
+                              # B216: depth = "gebco" (default "": the run's): the nodes inside the coarse box take
+                              # the box mean per node (no smoothing, no strait floor), with depth_channel ("near",
+                              # "cells") and sill_level ("grid", "shallower") as an insert's (nest_depth)
     mask="nemo",              # B82: NEMO's mask ("nemo"), FESOM3's rules ("fesom3", B94), or "all" (every cell)
     ref_dir=None,             # the reference npz (scripts/grids/orca_refs_npz.py); None: $MESHOM_ORCA_REFS
     levels_dir=None,          # B91: NEMO's levels npz (orca_levels_npz.py, nemo_inputs_npz.py); $MESHOM_ORCA_LEVELS
@@ -242,6 +245,84 @@ def node_depth(run_dir: Path, mesh: Mesh) -> tuple[np.ndarray, np.ndarray] | Non
     d, k = cKDTree(b["points"]).query(mesh.points, distance_upper_bound=JOINT_TOL)
     hit = np.flatnonzero(np.isfinite(d))
     return hit, np.asarray(b["z"], float)[b["node_level"][k[hit]]]
+
+
+def nest_box_nodes(run_dir: Path, mesh: Mesh) -> np.ndarray | None:
+    """B216: (N,) bool, the nodes of `mesh` strictly inside the nest's coarse box: the coarse grid's F points on the
+    box's four lines (orca_belt.npz) as one loop, meshom.size.polygon_inside; the loop's own points (the frame's ring
+    0, nodes of the coarse grid) are outside. None when the run has no nest."""
+    from meshom.geo import lonlat_to_xyz
+    from meshom.size import polygon_inside
+
+    f = Path(run_dir) / "orca_belt.npz"
+    if not f.exists():
+        return None
+    b = np.load(f)
+    if "nest_coarse_box" not in b.files:
+        return None
+    c0, c1, r0, r1 = map(int, b["nest_coarse_box"])
+    lon, lat = b["lon"], b["lat"]                             # F rows t_rows[0] - 1 .. t_rows[1], columns 0 .. ni - 1
+    k0, ni = int(b["t_rows"][0]) - 1, lon.shape[1]
+    rows = np.r_[np.full(c1 - c0, r0), np.arange(r0, r1), np.full(c1 - c0, r1), np.arange(r1, r0, -1)] - k0
+    cols = np.r_[np.arange(c0, c1), np.full(r1 - r0, c1), np.arange(c1, c0, -1), np.full(r1 - r0, c0)] % ni
+    loop = lonlat_to_xyz(lon[rows, cols], lat[rows, cols])
+    d, _ = cKDTree(loop).query(mesh.points, distance_upper_bound=JOINT_TOL)
+    return polygon_inside(mesh.points, loop) & ~np.isfinite(d)
+
+
+def _canonical(e: np.ndarray) -> np.ndarray:
+    """Elements in an order of their own: each turned to start at its smallest node id (orientation kept), the rows
+    sorted."""
+    if not len(e):
+        return e
+    k = e.shape[1]
+    e = np.take_along_axis(e, (np.argmin(e, axis=1)[:, None] + np.arange(k)) % k, axis=1)
+    return e[np.lexsort(e.T[::-1])]
+
+
+def nest_depth(run_dir: Path, mesh: Mesh, depth: np.ndarray, cfg, fmt: str, log=print) -> tuple[np.ndarray, dict]:
+    """B216, `nest.depth = "gebco"`: the nodes strictly inside the nest's coarse box (nest_box_nodes) take meshom's
+    grid rule as an insert's own nodes do (meshom.insert.core.rule_depth, B211): the box mean per node, no smoothing,
+    no strait depth floor, the run's slope limiter, the depth floor and the regions; with `nest.depth_channel` the
+    channel raise (B213; the line's ends: the deepest node of each of the two largest wet pieces of the box's edge;
+    box means at the median spacing of the box's nodes) and with `nest.sill_level` the sill (B212 / B215). Computed on
+    the box's cells and one cell ring round them, nodes ordered by position and cells by their nodes, so the depth is
+    the same in every mesh that holds the box's cells (an insert elsewhere recomputes it exactly). Every other node
+    keeps `depth`. Returns (depth, record)."""
+    from meshom.insert.core import rule_depth
+
+    o = cfg.mesh.opts.get("nest") or {}
+    inside = nest_box_nodes(run_dir, mesh)
+    if inside is None or not inside.any():
+        return depth, {"nodes": 0}
+    T = mesh.n_tris
+
+    def cells_of(nodes):
+        return np.r_[nodes[mesh.tris].any(1) if T else np.zeros(0, bool), nodes[mesh.quads].any(1)]
+
+    near = np.zeros(mesh.n_nodes, bool)
+    c = cells_of(inside)
+    near[mesh.tris[c[:T]].ravel()] = True
+    near[mesh.quads[c[T:]].ravel()] = True
+    c = cells_of(near)                                        # the box's cells and one ring round them
+    wid = np.unique(np.r_[mesh.tris[c[:T]].ravel(), mesh.quads[c[T:]].ravel()])
+    wid = wid[np.lexsort(mesh.points[wid].T[::-1])]
+    loc = np.full(mesh.n_nodes, -1, np.int64)
+    loc[wid] = np.arange(len(wid))
+    sub = Mesh(mesh.points[wid], _canonical(loc[mesh.tris[c[:T]]].reshape(-1, 3)),
+               _canonical(loc[mesh.quads[c[T:]]].reshape(-1, 4)), np.zeros(len(wid), np.int8))
+    ins = inside[wid]
+    d, rec = rule_depth(sub, ins, depth[wid], cfg, fmt, None, depth_at="node", depth_smooth=0, strait_floor=False,
+                        sill_level=str(o.get("sill_level") or ""), depth_channel=str(o.get("depth_channel") or ""),
+                        tag="[nest]", log=log)
+    out = np.array(depth, dtype=np.float64)
+    out[wid[ins]] = d[ins]
+    rec["change_m"] = {"min": float((d - depth[wid])[ins].min()), "max": float((d - depth[wid])[ins].max())}
+    log(f"[nest] depth of the {int(ins.sum())} nodes inside the coarse box: the box mean per node, no smoothing, no "
+        f"strait floor{', channel ' + o['depth_channel'] if o.get('depth_channel') else ''}"
+        f"{', sill ' + o['sill_level'] if o.get('sill_level') else ''}: {d[ins].min():.0f}-{d[ins].max():.0f} m "
+        f"(before: {depth[wid][ins].min():.0f}-{depth[wid][ins].max():.0f} m)", flush=True)
+    return out, rec
 
 
 def _rows(g, lat_south, lat_north) -> tuple[int, int, bool, bool]:

@@ -26,7 +26,9 @@ python -m meshom.insert --run RUN_DIR --insert 'name=gib; strait=Gibraltar; cell
 
 Run it on a compute node. `--config` takes every `[[inserts]]` entry of a TOML file (a file of `[[inserts]]` alone,
 or a run config); `--insert` one entry inline as `key=value; ...` with TOML values. `--mesh` picks another mesh of
-the run folder (or a path to an `.npz`), so inserts chain: give the next one the previous `insert_<name>.npz`. The
+the run folder (or a path to an `.npz`), so inserts chain: give the next one the previous `insert_<name>.npz`; its
+saved depth (`fesom-insert_<name>/depth.npy`) is kept on every host node, so the first insert's own depth rule
+survives (B217). The
 general recipe with one example of each kind: `docs/examples/inserts.toml`; corridors and strips:
 `docs/examples/inserts_gulf_stream.toml`.
 

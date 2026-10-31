@@ -90,6 +90,10 @@ Report it; do not try to fix it.
   cells inside it, so the box goes from ORCA025 to ORCA36 in two frames and holds no ORCA12 cells. h: a second
   `blend` zone (`h_factor = 1/3`, `polygon` the inner box's edge, `outer` the nest's box's edge). For a strait this
   gives the cells NEMO's finer grid has there (Gibraltar: 6 at the narrowest section in ORCA36, 3 in ORCA12).
+- **The nest's depth** (`[mesh.opts.nest] depth = "gebco"`, B216): the nodes inside the coarse box take the box
+  mean per node (no smoothing, no strait floor) instead of FESOM3's ORCA depth, which digs a strait's sills too deep;
+  for a strait add `depth_channel = "near"` and `sill_level = "grid"` (as the Gibraltar insert). Only the depth
+  changes: write the saved mesh again with `meshom write` instead of a new run.
 
 ## FESOM3's ORCA rules
 

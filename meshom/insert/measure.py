@@ -333,14 +333,15 @@ def cells(mesh: Mesh, case_kind: np.ndarray | None = None) -> dict:
 def host_moved(host: Mesh, mesh: Mesh, h_host: float, kept: np.ndarray, collar: np.ndarray | None = None) -> dict:
     """Host nodes the insert moved (B192): of the host window's nodes `kept` ((N,) bool: those a host cell outside the
     replaced region uses, the joins included), the ones that are no node of mesh at their exact position -- count
-    and the largest distance to mesh's nearest node in host cells; with collar ((N,) bool: the host nodes the
-    collar may move), the moved nodes beyond it (must be 0)."""
+    and the largest distance to mesh's nearest node in host cells, and their ids ("ids"); with collar ((N,) bool: the
+    host nodes the collar may move), the moved nodes beyond it (must be 0)."""
     from scipy.spatial import cKDTree
 
     d, _ = cKDTree(mesh.points).query(host.points)
     moved = (d >= 1e-12) & np.asarray(kept, bool)
     dist = R_EARTH_M * 2 * np.arcsin(np.minimum(1.0, 0.5 * d))
-    out = {"moved": int(moved.sum()), "largest_host_cells": float(dist[moved].max() / h_host) if moved.any() else 0.0}
+    out = {"moved": int(moved.sum()), "largest_host_cells": float(dist[moved].max() / h_host) if moved.any() else 0.0,
+           "ids": np.flatnonzero(moved)}
     if collar is not None:
         out["beyond_collar"] = int((moved & ~np.asarray(collar, bool)).sum())
     return out

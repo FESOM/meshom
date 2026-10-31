@@ -87,6 +87,7 @@ class Result:
     ring_case: object = None
     real: object = None                      # the RealCoast (B164) or None
     ring_out: object = None                  # the cleaned case's mesh (B192)
+    collar_moved: np.ndarray | None = None   # B217: the host window's nodes the collar moved (window node ids)
 
 
 def _ll(a) -> np.ndarray | None:
@@ -439,7 +440,7 @@ def insert_window(win: Window, spec: Spec, h_run, tol=0.20, gates=None, log=prin
                                                rings=rings, clean_h=spec.clean_h, **assemble.collar_opts(host_fixed))
     rec["timing"]["clean_s"] = time.perf_counter() - t
     rec["clean"] = crec
-    rec["collar"] = collar_record(mesh, reg, m, case, ring_out, out, h_host, rings, host_fixed)
+    rec["collar"], collar_ids = collar_record(mesh, reg, m, case, ring_out, out, h_host, rings, host_fixed)
     try:
         from meshom.meshfix.score import score as ms
 
@@ -502,10 +503,10 @@ def insert_window(win: Window, spec: Spec, h_run, tol=0.20, gates=None, log=prin
                           f"{np.floor(fl['smallest_m']):.0f} m{by_cells}"]
         log(f"[insert {spec.name}] REFUSED {rec['refused'][0]}", flush=True)
         res = Result(False, rec, out, m.mesh, win, chart, prof, joins, cands, outline, h_ins, case)
-        res.real, res.ring_out = rc, ring_out
+        res.real, res.ring_out, res.collar_moved = rc, ring_out, collar_ids
         return res
     res = Result(True, rec, out, m.mesh, win, chart, prof, joins, cands, outline, h_ins, case)
-    res.real, res.ring_out = rc, ring_out
+    res.real, res.ring_out, res.collar_moved = rc, ring_out, collar_ids
     return res
 
 
@@ -556,9 +557,10 @@ def land_record(rc, chart: Chart, xyA, xyB, banks, base) -> dict:
 
 
 def collar_record(host: Mesh, reg: np.ndarray, m, case, ring_out: Mesh, out: Mesh, h_host: float, rings: int,
-                  host_fixed: bool) -> dict:
+                  host_fixed: bool) -> tuple[dict, np.ndarray]:
     """B192: the collar's measures: its cells before and after the cleaning (measure.cells), the host nodes moved
-    (count, the largest move in host cells) and those beyond the collar (must be 0)."""
+    (count, the largest move in host cells) and those beyond the collar (must be 0); and the ids in `host` of the
+    host nodes moved (B217). Returns (record, ids)."""
     T = host.n_tris
     kept = np.zeros(host.n_nodes, bool)
     kept[host.tris[~reg[:T]].ravel()] = True
@@ -568,9 +570,10 @@ def collar_record(host: Mesh, reg: np.ndarray, m, case, ring_out: Mesh, out: Mes
     if len(free):
         collar = cKDTree(free).query(host.points)[0] < assemble.MATCH_CHORD
     mv = measure.host_moved(host, out, h_host, kept, collar)
-    return {"rings": int(rings), "host_fixed": bool(host_fixed), "before": measure.cells(case.mesh, case.kind),
-            "after": measure.cells(ring_out), "host_moved": mv["moved"],
-            "host_moved_max_cells": mv["largest_host_cells"], "beyond_collar_moved": mv["beyond_collar"]}
+    return ({"rings": int(rings), "host_fixed": bool(host_fixed), "before": measure.cells(case.mesh, case.kind),
+             "after": measure.cells(ring_out), "host_moved": mv["moved"],
+             "host_moved_max_cells": mv["largest_host_cells"], "beyond_collar_moved": mv["beyond_collar"]},
+            mv["ids"])
 
 
 def _small(s: dict) -> dict:
@@ -689,39 +692,101 @@ def fix_spliced(mesh: Mesh, win: Window, res: Result, full: Mesh, sinfo: dict, s
 
 
 SILL_MARGIN_M = 1.0          # B212: the sill's nodes are capped this far above the midpoint between the two levels
+COLLAR_MATCH_H = 1.5         # B217: a host node the collar moved is matched within this many of its spacings
+
+
+def host_depth_of(src: Path, n_nodes: int) -> np.ndarray | None:
+    """B217: the saved depth of a host mesh that is an insert's result (insert_<name>.npz: fesom-insert_<name>/depth.npy
+    beside it, written after the mesh, one value per node), else None (the host's depth is then the run's rules)."""
+    f = src.parent / f"fesom-{src.stem}" / "depth.npy"
+    if not (src.stem.startswith("insert_") and f.exists() and f.stat().st_mtime >= src.stat().st_mtime):
+        return None
+    d = np.load(f)
+    return d if len(d) == n_nodes else None
+
+
+def collar_moved(win: Window, res: Result, full: Mesh, sinfo: dict) -> tuple[np.ndarray, np.ndarray, dict]:
+    """B217: the host nodes the collar moved (res.collar_moved: the host window's nodes outside the replaced region
+    that are no node of the cleaned window at their position, B192) and their nodes in the spliced mesh, which the
+    splice appended: a one-to-one match of the moved nodes to appended nodes within COLLAR_MATCH_H of their host
+    spacing (mean edge length) with the least sum of distances (the most matches first). Returns (ids in the spliced
+    mesh, host ids, record: moved, matched, the largest move, the unmatched ones)."""
+    from scipy.optimize import linear_sum_assignment
+
+    from meshom.bathymetry import node_spacing_m
+
+    wm = np.asarray(res.collar_moved if res.collar_moved is not None else [], np.int64)
+    none = np.zeros(0, np.int64)
+    if not len(wm):
+        return none, none, {"moved": 0, "matched": 0}
+    app = np.arange(full.n_nodes - sinfo["appended_nodes"], full.n_nodes)
+    if not len(app):
+        return none, none, {"moved": int(len(wm)), "matched": 0}
+    sp, _, _ = node_spacing_m(win.mesh)
+    chord = 2.0 * np.sin(0.5 * COLLAR_MATCH_H * sp[wm] / R_EARTH_M)
+    k = min(8, len(app))
+    dist, j = cKDTree(full.points[app]).query(win.mesh.points[wm], k=k)
+    dist, j = dist.reshape(len(wm), k), j.reshape(len(wm), k)
+    ok = dist <= chord[:, None]
+    cand = np.unique(j[ok])
+    big = 1e3                                               # no pair: far above any sum of real chords
+    C = np.full((len(wm), max(len(cand), 1)), big)
+    r = np.repeat(np.arange(len(wm)), k).reshape(len(wm), k)[ok]
+    C[r, np.searchsorted(cand, j[ok])] = dist[ok]
+    ri, ci = linear_sum_assignment(C)
+    m = C[ri, ci] < big
+    ri, ci = ri[m], ci[m]
+    km = 2.0 * np.arcsin(0.5 * C[ri, ci]) * R_EARTH_M / 1e3 if len(ri) else np.zeros(1)
+    left = np.setdiff1d(np.arange(len(wm)), ri)
+    lo, la = xyz_to_lonlat(win.mesh.points[wm[left]])
+    near = 2.0 * np.arcsin(0.5 * np.minimum(dist[left, 0], 2.0)) * R_EARTH_M / np.maximum(sp[wm[left]], 1.0)
+    rec = {"moved": int(len(wm)), "matched": int(len(ri)), "move_max_km": float(km.max()),
+           "unmatched": [{"lonlat": [round(float(x), 4), round(float(y), 4)], "nearest_spacings": round(float(q), 2)}
+                         for x, y, q in zip(lo, la, near)]}
+    return app[cand[ci]].astype(np.int64), win.old_id[wm[ri]].astype(np.int64), rec
 
 
 def insert_depth(depth: np.ndarray, mesh: Mesh, win: Window, res: Result, full: Mesh, sinfo: dict, h2n: np.ndarray,
-                 moved: np.ndarray | None, spec: Spec, cfg, fmt: str, straits: list, run_dir: Path, log=print):
-    """The model depth of the spliced mesh after meshom.run.model_depth (the run's rules on every node): with
-    fix_rings the host nodes it moved keep their host depth (B210: the run's rules on the host window, where they
-    stand at their host positions); with an own rule of the insert (B211: depth_at, depth_smooth, strait_floor) its
-    own nodes (those the splice appended) take that rule on the window's part of the mesh: the grid rule, the
-    smoothing (None: the run's passes over the whole part; a number: that many passes among the insert's nodes only),
-    the run's slope limiter, the strait depth floors when strait_floor, the depth floor and the run's regions;
-    depth_quantile (B214) replaces the grid rule's value by a quantile of the node box, depth_channel (B213) raises
-    the nodes along the grid's deepest channel between the joins, and sill_level "shallower" (B212) then rounds the
-    sill up in the model's levels (sill_shallower), "grid" (B215) holds the grid's saddle at its level
-    (meshom.insert.channel). Returns (depth, record)."""
+                 moved: np.ndarray | None, spec: Spec, cfg, fmt: str, straits: list, run_dir: Path, log=print,
+                 host: np.ndarray | None = None, collar: tuple | None = None):
+    """The model depth of the spliced mesh after meshom.run.model_depth (the run's rules on every node): `host` (the
+    host mesh's own depth when it is an insert's result, host_depth_of) on every host node the splice kept (B217);
+    the host nodes fix_rings moved (B210) and those the collar moved (`collar`: (ids in the spliced mesh, host ids),
+    collar_moved, B217) keep their host depth (`host`, else the run's rules on the host window, where they stand at
+    their host positions); with an own rule of the insert (B211-B215: depth_at, depth_smooth, strait_floor,
+    depth_quantile, depth_channel, sill_level) its own nodes (those the splice appended, less the collar's moved host
+    nodes) take that rule on the window's part of the mesh (rule_depth). Returns (depth, record)."""
     from meshom import run as runmod
-    from meshom.bathymetry import (apply_regions, cells_deepest_depth, depth_policy, levels, node_area_m2,
-                                   node_depth, node_spacing_m, smooth_depth)
 
     b = cfg.bathymetry
     rec = {"host_moved_kept": 0}
     depth = np.asarray(depth, dtype=np.float64).copy()
-    if moved is not None and len(moved):
-        hd = runmod.model_depth(win.mesh, cfg, fmt, straits, run_dir)
-        host_of = np.full(full.n_nodes, -1, np.int64)
-        ok = h2n >= 0
-        host_of[h2n[ok]] = np.flatnonzero(ok)
-        wpos = np.full(mesh.n_nodes, -1, np.int64)
-        wpos[win.old_id] = np.arange(len(win.old_id))
-        k = wpos[host_of[moved]]
-        assert (k >= 0).all()
-        rec["host_moved_kept"] = int(len(moved))
-        rec["host_moved_change_m"] = float(np.abs(depth[moved] - hd[k]).max())
-        depth[moved] = hd[k]
+    ok = h2n >= 0
+    if host is not None:                                   # B217: a chain: the host mesh's own depth on its kept nodes
+        depth[h2n[ok]] = host[ok]
+        rec["host_depth"] = {"source": "the host mesh's own (an insert's result)", "nodes": int(ok.sum())}
+    host_of = np.full(full.n_nodes, -1, np.int64)
+    host_of[h2n[ok]] = np.flatnonzero(ok)
+    fid = np.asarray(moved if moved is not None else [], np.int64)
+    hid = host_of[fid]
+    cm = np.zeros(full.n_nodes, bool)
+    if collar is not None and len(collar[0]):
+        cm[collar[0]] = True
+        fid, hid = np.r_[fid, collar[0]], np.r_[hid, collar[1]]
+        rec["collar_moved_kept"] = int(len(collar[0]))
+    if len(fid):
+        if host is not None:
+            hd = host[hid]
+        else:
+            hw = runmod.model_depth(win.mesh, cfg, fmt, straits, run_dir)
+            wpos = np.full(mesh.n_nodes, -1, np.int64)
+            wpos[win.old_id] = np.arange(len(win.old_id))
+            k = wpos[hid]
+            assert (k >= 0).all()
+            hd = hw[k]
+        rec["host_moved_kept"] = int(len(fid))
+        rec["host_moved_change_m"] = float(np.abs(depth[fid] - hd).max())
+        depth[fid] = hd
     own = (bool(spec.depth_at) or spec.depth_smooth is not None or not spec.strait_floor or bool(spec.sill_level)
            or bool(spec.depth_channel) or spec.depth_quantile > 0)
     if b.source == "none" or not own:
@@ -733,12 +798,45 @@ def insert_depth(depth: np.ndarray, mesh: Mesh, win: Window, res: Result, full: 
     loc[wid] = np.arange(len(wid))
     sub = Mesh(full.points[wid], loc[full.tris[part[:T0]]].reshape(-1, 3), loc[full.quads[part[T0:]]].reshape(-1, 4),
                np.zeros(len(wid), np.int8))
-    ins = wid >= full.n_nodes - sinfo["appended_nodes"]               # the insert's own nodes (appended last)
+    ins = (wid >= full.n_nodes - sinfo["appended_nodes"]) & ~cm[wid]   # the insert's own nodes (appended last)
+    d, r = rule_depth(sub, ins, depth[wid], cfg, fmt, straits, spec.depth_at, spec.depth_smooth, spec.strait_floor,
+                      spec.sill_level, spec.depth_channel, spec.depth_quantile,
+                      res.profile.h_fine if res.profile is not None else None, f"[insert {spec.name}]", log)
+    r["insert_nodes"], r["insert_m"] = r.pop("nodes"), r.pop("nodes_m")
+    rec.update(r)
+    depth[wid[ins]] = d[ins]
+    ru = rec["rule"]
+    log(f"[insert {spec.name}] depth of the insert's {int(ins.sum())} nodes: {ru['depth_at']}, {ru['smooth_passes']} "
+        f"smoothing passes ({ru['smooth_among']}), strait floors {'on' if spec.strait_floor else 'off'}: "
+        f"{d[ins].min():.0f}-{d[ins].max():.0f} m (the run's rules: {rec['run_rule_m']['min']:.0f}-"
+        f"{rec['run_rule_m']['max']:.0f} m); host nodes kept at their host depth {rec['host_moved_kept']}", flush=True)
+    return depth, rec
+
+
+def rule_depth(sub: Mesh, ins: np.ndarray, base: np.ndarray, cfg, fmt: str, straits: list | None, depth_at: str = "",
+               depth_smooth: int | None = None, strait_floor: bool = True, sill_level: str = "",
+               depth_channel: str = "", depth_quantile: float = 0.0, h_fine: float | None = None, tag: str = "",
+               log=print) -> tuple[np.ndarray, dict]:
+    """An own depth rule (B211-B215) on the nodes `ins` of `sub`, a part of a mesh that holds every cell round them
+    (insert_depth: the insert's own nodes; meshom.methods.m16_orca.nest_depth: the nodes inside a nest's coarse box,
+    B216); `base`: the depth of `sub`'s nodes by the run's rules. The grid rule `depth_at` ("": the run's),
+    depth_quantile (B214: a quantile of the node box instead of the mean), `depth_smooth` passes among `ins` (None:
+    the run's passes over the whole part), the run's slope limiter, the strait depth floors with `strait_floor`, the
+    depth floor and the run's regions; then depth_channel (B213: the channel line between the two largest pieces of
+    the other nodes of the cells of `ins` (the joins), box means at h_fine, None: the median spacing of `ins`) and
+    sill_level ("shallower", B212: sill_shallower; "grid", B215: meshom.insert.channel.grid_sill). `tag` heads the
+    log lines. Returns (the depth on `sub`, the rule's values on `ins`; the record)."""
+    from meshom import run as runmod
+    from meshom.bathymetry import (apply_regions, cells_deepest_depth, depth_policy, levels, node_area_m2,
+                                   node_depth, node_spacing_m, smooth_depth)
+
+    b = cfg.bathymetry
+    rec = {}
     floor = runmod.depth_floor_m(cfg, fmt)
-    at = spec.depth_at or b.depth_at
+    at = depth_at or b.depth_at
     d, info = (cells_deepest_depth if at == "cells_deepest" else node_depth)(sub, Path(b.source), b.variable, floor)
     grid = None
-    if spec.depth_quantile > 0 or spec.depth_channel or spec.sill_level == "grid":
+    if depth_quantile > 0 or depth_channel or sill_level == "grid":
         from meshom.insert import channel as chan
         from meshom.mesh import signed_area
 
@@ -748,58 +846,53 @@ def insert_depth(depth: np.ndarray, mesh: Mesh, win: Window, res: Result, full: 
         nodes_ins = np.unique(np.r_[sub.tris[cells_ins[:sub.n_tris]].ravel(), sub.quads[cells_ins[sub.n_tris:]].ravel()])
         lo_, la_ = xyz_to_lonlat(sub.points[nodes_ins])
         grid = chan.read_window(Path(b.source), b.variable, lo_, la_, 2.0 * r_max)
-    if spec.depth_quantile > 0:
-        d, rec["quantile"] = chan.node_quantile(sub, d, ins, grid, spec.depth_quantile, floor)
+    if depth_quantile > 0:
+        d, rec["quantile"] = chan.node_quantile(sub, d, ins, grid, depth_quantile, floor)
     _, edges, _ = node_spacing_m(sub)
     area = node_area_m2(sub)
-    passes = b.smooth_passes if spec.depth_smooth is None else int(spec.depth_smooth)
-    d = smooth_depth(d, edges, area, passes, nodes=None if spec.depth_smooth is None else ins)
-    d, pol = depth_policy(sub, d, floor, 0, b.max_slope, straits if spec.strait_floor else None, b.carve_taper)
+    passes = b.smooth_passes if depth_smooth is None else int(depth_smooth)
+    d = smooth_depth(d, edges, area, passes, nodes=None if depth_smooth is None else ins)
+    d, pol = depth_policy(sub, d, floor, 0, b.max_slope, straits if strait_floor else None, b.carve_taper)
     if b.regions:
         d, _ = apply_regions(sub, d, b.regions, floor)
-    rec.update(rule={"depth_at": at, "smooth_passes": passes, "smooth_among": "run" if spec.depth_smooth is None
-                     else "insert", "strait_floor": bool(spec.strait_floor), "sill_level": spec.sill_level or None,
-                     "depth_channel": spec.depth_channel or None, "depth_quantile": spec.depth_quantile or None},
-               insert_nodes=int(ins.sum()), grid=info.get("depth_m"),
+    rec.update(rule={"depth_at": at, "smooth_passes": passes, "smooth_among": "run" if depth_smooth is None
+                     else "insert", "strait_floor": bool(strait_floor), "sill_level": sill_level or None,
+                     "depth_channel": depth_channel or None, "depth_quantile": depth_quantile or None},
+               nodes=int(ins.sum()), grid=info.get("depth_m"),
                strait_depth_floor=pol.get("strait_depth_floor"),
-               run_rule_m={"min": float(depth[wid[ins]].min()), "max": float(depth[wid[ins]].max())})
+               run_rule_m={"min": float(base[ins].min()), "max": float(base[ins].max())})
     line = None
-    if spec.depth_channel or spec.sill_level == "grid":
-        h_f = res.profile.h_fine if res.profile is not None else float(np.median(node_spacing_m(sub)[0][ins]))
-        line = chan.channel_line(sub, ins, depth[wid], grid, h_f)
+    if depth_channel or sill_level == "grid":
+        h_f = h_fine if h_fine is not None else float(np.median(node_spacing_m(sub)[0][ins]))
+        line = chan.channel_line(sub, ins, base, grid, h_f)
         rec["channel"] = line.record if line is not None else {"skipped": "the insert has no two joins"}
         if line is not None:
-            log(f"[insert {spec.name}] channel line {line.record['km']:.0f} km (box means at {h_f / 1e3:.2f} km), "
+            log(f"{tag} channel line {line.record['km']:.0f} km (box means at {h_f / 1e3:.2f} km), "
                 f"its deepest connection {line.record['deepest_connection_box_m']:.0f} m; the grid's saddle "
                 f"{line.saddle[0]:.0f} m at {line.record['grid_saddle']['at']}", flush=True)
-        if line is not None and spec.depth_channel:
-            d, rec["channel"]["raise"] = chan.line_raise(sub, d, ins, grid, line, spec.depth_channel)
+        if line is not None and depth_channel:
+            d, rec["channel"]["raise"] = chan.line_raise(sub, d, ins, grid, line, depth_channel)
             r = rec["channel"]["raise"]
-            log(f"[insert {spec.name}] depth_channel {spec.depth_channel}: {r['nodes_raised']} nodes raised, by up to "
+            log(f"{tag} depth_channel {depth_channel}: {r['nodes_raised']} nodes raised, by up to "
                 f"{r['raise_max_m']:.0f} m (mean {r['raise_mean_m']:.0f} m)", flush=True)
-    if spec.sill_level == "shallower":
+    if sill_level == "shallower":
         d, rec["sill"] = sill_shallower(sub, d, ins, levels(b.levels))
         s = rec["sill"]
         if "barrier_m" in s:
-            log(f"[insert {spec.name}] sill {s['barrier_m']:.1f} m at {s['at']}: level {s['level_m']:.0f} m, "
+            log(f"{tag} sill {s['barrier_m']:.1f} m at {s['at']}: level {s['level_m']:.0f} m, "
                 f"{s['capped']} nodes capped at {s['cap_m']:.1f} m (largest cut {s['cut_max_m']:.1f} m)", flush=True)
-    elif spec.sill_level == "grid":
+    elif sill_level == "grid":
         d, rec["sill"] = (chan.grid_sill(sub, d, ins, line, levels(b.levels)) if line is not None
                           else (d, {"skipped": "no channel line"}))
         s = rec["sill"]
         if "cap_m" in s:
-            log(f"[insert {spec.name}] the grid's saddle {s['saddle_m']:.0f} m at {s['saddle_at']}: level "
+            log(f"{tag} the grid's saddle {s['saddle_m']:.0f} m at {s['saddle_at']}: level "
                 f"{s['level_m']:.0f} m, a dam of {s['chain_nodes']} nodes through {s['via']}, {s['capped']} nodes "
                 f"capped at {s['cap_m']:.1f} m (largest cut {s['cut_max_m']:.0f} m)", flush=True)
         else:
-            log(f"[insert {spec.name}] sill_level grid: {s}", flush=True)
-    depth[wid[ins]] = d[ins]
-    rec["insert_m"] = {"min": float(d[ins].min()), "max": float(d[ins].max())}
-    log(f"[insert {spec.name}] depth of the insert's {int(ins.sum())} nodes: {at}, {passes} smoothing passes "
-        f"({rec['rule']['smooth_among']}), strait floors {'on' if spec.strait_floor else 'off'}: "
-        f"{d[ins].min():.0f}-{d[ins].max():.0f} m (the run's rules: {rec['run_rule_m']['min']:.0f}-"
-        f"{rec['run_rule_m']['max']:.0f} m); host nodes kept at their host depth {rec['host_moved_kept']}", flush=True)
-    return depth, rec
+            log(f"{tag} sill_level grid: {s}", flush=True)
+    rec["nodes_m"] = {"min": float(d[ins].min()), "max": float(d[ins].max())}
+    return d, rec
 
 
 def sill_shallower(sub: Mesh, depth: np.ndarray, ins: np.ndarray, zbar: np.ndarray) -> tuple[np.ndarray, dict]:
@@ -900,8 +993,10 @@ def run(run_dir: Path, spec: Spec, out_dir: Path | None = None, mesh_name: str |
     """The insert in a finished run (module docstring): writes <out>/insert_<name>.npz, .json (the record),
     .score.json (zone scores and the ring's meshfix score), .map.png, .profile.png and, when the run wrote model
     files, fesom-insert_<name>/ in the run's format with depth by the run's bathymetry rules (insert_depth: the
-    insert's own rule, B211-B215). With fix_rings the spliced mesh is smoothed first (fix_spliced, B210). Returns the
-    record."""
+    insert's own rule, B211-B215; on another insert's result its saved depth on the host nodes, B217). With fix_rings
+    the spliced mesh is smoothed first (fix_spliced, B210). Also <out>/insert_<name>.host_to_new.npy (host node id ->
+    id in the result, -1 dropped) and .collar_moved.npy (2, K): the ids in the result and the host ids of the host
+    nodes the collar moved (B217). Returns the record."""
     from meshom import compete
     from meshom import run as runmod
     from meshom.config import load as load_cfg
@@ -957,6 +1052,7 @@ def run(run_dir: Path, spec: Spec, out_dir: Path | None = None, mesh_name: str |
         t = time.perf_counter()
         full, sinfo = splice(mesh, win, res.window)
         rec["timing"]["splice_s"] = time.perf_counter() - t
+        cfid, chid, rec["collar_moved"] = collar_moved(win, res, full, sinfo)      # B217, before any fixer move
         if spec.fix_rings > 0 and res.record.get("valid"):           # B210: stage a on the insert and its rings
             full, rec["fix_rings"], moved, res.window = fix_spliced(mesh, win, res, full, sinfo, spec, h_min, log)
     seg = res.chart.fwd(win.mesh.points)[win.coast_edges]
@@ -981,6 +1077,7 @@ def run(run_dir: Path, spec: Spec, out_dir: Path | None = None, mesh_name: str |
         return rec
     h2n = sinfo.pop("host_to_new")
     np.save(stem.parent / (stem.name + ".host_to_new.npy"), h2n)
+    np.save(stem.parent / (stem.name + ".collar_moved.npy"), np.stack([cfid, chid]))
     rec["splice"] = sinfo
     rec["validity"] = {"host": measure.validity(mesh), "final": measure.validity(full)}
     compete._save(full, stem.with_suffix(".npz"))
@@ -991,7 +1088,7 @@ def run(run_dir: Path, spec: Spec, out_dir: Path | None = None, mesh_name: str |
         meta = {}
         depth = runmod.model_depth(full, cfg, fmt, straits, run_dir, meta)
         depth, rec["depth"] = insert_depth(depth, mesh, win, res, full, sinfo, h2n, moved, spec, cfg, fmt, straits,
-                                           run_dir, log)
+                                           run_dir, log, host=host_depth_of(src, mesh.n_nodes), collar=(cfid, chid))
         fdir = out_dir / f"fesom-insert_{spec.name}"
         fdir.mkdir(exist_ok=True)
         np.save(fdir / "depth.npy", depth)

@@ -43,7 +43,8 @@ growth_b = 0.15
 bank_land_cells = 1.0
 
 # Fill lines: the Bay of Seine and the Thames estuary cut off the main block by two drawn lines, so its columns are not
-# stretched over them; the water behind each line is meshed as a strip of its own hanging off that bank.
+# stretched over them; the water behind each line is meshed as a strip of its own hanging off that bank. On ORCA025 v5
+# the Channel join's candidates with its 6 host edges fail the corner rule, so `force` takes the best of them.
 [[inserts]]
 name = "dover_filled"
 path = [[-1.9, 50.15], [-0.6, 50.35], [0.7, 50.65], [1.45, 51.0], [2.1, 51.45], [2.9, 51.95], [3.2, 52.6]]
@@ -51,13 +52,14 @@ cells = 5
 reach_km = 450.0
 cells_a = 6
 cells_b = 11
+force = true
 bank_land_cells = 1.0
 fill = [[[-1.25, 49.60], [-0.5, 49.65], [0.0, 49.72], [0.3, 49.77], [0.5, 49.88], [1.0, 49.90], [1.3, 50.05], [1.6, 50.18]],
         [[1.05, 51.42], [1.25, 51.55], [1.45, 51.68], [1.50, 51.85], [1.50, 52.10]]]
 
 # More columns: the same strait with `add_columns`: the Channel join keeps its 6 host edges, but where the rows are long (the
 # Channel west of Dover, the bank's turn at the Somme) the block gets more columns and rows, so its cells stay near the
-# host's size, and the counts come back to 6 before the join.
+# host's size, and the counts come back to 6 before the join (`force` as above).
 [[inserts]]
 name = "dover"
 path = [[-1.9, 50.15], [-0.6, 50.35], [0.7, 50.65], [1.45, 51.0], [2.1, 51.45], [2.9, 51.95], [3.2, 52.6]]
@@ -66,6 +68,7 @@ reach_km = 450.0
 cells_a = 6
 cells_b = 11
 add_columns = true
+force = true
 bank_land_cells = 1.0
 fill = [[[-1.25, 49.60], [-0.5, 49.65], [0.0, 49.72], [0.3, 49.77], [0.5, 49.88], [1.0, 49.90], [1.3, 50.05], [1.6, 50.18]],
         [[1.05, 51.42], [1.25, 51.55], [1.45, 51.68], [1.50, 51.85], [1.50, 52.10]]]

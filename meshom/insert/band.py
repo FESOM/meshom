@@ -456,7 +456,7 @@ def insert_band(win: Window, spec, h_run, tol=0.20, gates=None, log=print, real=
                                                clean_h=spec.clean_h, **assemble.collar_opts(host_fixed))
     rec["timing"]["clean_s"] = time.perf_counter() - t
     rec["clean"] = crec
-    rec["collar"] = collar_record(mesh, reg, m, case, ring_out, out, h_host, rings, host_fixed)
+    rec["collar"], collar_ids = collar_record(mesh, reg, m, case, ring_out, out, h_host, rings, host_fixed)
     try:
         from meshom.meshfix.score import score as ms
 
@@ -508,7 +508,7 @@ def insert_band(win: Window, spec, h_run, tol=0.20, gates=None, log=print, real=
         f"{fl['below']} below", flush=True)
     rec["timing"]["total_s"] = time.perf_counter() - t0
     res = Result(False, rec, out, m.mesh, win, chart, None, [], [], outline, h_ins, case)
-    res.real, res.ring_out = rc, ring_out
+    res.real, res.ring_out, res.collar_moved = rc, ring_out, collar_ids
     r_z = 0.75 * depth
     zooms = [("spine end P", spine[0], r_z), ("spine end Q", spine[-1], r_z),
              ("host chain start", xy[chains[0][0]], r_z), ("host chain end", xy[chains[0][-1]], r_z),

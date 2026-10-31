@@ -578,6 +578,14 @@ a box (`nest.inner`): its whole grid has 119 M cells.
   of the middle preset; the step from the coarse cells to the finest is two graded frames of 3. Size the box so that
   the third preset's part (the box less `inner.width / 3` middle cells on every side) covers the region. Its h: a
   second `blend` zone with `h_factor = 1/3`, `polygon` = the inner box's edge, `outer` = the nest's fine box's edge.
+- **The nest's depth** (`[mesh.opts.nest] depth = "gebco"`, B216): FESOM3's ORCA depth (the deepest of the four
+  NEMO cells' levels) on the finer cells digs a strait's sills a level or two too deep. With `depth = "gebco"` every
+  node strictly inside the coarse box (the box's own edge nodes keep the coarse grid's depth) takes meshom's grid
+  rule instead: the box mean of the grid's ocean cells per node, no smoothing, no strait depth floor, the slope
+  limiter, floor and regions of `[bathymetry]`; `depth_channel = "near"` and `sill_level = "grid"` add an insert's
+  channel raise and the grid's saddle held at its level (the ends: the two largest wet stretches of the coarse box's
+  edge). The rest of the mesh keeps the run's depth. `meshom write` (or the run's bathymetry stage) recomputes it on
+  the saved mesh; the mesh does not change.
 - **A latitude range** (`lat_south` and / or `lat_north`): the ORCA rows from the first F row south of `lat_south` to
   the F row whose mean latitude is nearest `lat_north`, NEMO's mask on them; a north cap (when `lat_north` is set) and
   a south cap (when `lat_south` lies north of the preset's own first row) meshed by `cap_method` on the domain bounded
@@ -598,7 +606,7 @@ Options (`[mesh.opts]`):
 | `transition` | string | `"fill"` | B114: between a coarse and a `fine_orca` part, `"fill"` = `cap_method` (B108-B112), `"ladder"` = the structured strip of `meshom.orca.ladder` between two plain rows |
 | `ladder_lat` | [float, float] | unset | B114: `transition = "ladder"`: the coarse part up to its last F row lying wholly south of the first latitude, the fine part from its last F row lying wholly south of the second (it covers everything north of it) |
 | `ladder_theta_deg` | float | 18 | B115: an arm's tilt on the sphere at a Y-split (the triangle's apex 2θ, the quad corner at the arm 90° + θ) |
-| `nest` | table or unset | unset | B176: `fine_orca` (the refined preset, k = 3), `box` = [c0, c1, r0, r1] (the fine box as coarse F lines of the preset's own rows; columns unwrapped, c0 < c1) or `lonlat` = [lon0, lat0, lon1, lat1] (the smallest box of F lines holding every cell whose T point lies inside; lon0 > lon1 crosses the antimeridian), `width` (the frame's width in fine steps, a multiple of 3, default 39: 24 rings, B172), `theta_deg` (an arm's tilt at a ladder Y-split, default 18, B115), `relax` (the frame's relaxation weights [widths, tilts, bases], default [1, 3, 3], false: off, B175), `inner` (a table, unset by default: a nest in the nest, B230: `fine_orca` = a preset refining `fine_orca` by 3, `width` in its steps (default 39), `theta_deg`, `relax` as above) |
+| `nest` | table or unset | unset | B176: `fine_orca` (the refined preset, k = 3), `box` = [c0, c1, r0, r1] (the fine box as coarse F lines of the preset's own rows; columns unwrapped, c0 < c1) or `lonlat` = [lon0, lat0, lon1, lat1] (the smallest box of F lines holding every cell whose T point lies inside; lon0 > lon1 crosses the antimeridian), `width` (the frame's width in fine steps, a multiple of 3, default 39: 24 rings, B172), `theta_deg` (an arm's tilt at a ladder Y-split, default 18, B115), `relax` (the frame's relaxation weights [widths, tilts, bases], default [1, 3, 3], false: off, B175), `inner` (a table, unset by default: a nest in the nest, B230: `fine_orca` = a preset refining `fine_orca` by 3, `width` in its steps (default 39), `theta_deg`, `relax` as above), `depth` (B216: `""` by default = the run's depth rules: the ORCA nodes FESOM3's depth from NEMO's levels with `mask = "fesom3"`, the frames' nodes `[bathymetry]`; `"gebco"`: every node inside the coarse box takes the box mean of the grid's ocean cells per node, without smoothing and without the strait depth floors, as an insert's own nodes with `depth_at = "node"`, `depth_smooth = 0`, `strait_floor = false`), `depth_channel` and `sill_level` (with `depth = "gebco"`: an insert's `depth_channel` (B213) and `sill_level` (B212, B215) on those nodes, the channel's ends at the two largest wet stretches of the coarse box's edge) |
 | `mask` | string | `"nemo"` | `"nemo"`: NEMO's mask on the ORCA cells (B82-B84); `"fesom3"`: FESOM3's rules (below, B94); `"all"`: every cell, the land as the run's cut has it for the caps (the ORCA cells are still protected, B85; for tests) |
 | `ref_dir` | path | `$MESHOM_ORCA_REFS` | the folder of NEMO's reference grids as npz (`scripts/grids/orca_refs_npz.py OUT_DIR`; eORCA05: `... OUT_DIR eorca05=PATH`) |
 | `levels_dir` | path | `$MESHOM_ORCA_LEVELS` | `mask = "fesom3"`: the folder of NEMO's bottom levels / model bathymetry as npz (`scripts/grids/orca_levels_npz.py`, `scripts/grids/nemo_inputs_npz.py`; the names of `meshom.orca.fesom3.SOURCES`, B92) |
@@ -685,7 +693,12 @@ spliced mesh: meshom's mesh fixer stage a (free-node geometry, `meshom.meshfix.g
 or changed and N element rings round them, every other node held, the host's coast fixed and the insert's banks
 sliding, sizes held at the smaller of the spliced mesh's and the host's node sizes; host nodes in the rings move (less
 than a host cell) and keep their host depth in the model files; the record's `fix_rings` has the case, the cells
-before and after, the host nodes moved, the size floor and the validity. The depth of the insert's own nodes follows
+before and after, the host nodes moved, the size floor and the validity. The host nodes the collar moved keep their
+host depth too (B217: the splice appends them at their new positions; each is matched to the nearest new node within
+its host spacing), and on another insert's result (`--mesh insert_<name>.npz`) every host node keeps that result's
+saved depth (`fesom-insert_<name>/depth.npy`), so a chain of inserts keeps each one's own depth rule (B217; the
+record's `depth.host_depth`, `depth.collar_moved_kept`, `collar_moved`; `insert_<name>.collar_moved.npy`: the ids
+in the result and the host ids of those nodes). The depth of the insert's own nodes follows
 the run's `[bathymetry]` unless the insert sets its own rule: `depth_at` (`"node"`: the box mean per node, keeps
 sills and channels; `"cells_deepest"`; default the run's), `depth_smooth` (smoothing passes among the insert's own
 nodes only; default: the run's passes over the whole mesh), `strait_floor` (default true: the run's strait depth

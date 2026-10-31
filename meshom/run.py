@@ -481,6 +481,17 @@ def _method_node_depth(cfg: Config, run_dir: Path, mesh: Mesh, depth: np.ndarray
     return depth
 
 
+def _nest_depth(cfg: Config, run_dir: Path, mesh: Mesh, depth: np.ndarray, fmt: str, meta: dict) -> np.ndarray:
+    """m16_orca's `nest.depth = "gebco"` (B216): the nodes inside the nest's coarse box take meshom's grid rule
+    (meshom.methods.m16_orca.nest_depth; record meta["nest_depth"]); every other node keeps `depth`."""
+    if cfg.mesh.method != "m16_orca" or (cfg.mesh.opts.get("nest") or {}).get("depth", "") != "gebco":
+        return depth
+    from meshom.methods.m16_orca import nest_depth
+
+    depth, meta["nest_depth"] = nest_depth(run_dir, mesh, depth, cfg, fmt)
+    return depth
+
+
 def depth_floor_m(cfg: Config, fmt: str) -> float:
     """The run's depth floor in format `fmt`: [bathymetry] min_depth_m, and for fesom2 / fesom3 at least the bottom of
     the min_layers-th level (bathymetry.min_depth_of, decisions O18)."""
@@ -514,15 +525,16 @@ def mesh_depth(mesh: Mesh, cfg: Config, fmt: str, straits: list, meta: dict | No
 def model_depth(mesh: Mesh, cfg: Config, fmt: str, straits: list, run_dir: Path, meta: dict | None = None,
                 cache: Path | None = None) -> np.ndarray:
     """The node depth of the model files before any node edit (decisions O35): mesh_depth (box mean or
-    cells_deepest, depth_policy), the method's own node depths (_method_node_depth, with a source), then the
-    [[bathymetry.regions]] rules in file order at the run's floor (bathymetry.apply_regions; `meta["regions"]`: one
-    record per region). The run's bathymetry stage and write_mesh both use it."""
+    cells_deepest, depth_policy), the method's own node depths (_method_node_depth and _nest_depth, B216, with a
+    source), then the [[bathymetry.regions]] rules in file order at the run's floor (bathymetry.apply_regions;
+    `meta["regions"]`: one record per region). The run's bathymetry stage and write_mesh both use it."""
     from meshom.bathymetry import apply_regions
 
     meta = {} if meta is None else meta
     depth = mesh_depth(mesh, cfg, fmt, straits, meta, cache)
     if cfg.bathymetry.source != "none":
         depth = _method_node_depth(cfg, run_dir, mesh, depth)
+        depth = _nest_depth(cfg, run_dir, mesh, depth, fmt, meta)
     if cfg.bathymetry.regions:
         depth, meta["regions"] = apply_regions(mesh, depth, cfg.bathymetry.regions, depth_floor_m(cfg, fmt))
     return depth

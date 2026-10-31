@@ -419,3 +419,112 @@ def coast_keys_of(mesh: Mesh, cut_xyz: np.ndarray) -> np.ndarray:
 
 def with_h(case, h):
     return dataclasses.replace(case, h=h, h_node=np.asarray(h(case.mesh.points)))
+
+
+class HMin:
+    """B210: h = min(a(xyz), b(xyz)) of two size fields (MeshH of the spliced mesh and of the host): the fixer repairs
+    shapes and holds sizes, and pulls cells larger than the host's toward it."""
+
+    def __init__(self, a, b):
+        self.a, self.b = a, b
+
+    def __call__(self, xyz):
+        return np.minimum(self.a(xyz), self.b(xyz))
+
+
+def fix_rings(host: Mesh, mesh: Mesh, part: np.ndarray, cut: np.ndarray, rings: int, h_min: float, h_host: float,
+              centre: np.ndarray, name: str) -> tuple[Mesh, dict, np.ndarray]:
+    """B210: meshom.meshfix.geom (stage a, free-node geometry) on the cells of the spliced mesh `mesh` that the insert
+    created or changed (measure.changed_cells against `host`, the host window it was fitted to) and `rings` element
+    rings round them (grown through shared nodes), every other node held. part: (T+Q,) bool, the elements of `mesh`
+    that replaced the host window (the case is taken from them); cut: (N,) bool, the nodes of `mesh` on the window's
+    cut (cells touching it stay out of the case). Elements at a pinch node of the case's outline are left out until
+    none is left (as ring_case). The case's boundary edges on the mesh's boundary are coast (kind 1, sliding: the
+    insert's banks), the rest fixed (kind 2); the host's coast nodes are fixed too. The size field is HMin of the
+    spliced mesh's and the host's node sizes (MeshH). Returns (the mesh with the new node positions, the record:
+    the case, the stage's info, the case's cells before / after (measure.cells), the host nodes moved (count, the
+    largest move in host cells), the nodes moved and the largest move, the size floor (measure.floor_check) and the
+    validity of the window part before / after; the ids in `mesh` of the host nodes moved)."""
+    import time
+
+    from meshom.geo import xyz_to_lonlat
+    from meshom.insert import measure
+    from meshom.meshfix.cases import Case, _basin_points
+    from meshom.meshfix.geom import fix as geom_fix
+
+    t0 = time.perf_counter()
+    T0 = mesh.n_tris
+    pt, pq = part[:T0], part[T0:]
+    wid = np.unique(np.r_[mesh.tris[pt].ravel(), mesh.quads[pq].ravel()])
+    loc = np.full(mesh.n_nodes, -1, np.int64)
+    loc[wid] = np.arange(len(wid))
+    W = Mesh(mesh.points[wid].copy(), loc[mesh.tris[pt]].reshape(-1, 3), loc[mesh.quads[pq]].reshape(-1, 4),
+             np.zeros(len(wid), np.int8))
+    T = W.n_tris
+    d, _ = cKDTree(host.points).query(W.points)
+    is_host = d < MATCH_CHORD
+    wcut = np.asarray(cut, bool)[wid]
+
+    def touch(mask):
+        return np.r_[mask[W.tris].any(1) if T else np.zeros(0, bool), mask[W.quads].any(1)]
+
+    keep = measure.changed_cells(host, W)
+    for _ in range(rings):
+        near = np.zeros(W.n_nodes, bool)
+        near[W.tris[keep[:T]].ravel()] = True
+        near[W.quads[keep[T:]].ravel()] = True
+        keep |= touch(near)
+    keep &= ~touch(wcut)
+    for _ in range(1000):                                   # no pinch node on the case's outline (as ring_case)
+        st = build_topology(Mesh(W.points, W.tris[keep[:T]], W.quads[keep[T:]], W.node_flag))
+        be = st.edges[st.edge_elems[:, 1] < 0]
+        pinch = np.bincount(be.ravel(), minlength=W.n_nodes) > 2
+        if not pinch.any():
+            break
+        keep &= ~touch(pinch)
+    used = np.unique(np.r_[W.tris[keep[:T]].ravel(), W.quads[keep[T:]].ravel()])
+    lw = np.full(W.n_nodes, -1, np.int64)
+    lw[used] = np.arange(len(used))
+    cm = Mesh(W.points[used].copy(), lw[W.tris[keep[:T]]].reshape(-1, 3), lw[W.quads[keep[T:]]].reshape(-1, 4),
+              np.zeros(len(used), np.int8))
+    wtopo = build_topology(W)
+    wbe = wtopo.edges[wtopo.edge_elems[:, 1] < 0]
+    ct = build_topology(cm)
+    cbe = ct.edges[ct.edge_elems[:, 1] < 0]
+    coast = np.isin(_key(used[cbe], W.n_nodes), _key(wbe, W.n_nodes))    # on the mesh's boundary (the cut is out)
+    kind = np.zeros(cm.n_nodes, np.int8)
+    kind[cbe[coast].ravel()] = 1
+    kind[cbe[~coast].ravel()] = 2
+    kind[(kind == 1) & is_host[used]] = 2                   # the host's coast stays where it is
+    cm.node_flag = ct.boundary_node.astype(np.int8)
+    h = HMin(MeshH(W), MeshH(host))
+    seg = np.stack([cm.points[cbe[coast][:, 0]], cm.points[cbe[coast][:, 1]]], axis=1)
+    dist_seg = np.stack([W.points[wbe[:, 0]], W.points[wbe[:, 1]]], axis=1)
+    case = Case(name, cm, kind, h, np.asarray(h(cm.points)), seg, dist_seg, _basin_points(cm), cbe[~coast],
+                0.20, {}, {}, {"kind": "insert_fix_rings"})
+    t1 = time.perf_counter()
+    out, frec = geom_fix(case, {})
+    wall_a = time.perf_counter() - t1
+    moved = np.linalg.norm(out.points - cm.points, axis=1) > 0
+    P = mesh.points.copy()
+    P[wid[used]] = out.points
+    res = Mesh(P, mesh.tris, mesh.quads, mesh.node_flag, mesh.tri_zone)
+    W2 = Mesh(P[wid], W.tris, W.quads, W.node_flag)
+    hm = is_host[used] & moved
+    dist = R_EARTH_M * 2 * np.arcsin(np.minimum(1.0, 0.5 * np.linalg.norm(out.points - cm.points, axis=1)))
+    reach = R_EARTH_M * np.arccos(np.clip(cm.points @ (centre / np.linalg.norm(centre)), -1.0, 1.0)).max()
+    far = int(np.argmax(dist))
+    rec = {"rings": int(rings), "h": "min(MeshH(spliced), MeshH(host))",
+           "case": {"nodes": int(cm.n_nodes), "free": int((kind == 0).sum()), "sliding": int((kind == 1).sum()),
+                    "fixed": int((kind == 2).sum()), "elems": int(cm.n_elems), "quads": int(cm.n_quads),
+                    "tris": int(cm.n_tris), "reach_km": float(reach / 1e3)},
+           "stage_a": {"wall_s": wall_a, "info": {k: v for k, v in frec["info"].items() if k != "opts"}},
+           "before": measure.cells(cm, kind), "after": measure.cells(out),
+           "host_moved": int(hm.sum()),
+           "host_moved_max_cells": float(dist[hm].max() / h_host) if hm.any() else 0.0,
+           "nodes_moved": int(moved.sum()), "moved_max_km": float(dist.max() / 1e3),
+           "moved_max_at": [round(float(v[0]), 4) for v in xyz_to_lonlat(out.points[far][None])],
+           "floor": measure.floor_check(host, W2, h_min),
+           "validity": {"before": measure.validity(W), "after": measure.validity(W2)},
+           "wall_s": time.perf_counter() - t0}
+    return res, rec, wid[used][hm]

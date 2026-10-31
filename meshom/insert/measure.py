@@ -305,9 +305,9 @@ def coast_real(mesh: Mesh, z: dict, chart, real_seg_xy: np.ndarray, host_seg_xy:
 
 def cells(mesh: Mesh, case_kind: np.ndarray | None = None) -> dict:
     """The collar's measures (B192) over every cell of mesh (the cleaned case: the collar's host rings, the join and
-    the block's ring rows): quad max corner (max, p99.9, p99, count and share > 120 deg), the neighbour size ratio
-    across its interior edges (p99, max), triangles, and the valence (cells per node) of the interior nodes that are
-    not on the case's boundary (case_kind: 0 interior)."""
+    the block's ring rows): quad max corner (max, p99.9, p99, count > 110, count and share > 120 deg), the neighbour
+    size ratio across its interior edges (p99, max), triangles, and the valence (cells per node) of the interior nodes
+    that are not on the case's boundary (case_kind: 0 interior)."""
     g = element_geometry(mesh)
     topo = build_topology(mesh)
     T, Q = mesh.n_tris, mesh.n_quads
@@ -323,7 +323,7 @@ def cells(mesh: Mesh, case_kind: np.ndarray | None = None) -> dict:
         inner &= np.asarray(case_kind) == 0
     vv, vc = np.unique(val[inner], return_counts=True)
     return {"quads": int(Q), "tris": int(T), "qmax": _mx(qmax), "qmax_p999": _pct(qmax, 99.9),
-            "qmax_p99": _pct(qmax, 99), "q120": int((qmax > 120).sum()),
+            "qmax_p99": _pct(qmax, 99), "q110": int((qmax > 110).sum()), "q120": int((qmax > 120).sum()),
             "q120_share": float((qmax > 120).mean()) if Q else 0.0, "q125": int((qmax > 125).sum()),
             "ratio_p99": _pct(r, 99), "ratio_max": _mx(r),
             "valence": {int(k): int(v) for k, v in zip(vv, vc)},

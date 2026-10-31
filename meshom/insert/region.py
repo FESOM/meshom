@@ -78,11 +78,12 @@ class SideRule:
     and the block's counts run monotonically from the neck's count to it (equal counts: the rows only widen), so the
     funnel rule takes N(s) within those two counts; `growth` scales the room rule's slope and the funnel's ratio
     (ln 1.15 and ln 1.2 at the default 0.12) by growth / 0.12: a short, fast transition where it is asked for.
-    `widen` (B207): with `cells` the counts may rise above the neck's and the join's where the rows are long and come
-    back to the join's count before the join; the funnel rule then takes N(s) held only at or above the smaller."""
+    `add_columns` (B207): with `cells` the counts may rise above the neck's and the join's where the rows are long and
+    come back to the join's count before the join; the funnel rule then takes N(s) held only at or above the
+    smaller."""
     cells: int | None = None
     growth: float | None = None
-    widen: bool = False
+    add_columns: bool = False
 
     @property
     def scale(self) -> float:
@@ -111,10 +112,10 @@ def side_target(prof, n: int, rule: "SideRule | None") -> np.ndarray:
 def funnel_counts(Ns: np.ndarray, n_neck: int, rule: "SideRule | None") -> np.ndarray:
     """B200: the cells across the funnel's sections as the block lays them: the square-cell count W / h, or with a
     set join count clipped to between the neck's count and the join's (equal counts: the neck's count throughout);
-    with `widen` (B207) only held at or above the smaller of the two."""
+    with `add_columns` (B207) only held at or above the smaller of the two."""
     if rule is None or rule.cells is None:
         return Ns
-    if rule.widen:
+    if rule.add_columns:
         return np.maximum(Ns, min(n_neck, rule.cells))
     return np.clip(Ns, min(n_neck, rule.cells), max(n_neck, rule.cells))
 

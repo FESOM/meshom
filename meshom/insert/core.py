@@ -1,5 +1,6 @@
 """The insert pipeline: region -> joins -> block -> merge -> ring cleaning -> scores (insert_window, on a host
-window in memory), and the run-folder wrapper (run: window cut, splice, depth, model files, record, maps).
+window in memory), and the run-folder wrapper (run: window cut, splice, the optional smoothing of the spliced insert,
+depth, model files, record, maps).
 """
 import dataclasses
 import json
@@ -58,9 +59,14 @@ class Spec:
     fill: list = field(default_factory=list)  # B204: fill lines, each (K,3) unit vectors: the bank follows them
     fill_rows: int | None = None             # B204: rows of the strip behind a fill line (None: by its depth)
     corner_steps: bool = False               # B206: a hinted join cuts every convex step of its staircase
-    widen: bool = False                      # B207: target lowered where a block cell > 1.1 x host; counts not capped
+    add_columns: bool = False                # B207: target lowered where a block cell > 1.1 x host; counts not capped
     corner_split: bool = False               # B208: corner triangles split at the diagonal's midpoint (a block node)
     join_margin: float = 1.0                 # B209: the size target's cap at the joins in host cell sizes
+    fix_rings: int = 0                       # B210: stage a on the insert and this many element rings after the splice
+    depth_at: str = ""                       # B211: the insert's own nodes' depth rule ("": the run's)
+    depth_smooth: int | None = None          # B211: smoothing passes over the insert's nodes (None: the run's)
+    strait_floor: bool = True                # B211: the run's strait depth floors on the insert's nodes
+    sill_level: str = ""                     # B212: "shallower": the sill's level rounded up
 
 
 @dataclass
@@ -118,7 +124,8 @@ def spec_from(cfg_entry, cfg=None) -> Spec:
                 e.coast_source, e.bank_sigma_cells, e.bays, e.kind, e.width_km * 1e3 if e.width_km else None,
                 e.band_km * 1e3 if e.band_km is not None else None, e.ljoins, e.rows, e.coast_rounds,
                 e.coast_shift_cells, e.cells_a, e.cells_b, e.growth_a, e.growth_b, e.bank_land_cells,
-                [_ll(f) for f in e.fill], e.fill_rows, e.corner_steps, e.widen, e.corner_split, e.join_margin)
+                [_ll(f) for f in e.fill], e.fill_rows, e.corner_steps, e.add_columns, e.corner_split, e.join_margin,
+                e.fix_rings, e.depth_at, e.depth_smooth, e.strait_floor, e.sill_level)
 
 
 def _path_frame(path: np.ndarray):
@@ -179,7 +186,7 @@ def insert_window(win: Window, spec: Spec, h_run, tol=0.20, gates=None, log=prin
     rules = {"A": None, "B": None}                     # B200 / B201: per-side join counts and size slopes
     for sd, nj, gr in (("A", spec.cells_a, spec.growth_a), ("B", spec.cells_b, spec.growth_b)):
         if nj is not None or gr is not None:
-            rules[sd] = region.SideRule(nj, gr, spec.widen)
+            rules[sd] = region.SideRule(nj, gr, spec.add_columns)
     g_side = tuple(r.growth if r is not None and r.growth is not None else block.G_LAYOUT
                    for r in (rules["A"], rules["B"]))
     if rc is not None:
@@ -378,7 +385,7 @@ def insert_window(win: Window, spec: Spec, h_run, tol=0.20, gates=None, log=prin
                       growth=g_side if any(r is not None for r in rules.values()) else block.G_LAYOUT,
                       monotone=(spec.cells_a is not None, spec.cells_b is not None),       # B200, B201
                       steps=(spec.corner_steps and jA.shape == "hint", spec.corner_steps and jB.shape == "hint"),
-                      widen=spec.widen,                                                    # B207
+                      add_columns=spec.add_columns,                                        # B207
                       split=spec.corner_split, margin=spec.join_margin)                    # B208, B209
     rec["timing"]["block_s"] = time.perf_counter() - t
     rec["block"] = blk.info
@@ -646,11 +653,211 @@ def _jsonable(x):
     return x
 
 
+def _part(full: Mesh, window: Mesh) -> np.ndarray:
+    """(T+Q,) bool: the elements of the spliced mesh that came from the insert's window (host.splice appends them
+    after the host's kept triangles and quads)."""
+    return np.r_[np.arange(full.n_tris) >= full.n_tris - window.n_tris,
+                 np.arange(full.n_quads) >= full.n_quads - window.n_quads]
+
+
+def fix_spliced(mesh: Mesh, win: Window, res: Result, full: Mesh, sinfo: dict, spec: Spec, h_min: float, log=print):
+    """B210: assemble.fix_rings on the spliced mesh (the case from the window's part, the window's cut held): (the
+    mesh with the new positions, the record, the ids in it of the host nodes moved, the window mesh with the new
+    positions for the maps)."""
+    h2n = sinfo["host_to_new"]
+    cut = np.zeros(full.n_nodes, bool)
+    cut[h2n[win.old_id[win.kind == 2]]] = True
+    d, gid = cKDTree(full.points).query(res.window.points)            # the window's nodes in the spliced mesh
+    assert d.max() < assemble.MATCH_CHORD
+    prof = res.record["profile"]
+    ll = prof.get("neck_lonlat")                                       # a band has none: the path's centre
+    neck = lonlat_to_xyz(np.array([ll[0]]), np.array([ll[1]]))[0] if ll else _path_frame(spec.path)[0]
+    out, frec, moved = assemble.fix_rings(win.mesh, full, _part(full, res.window), cut, spec.fix_rings, h_min,
+                                          prof["h_host_km"] * 1e3, neck, f"insert_{spec.name}_fix")
+    w = res.window
+    window = Mesh(out.points[gid], w.tris, w.quads, w.node_flag, w.tri_zone)
+    b, a = frec["before"], frec["after"]
+    log(f"[insert {spec.name}] fix_rings {spec.fix_rings}: {frec['case']['nodes']} nodes ({frec['case']['free']} "
+        f"free, {frec['case']['sliding']} sliding), quads > 110 / > 120 {b['q110']} / {b['q120']} -> {a['q110']} / "
+        f"{a['q120']}, worst {b['qmax']:.1f} -> {a['qmax']:.1f} deg; host nodes moved {frec['host_moved']} (max "
+        f"{frec['host_moved_max_cells']:.2f} host cells); smallest cell {frec['floor']['smallest_m'] / 1e3:.3f} km "
+        f"({frec['wall_s']:.0f} s)", flush=True)
+    return out, frec, moved, window
+
+
+SILL_MARGIN_M = 1.0          # B212: the sill's nodes are capped this far above the midpoint between the two levels
+
+
+def insert_depth(depth: np.ndarray, mesh: Mesh, win: Window, res: Result, full: Mesh, sinfo: dict, h2n: np.ndarray,
+                 moved: np.ndarray | None, spec: Spec, cfg, fmt: str, straits: list, run_dir: Path, log=print):
+    """The model depth of the spliced mesh after meshom.run.model_depth (the run's rules on every node): with
+    fix_rings the host nodes it moved keep their host depth (B210: the run's rules on the host window, where they
+    stand at their host positions); with an own rule of the insert (B211: depth_at, depth_smooth, strait_floor) its
+    own nodes (those the splice appended) take that rule on the window's part of the mesh: the grid rule, the
+    smoothing (None: the run's passes over the whole part; a number: that many passes among the insert's nodes only),
+    the run's slope limiter, the strait depth floors when strait_floor, the depth floor and the run's regions;
+    sill_level "shallower" (B212) then rounds the sill up in the model's levels (sill_shallower). Returns
+    (depth, record)."""
+    from meshom import run as runmod
+    from meshom.bathymetry import (apply_regions, cells_deepest_depth, depth_policy, levels, node_area_m2,
+                                   node_depth, node_spacing_m, smooth_depth)
+
+    b = cfg.bathymetry
+    rec = {"host_moved_kept": 0}
+    depth = np.asarray(depth, dtype=np.float64).copy()
+    if moved is not None and len(moved):
+        hd = runmod.model_depth(win.mesh, cfg, fmt, straits, run_dir)
+        host_of = np.full(full.n_nodes, -1, np.int64)
+        ok = h2n >= 0
+        host_of[h2n[ok]] = np.flatnonzero(ok)
+        wpos = np.full(mesh.n_nodes, -1, np.int64)
+        wpos[win.old_id] = np.arange(len(win.old_id))
+        k = wpos[host_of[moved]]
+        assert (k >= 0).all()
+        rec["host_moved_kept"] = int(len(moved))
+        rec["host_moved_change_m"] = float(np.abs(depth[moved] - hd[k]).max())
+        depth[moved] = hd[k]
+    own = bool(spec.depth_at) or spec.depth_smooth is not None or not spec.strait_floor or bool(spec.sill_level)
+    if b.source == "none" or not own:
+        return depth, rec
+    part = _part(full, res.window)
+    T0 = full.n_tris
+    wid = np.unique(np.r_[full.tris[part[:T0]].ravel(), full.quads[part[T0:]].ravel()])
+    loc = np.full(full.n_nodes, -1, np.int64)
+    loc[wid] = np.arange(len(wid))
+    sub = Mesh(full.points[wid], loc[full.tris[part[:T0]]].reshape(-1, 3), loc[full.quads[part[T0:]]].reshape(-1, 4),
+               np.zeros(len(wid), np.int8))
+    ins = wid >= full.n_nodes - sinfo["appended_nodes"]               # the insert's own nodes (appended last)
+    floor = runmod.depth_floor_m(cfg, fmt)
+    at = spec.depth_at or b.depth_at
+    d, info = (cells_deepest_depth if at == "cells_deepest" else node_depth)(sub, Path(b.source), b.variable, floor)
+    _, edges, _ = node_spacing_m(sub)
+    area = node_area_m2(sub)
+    passes = b.smooth_passes if spec.depth_smooth is None else int(spec.depth_smooth)
+    d = smooth_depth(d, edges, area, passes, nodes=None if spec.depth_smooth is None else ins)
+    d, pol = depth_policy(sub, d, floor, 0, b.max_slope, straits if spec.strait_floor else None, b.carve_taper)
+    if b.regions:
+        d, _ = apply_regions(sub, d, b.regions, floor)
+    rec.update(rule={"depth_at": at, "smooth_passes": passes, "smooth_among": "run" if spec.depth_smooth is None
+                     else "insert", "strait_floor": bool(spec.strait_floor), "sill_level": spec.sill_level or None},
+               insert_nodes=int(ins.sum()), grid=info.get("depth_m"),
+               strait_depth_floor=pol.get("strait_depth_floor"),
+               run_rule_m={"min": float(depth[wid[ins]].min()), "max": float(depth[wid[ins]].max())})
+    if spec.sill_level == "shallower":
+        d, rec["sill"] = sill_shallower(sub, d, ins, levels(b.levels))
+        s = rec["sill"]
+        if "barrier_m" in s:
+            log(f"[insert {spec.name}] sill {s['barrier_m']:.1f} m at {s['at']}: level {s['level_m']:.0f} m, "
+                f"{s['capped']} nodes capped at {s['cap_m']:.1f} m (largest cut {s['cut_max_m']:.1f} m)", flush=True)
+    depth[wid[ins]] = d[ins]
+    rec["insert_m"] = {"min": float(d[ins].min()), "max": float(d[ins].max())}
+    log(f"[insert {spec.name}] depth of the insert's {int(ins.sum())} nodes: {at}, {passes} smoothing passes "
+        f"({rec['rule']['smooth_among']}), strait floors {'on' if spec.strait_floor else 'off'}: "
+        f"{d[ins].min():.0f}-{d[ins].max():.0f} m (the run's rules: {rec['run_rule_m']['min']:.0f}-"
+        f"{rec['run_rule_m']['max']:.0f} m); host nodes kept at their host depth {rec['host_moved_kept']}", flush=True)
+    return depth, rec
+
+
+def sill_shallower(sub: Mesh, depth: np.ndarray, ins: np.ndarray, zbar: np.ndarray) -> tuple[np.ndarray, dict]:
+    """B212: the insert's sill rounded up in the model's levels. FESOM3's fesom_ini gives an element the level whose
+    layer midpoint lies below the mean of its nodes' depths (the nearest level surface), a node the deepest level of
+    its elements, and the model's element bottom is the shallowest of its nodes' levels: a node at the sill takes the
+    next level down as soon as one element round it reaches below the midpoint. Here the barrier is the bank-to-bank
+    chain of the insert's nodes (neighbours: nodes of one insert cell) whose deepest node is shallowest (a minimax
+    path from one bank's coast nodes to the other's; banks: the two largest components of the insert cells' coast
+    edges); its depth B is the insert's sill. Every node of the chain and every node sharing a cell with one is capped
+    at the midpoint between L (the deepest level surface not below B) and the next level, minus SILL_MARGIN_M: the
+    chain's nodes then take level L, and every element on the chain has its bottom at L or above. Returns (depth,
+    record)."""
+    import heapq
+
+    from scipy.sparse import coo_matrix
+    from scipy.sparse.csgraph import connected_components
+
+    from meshom.geo import xyz_to_lonlat
+    from meshom.mesh import build_topology
+
+    T = sub.n_tris
+    cells = [c for c in (sub.tris, sub.quads) if len(c)]
+    in_ins = [c[ins[c].any(1)] for c in cells]                         # the insert's cells
+    pairs = np.vstack([np.c_[c[:, i], c[:, j]] for c in in_ins for i in range(c.shape[1])
+                       for j in range(i + 1, c.shape[1])])
+    n = sub.n_nodes
+    g = coo_matrix((np.ones(len(pairs)), (pairs[:, 0], pairs[:, 1])), shape=(n, n)).tocsr()
+    g = ((g + g.T) > 0).tocsr()
+    topo = build_topology(sub)
+    be = topo.edges[topo.edge_elems[:, 1] < 0]
+    node_in = np.zeros(n, bool)
+    for c in in_ins:
+        node_in[c.ravel()] = True
+    elem_ins = np.r_[ins[sub.tris].any(1) if T else np.zeros(0, bool), ins[sub.quads].any(1)]
+    ce = be[elem_ins[topo.edge_elems[topo.edge_elems[:, 1] < 0, 0]]]  # coast edges of the insert's cells
+    if not len(ce):
+        return depth, {"skipped": "the insert has no coast edges"}
+    cg = coo_matrix((np.ones(len(ce)), (ce[:, 0], ce[:, 1])), shape=(n, n))
+    nc, lab = connected_components(cg, directed=False)
+    on = np.zeros(n, bool)
+    on[ce.ravel()] = True
+    sizes = np.bincount(lab[on], minlength=nc)
+    if (sizes > 0).sum() < 2:
+        return depth, {"skipped": "the insert's coast is one piece (no two banks)"}
+    a, bnk = np.argsort(sizes)[::-1][:2]
+    src, dst = on & (lab == a), on & (lab == bnk)
+    cost = np.full(n, np.inf)
+    prev = np.full(n, -1, np.int64)
+    heap = [(float(depth[i]), int(i)) for i in np.flatnonzero(src)]
+    for c, i in heap:
+        cost[i] = c
+    heapq.heapify(heap)
+    done = np.zeros(n, bool)
+    end = -1
+    while heap:
+        c, i = heapq.heappop(heap)
+        if done[i]:
+            continue
+        done[i] = True
+        if dst[i]:
+            end = i
+            break
+        for j in g.indices[g.indptr[i]:g.indptr[i + 1]]:
+            cj = max(c, float(depth[j]))
+            if cj < cost[j]:
+                cost[j], prev[j] = cj, i
+                heapq.heappush(heap, (cj, int(j)))
+    if end < 0:
+        return depth, {"skipped": "no chain between the banks"}
+    chain = [end]
+    while prev[chain[-1]] >= 0:
+        chain.append(int(prev[chain[-1]]))
+    chain = np.array(chain[::-1])
+    B = float(cost[end])
+    z = np.asarray(zbar, dtype=np.float64)
+    k = int(np.searchsorted(z, B, side="right")) - 1
+    L, Ln = float(z[max(k, 0)]), float(z[min(k + 1, len(z) - 1)])
+    cap = 0.5 * (L + Ln) - SILL_MARGIN_M
+    hit = np.zeros(n, bool)
+    hit[chain] = True
+    star = np.r_[hit[sub.tris].any(1) if T else np.zeros(0, bool), hit[sub.quads].any(1)]
+    nb = np.zeros(n, bool)
+    nb[sub.tris[star[:T]].ravel()] = True
+    nb[sub.quads[star[T:]].ravel()] = True
+    out = depth.copy()
+    low = nb & (out > cap)
+    out[low] = cap
+    top = chain[int(np.argmax(depth[chain]))]
+    return out, {"barrier_m": B, "level_m": L, "next_level_m": Ln, "cap_m": cap, "chain_nodes": int(len(chain)),
+                 "at": [round(float(v[0]), 4) for v in xyz_to_lonlat(sub.points[top][None])],
+                 "capped": int(low.sum()), "capped_host_nodes": int((low & ~ins).sum()),
+                 "cut_max_m": float((depth - out).max()), "nodes_star": int(nb.sum())}
+
+
 def run(run_dir: Path, spec: Spec, out_dir: Path | None = None, mesh_name: str | None = None,
         write: bool = True, log=print) -> dict:
     """The insert in a finished run (module docstring): writes <out>/insert_<name>.npz, .json (the record),
     .score.json (zone scores and the ring's meshfix score), .map.png, .profile.png and, when the run wrote model
-    files, fesom-insert_<name>/ in the run's format with depth by the run's bathymetry rules. Returns the record."""
+    files, fesom-insert_<name>/ in the run's format with depth by the run's bathymetry rules (insert_depth: the
+    insert's own rule, B211, B212). With fix_rings the spliced mesh is smoothed first (fix_spliced, B210). Returns the
+    record."""
     from meshom import compete
     from meshom import run as runmod
     from meshom.config import load as load_cfg
@@ -701,6 +908,13 @@ def run(run_dir: Path, spec: Spec, out_dir: Path | None = None, mesh_name: str |
         rec["status"] = "refused"
         stem.with_suffix(".json").write_text(json.dumps(_jsonable(rec), indent=1))
         return rec
+    full = sinfo = moved = None
+    if res.ok:
+        t = time.perf_counter()
+        full, sinfo = splice(mesh, win, res.window)
+        rec["timing"]["splice_s"] = time.perf_counter() - t
+        if spec.fix_rings > 0 and res.record.get("valid"):           # B210: stage a on the insert and its rings
+            full, rec["fix_rings"], moved, res.window = fix_spliced(mesh, win, res, full, sinfo, spec, h_min, log)
     seg = res.chart.fwd(win.mesh.points)[win.coast_edges]
     real_seg = res.real.segments("raw") if res.real is not None else None
     if res.profile is not None:
@@ -721,12 +935,10 @@ def run(run_dir: Path, spec: Spec, out_dir: Path | None = None, mesh_name: str |
         rec["status"] = "refused"
         stem.with_suffix(".json").write_text(json.dumps(_jsonable(rec), indent=1))
         return rec
-    t = time.perf_counter()
-    full, sinfo = splice(mesh, win, res.window)
-    np.save(stem.parent / (stem.name + ".host_to_new.npy"), sinfo.pop("host_to_new"))
+    h2n = sinfo.pop("host_to_new")
+    np.save(stem.parent / (stem.name + ".host_to_new.npy"), h2n)
     rec["splice"] = sinfo
     rec["validity"] = {"host": measure.validity(mesh), "final": measure.validity(full)}
-    rec["timing"]["splice_s"] = time.perf_counter() - t
     compete._save(full, stem.with_suffix(".npz"))
     rec["status"] = "ok" if res.record.get("valid") else "invalid"
     if write and rec["status"] == "ok" and (run_dir / "fesom").exists():
@@ -734,6 +946,8 @@ def run(run_dir: Path, spec: Spec, out_dir: Path | None = None, mesh_name: str |
         fmt = cfg.mesh.format
         meta = {}
         depth = runmod.model_depth(full, cfg, fmt, straits, run_dir, meta)
+        depth, rec["depth"] = insert_depth(depth, mesh, win, res, full, sinfo, h2n, moved, spec, cfg, fmt, straits,
+                                           run_dir, log)
         fdir = out_dir / f"fesom-insert_{spec.name}"
         fdir.mkdir(exist_ok=True)
         np.save(fdir / "depth.npy", depth)

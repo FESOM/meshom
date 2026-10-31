@@ -645,12 +645,12 @@ levels. Every preset but ORCA025 takes the strait edits by place where the strai
 ### `[[inserts]]` (`python -m meshom.insert`)
 
 Curvilinear inserts are fitted into a finished run afterwards (`python -m meshom.insert --run RUN_DIR --config
-FILE.toml`), not by `meshom run` (decisions B158-B169, B180-B186, B190-B209). `kind = "strait"` (default): a strait
+FILE.toml`), not by `meshom run` (decisions B158-B169, B180-B186, B190-B212). `kind = "strait"` (default): a strait
 (`strait` or `path`, `cells` or `h_fine_m`, `reach_km`, join hints `mouth_a` / `mouth_b`, `ljoins`); refused inserts say
 which rule fails and which cell counts both sides accept. A strait can be fitted to its host side by side (all off by
 default): `cells_a` / `cells_b` ask for a join with exactly that many host edges on side A / B, the block's counts
-running monotonically from the neck to it (equal counts: the rows only widen, no Y-split), or with `widen = true` rising
-above both and coming back to the join's count before the join: `widen` lowers the size target where a block cell is
+running monotonically from the neck to it (equal counts: the rows only widen, no Y-split), or with `add_columns = true`
+rising above both and coming back to the join's count before the join: `add_columns` lowers the size target where a block cell is
 above 1.1 x the host cell (more columns and rows, by Y-splits spread over the rows), which helps where the block fans
 out at a bank's turn, not at a staircase join's diagonal steps; `growth_a` / `growth_b` set the size slope along the
 block on that side (default 0.12; the room and funnel rules scale with it), so a short, fast
@@ -668,8 +668,21 @@ of a hinted join's host staircase by a corner triangle, not only its bends over 
 splits each corner triangle of a join at the midpoint of its diagonal, the midpoint a node of the block's first row (two
 triangles of ~0.8 x the host cell and no long diagonal edge next to the block); `join_margin` (default 1.0) caps the
 block's size target at the joins at that many host cell sizes, so the outermost rows are a little finer than the host
-(with both, 0.85 and `widen`, a staircase join at Gibraltar keeps the insert's cells within 1 % of the host cell next to
-them, at the cost of a size step of up to ~1.4 across the join). The cell count across the
+(with both, 0.85 and `add_columns`, a staircase join at Gibraltar keeps the insert's cells within 1 % of the host cell next to
+them, at the cost of a size step of up to ~1.4 across the join). `fix_rings = N` (default 0 = off) smooths the
+spliced mesh: meshom's mesh fixer stage a (free-node geometry, `meshom.meshfix.geom`) on the cells the insert created
+or changed and N element rings round them, every other node held, the host's coast fixed and the insert's banks
+sliding, sizes held at the smaller of the spliced mesh's and the host's node sizes; host nodes in the rings move (less
+than a host cell) and keep their host depth in the model files; the record's `fix_rings` has the case, the cells
+before and after, the host nodes moved, the size floor and the validity. The depth of the insert's own nodes follows
+the run's `[bathymetry]` unless the insert sets its own rule: `depth_at` (`"node"`: the box mean per node, keeps
+sills and channels; `"cells_deepest"`; default the run's), `depth_smooth` (smoothing passes among the insert's own
+nodes only; default: the run's passes over the whole mesh), `strait_floor` (default true: the run's strait depth
+floors carve them too; false: the insert's own grid depth sets its sill), and `sill_level = "shallower"`: the
+insert's sill (the bank-to-bank chain of its nodes whose deepest node is shallowest) gets the shallower of the two
+model levels round its depth, by capping the chain's nodes and their cell neighbours just above the midpoint between
+the levels (FESOM3's level finder rounds an element's mean depth to the nearest level and gives a node the deepest
+of its elements). The record's `depth` says which rule each node set took. The cell count across the
 narrowest row is the requested `cells` (the count smoothing never lifts it). `bays = "auto"` (default) gives a bay of the real coast a
 block of its own when its mouth holds 3 insert cells and the bay reaches at least its mouth's width inland; smaller
 pockets and lagoons are bridged (`true`: every bay with a mouth of 2 cells; `false`: none). `collar_rings`: on meshom's

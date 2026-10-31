@@ -42,8 +42,9 @@ docs/config.md has the full description and an example. Tables (units: metres, k
               `meshom run`; decisions B158-B169, B180-B185): kind ("strait" | "strip" | "corridor"), name, strait or
               path, mouth_a / mouth_b (join hints), cells or h_fine_m, reach_km, force, stages, ring_rows,
               bank_sigma_h, width_km and band_km (strip, corridor), ljoins, cells_a / cells_b, growth_a / growth_b,
-              bank_land_cells (B200-B202), fill, fill_rows (B204), corner_steps (B206), widen (B207),
-              corner_split (B208), join_margin (B209)
+              bank_land_cells (B200-B202), fill, fill_rows (B204), corner_steps (B206), add_columns (B207),
+              corner_split (B208), join_margin (B209), fix_rings (B210), depth_at, depth_smooth, strait_floor
+              (B211), sill_level (B212)
               (meshom.config.InsertCfg)
     [size]    grad_max (|grad h| limit of the gradient limiter, default 0.1; inf = no limiting), h_min_m / h_max_m
               (optional global clip), preview_deg (UI preview grid), limiter_max_nodes (grid size cap), from (an h
@@ -268,7 +269,7 @@ class InsertCfg:
     fill_rows: int | None = None                       # rows of that strip (None: its depth / the local cell, >= 1)
     corner_steps: bool = False                         # strait: a join from a hint cuts every convex step of its
                                                        # host staircase by a corner triangle, not only its bends (B206)
-    widen: bool = False                                # strait: the size target is lowered where a block cell is
+    add_columns: bool = False                          # strait: the size target is lowered where a block cell is
                                                        # above 1.1 x the host cell (more columns and rows); with
                                                        # cells_a / cells_b the counts may rise above the neck's and the
                                                        # join's and come back to the join's count before the join (B207)
@@ -277,6 +278,17 @@ class InsertCfg:
                                                        # two triangles of ~0.8 x the host cell, no long diagonal (B208)
     join_margin: float = 1.0                           # strait: the block's size target at the joins is capped at this
                                                        # times the host cell size (B209)
+    fix_rings: int = 0                                 # after the splice: meshfix stage a on the insert's cells and
+                                                       # this many element rings round them, the host's coast and
+                                                       # every other node held (0 = off); moved host nodes keep
+                                                       # their host depth in the model files (B210)
+    depth_at: str = ""                                 # the insert's own nodes: "" (the run's [bathymetry] depth_at)
+                                                       # | "node" | "cells_deepest" (B211)
+    depth_smooth: int | None = None                    # ... None: the run's smooth_passes; a number: that many passes
+                                                       # over the insert's own nodes only (B211)
+    strait_floor: bool = True                          # ... the run's strait depth floors also on them (B211)
+    sill_level: str = ""                               # "" | "shallower": the insert's sill gets the shallower of the
+                                                       # two levels round its depth in the model's levels (B212)
 
 
 @dataclass

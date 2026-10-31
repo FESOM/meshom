@@ -293,14 +293,16 @@ def bend_corners(xy: np.ndarray, region_xy: np.ndarray, deg: float | None = None
     the chords over CORNER_W edges before and after the node (a host staircase alternates +-90 deg turns node by
     node; over 2 edges it does not turn); local maxima at least 3 nodes apart, never the two end nodes. The block's
     side: the sign of the chain's total turning when it turns by more than 45 deg, else the side of region_xy (a
-    point inside the block). gap: the least index distance of two bends (B206: 2 with w = 1, every step of a
-    staircase). Returns the node indices."""
+    point inside the block); with w < CORNER_W the total turning is taken between the chords over CORNER_W edges at
+    both ends, so a staircase whose first and last single steps differ does not read as a turn (B206). gap: the least
+    index distance of two bends (B206: 2 with w = 1, every step of a staircase). Returns the node indices."""
     deg = CORNER_TURN_DEG if deg is None else deg
     w = CORNER_W if w is None else w
     n = len(xy) - 1
     if n < 2 * w:
         return []
-    d = np.diff(xy, axis=0)
+    ws = min(CORNER_W, n) if w < CORNER_W else 1
+    d = xy[ws:] - xy[:-ws]
     th = np.unwrap(np.arctan2(d[:, 1], d[:, 0]))
     total = float(th[-1] - th[0])
     if abs(total) > np.radians(45.0):

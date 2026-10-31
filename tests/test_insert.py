@@ -1145,8 +1145,6 @@ def test_staircase_join_cuts_every_convex_step():
     assert (s > 0).all()
 
 
-@pytest.mark.xfail(strict=True, reason="B206: the block's side is read from the turning between the chain's first and "
-                                       "last single edges (+90 deg here), so the corners go to the reflex steps")
 def test_staircase_join_cuts_the_convex_steps_whatever_its_first_and_last_step():
     """B206: a staircase whose first step is east and last step north (its single edges turn by 90 deg) with the
     block on its right: the convex steps are its N -> E turns, every cell keeps the block's orientation."""

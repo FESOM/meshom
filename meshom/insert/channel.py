@@ -12,7 +12,9 @@ rule (meshom.insert.core.insert_depth):
 - `depth_channel` (`line_raise`, B213): "cells": every insert node of a cell the line crosses takes at least the
   cell's channel depth (the box mean, box of the cell's area, centred on the line's points inside the cell);
   "near": every insert node within CHANNEL_NEAR of its spacings of the line takes at least the box mean centred on
-  the line's nearest point (box of the node's own size, node_depth's box moved onto the channel);
+  the line's nearest point (box of the node's own size, node_depth's box moved onto the channel); both only on the
+  line's narrows (`narrows`: the stretch round its narrowest point whose wet width across the line is at most
+  CHANNEL_WIDTH_K times the narrowest), never on its legs in the open basins;
 - `depth_quantile` (`node_quantile`, B214): the insert's nodes take a quantile of the grid's ocean cells in their
   node box instead of the mean;
 - `sill_level = "grid"` (`grid_sill`, B215): the grid's saddle is held at its level: the bank-to-bank chain of the
@@ -30,6 +32,11 @@ from meshom.mesh import Mesh
 CHANNEL_POWER = 4.0          # B213: the path's cost per km (D_ref / D)^CHANNEL_POWER on the grid's box means
 CHANNEL_NEAR = 1.0           # B213: "near": insert nodes within this many of their spacings of the line are raised
 SILL_MARGIN_M = 1.0          # B215: the dam is capped this far above the midpoint between the two levels (as B212)
+CHANNEL_WIDTH_K = 6.0        # B213: the raise acts where the line is at most this many times as wide as its narrowest
+CHANNEL_DIR_M = 2000.0       # B213: the line's direction at a point: the chord between its points this far on each side
+WIDTH_CAP_M = 50000.0        # B213: the widths are first measured up to this far on each side (then up to the limit)
+WIDTH_TURN_DEG = 45.0        # B213: a width is the shortest wet crossing within this angle of the line's normal ...
+WIDTH_STEP_DEG = 15.0        # B213: ... tried every this many degrees
 
 
 @dataclass
@@ -235,6 +242,65 @@ class Line:
     depth: np.ndarray        # the box means along it (the channel's profile at the fine size)
     saddle: tuple            # the grid's own saddle between the ends: (depth m, lon, lat)
     record: dict
+    narrow: np.ndarray | None = None     # (n,) bool: the line's narrows (`narrows`), where depth_channel acts
+
+
+def line_widths(grid: Grid, lon: np.ndarray, lat: np.ndarray, cap_m: float) -> np.ndarray:
+    """(n,) the wet width (m) across a line of grid cells at each of its points: the shortest run of the grid's ocean
+    cells through the point along a great circle within WIDTH_TURN_DEG of the line's normal (the line's direction:
+    the chord between its points CHANNEL_DIR_M before and after; every WIDTH_STEP_DEG), sampled every half cell up
+    to cap_m on each side; samples outside the grid's window count as water."""
+    p = lonlat_to_xyz(lon, lat)
+    n = len(p)
+    s = np.r_[0.0, np.cumsum(2.0 * np.arcsin(np.minimum(np.linalg.norm(np.diff(p, axis=0), axis=1) / 2.0, 1.0)))]
+    s *= R_EARTH_M
+    a = np.clip(np.searchsorted(s, s - CHANNEL_DIR_M, side="left"), 0, n - 1)
+    b = np.clip(np.searchsorted(s, s + CHANNEL_DIR_M, side="right") - 1, 0, n - 1)
+    t = p[b] - p[a]
+    t -= np.sum(t * p, axis=1)[:, None] * p
+    t /= np.maximum(np.linalg.norm(t, axis=1), 1e-15)[:, None]
+    nrm = np.cross(p, t)
+    step = 0.5 * R_EARTH_M * np.radians(abs(grid.dlat))
+    ang = np.arange(1, int(np.ceil(cap_m / step)) + 1) * step / R_EARTH_M
+    la0, la1 = float(grid.lat.min()), float(grid.lat.max())
+    lo0, lo1 = float(grid.lon.min()), float(grid.lon.max())
+    best = np.full(n, np.inf)
+    for turn in np.radians(np.arange(-WIDTH_TURN_DEG, WIDTH_TURN_DEG + 1e-9, WIDTH_STEP_DEG)):
+        u = np.cos(turn) * nrm + np.sin(turn) * t
+        width = np.full(n, step)
+        for sgn in (1.0, -1.0):
+            q = p[:, None, :] * np.cos(ang)[None, :, None] + sgn * u[:, None, :] * np.sin(ang)[None, :, None]
+            qlo, qla = xyz_to_lonlat(q.reshape(-1, 3))
+            ci, cj, _, _ = grid.boxes(qlo, qla, np.zeros(len(qlo)))
+            ul = grid.unwrap(qlo)
+            out = (qla < la0) | (qla > la1) | (ul < lo0) | (ul > lo1)
+            wet = (out | (grid.elev[ci, cj] < 0)).reshape(n, len(ang))
+            width += np.where(wet.all(axis=1), len(ang), np.argmin(wet, axis=1)) * step
+        best = np.minimum(best, width)
+    return best
+
+
+def narrows(grid: Grid, lon: np.ndarray, lat: np.ndarray) -> tuple[np.ndarray, dict]:
+    """B213: the line's narrows: the run of its points round its narrowest one whose wet width across the line
+    (line_widths) is at most CHANNEL_WIDTH_K times the narrowest. Returns ((n,) bool, record)."""
+    w = line_widths(grid, lon, lat, WIDTH_CAP_M)
+    lim = CHANNEL_WIDTH_K * float(w.min())
+    if lim > WIDTH_CAP_M:                                  # every width up to the limit measured, not capped
+        w = line_widths(grid, lon, lat, lim)
+    i0 = int(np.argmin(w))
+    a = i0
+    while a > 0 and w[a - 1] <= lim:
+        a -= 1
+    b = i0
+    while b < len(w) - 1 and w[b + 1] <= lim:
+        b += 1
+    m = np.zeros(len(w), bool)
+    m[a:b + 1] = True
+    xyz = lonlat_to_xyz(lon[a:b + 1], lat[a:b + 1])
+    km = float(R_EARTH_M / 1e3 * np.arccos(np.clip(np.sum(xyz[1:] * xyz[:-1], 1), -1, 1)).sum())
+    pt = lambda i: [round(float(lon[i]), 4), round(float(lat[i]), 4)]          # noqa: E731
+    return m, {"width_min_km": float(w[i0]) / 1e3, "at": pt(i0), "limit_km": lim / 1e3, "km": km,
+               "from": pt(a), "to": pt(b), "cells": int(b - a + 1)}
 
 
 def channel_line(sub: Mesh, ins: np.ndarray, depth: np.ndarray, grid: Grid, h_fine_m: float) -> Line | None:
@@ -255,16 +321,18 @@ def channel_line(sub: Mesh, ins: np.ndarray, depth: np.ndarray, grid: Grid, h_fi
     xyz = lonlat_to_xyz(plon, plat)
     km = float(R_EARTH_M / 1e3 * np.arccos(np.clip(np.sum(xyz[1:] * xyz[:-1], 1), -1, 1)).sum())
     k = int(np.argmin(D[ii, jj]))
+    narrow, nrec = narrows(grid, plon, plat)
     rec = {"ends": [[round(float(x), 4), round(float(y), 4)] for x, y in zip(lo, la)],
            "box_half_width_m": 0.5 * h_fine_m, "cells": int(len(ii)), "km": km,
            "deepest_connection_box_m": float(d_ref),
            "shallowest_on_line": {"m": float(D[ii[k], jj[k]]), "at": [round(float(plon[k]), 4), round(float(plat[k]), 4)]},
-           "grid_saddle": {"m": sd[0], "at": [round(sd[1], 4), round(sd[2], 4)]}}
-    return Line(plon, plat, D[ii, jj], sd, rec)
+           "grid_saddle": {"m": sd[0], "at": [round(sd[1], 4), round(sd[2], 4)]}, "narrows": nrec}
+    return Line(plon, plat, D[ii, jj], sd, rec, narrow)
 
 
 def line_raise(sub: Mesh, depth: np.ndarray, ins: np.ndarray, grid: Grid, line: Line, mode: str) -> tuple:
-    """B213 (module docstring): "cells" or "near". Returns (depth, record)."""
+    """B213 (module docstring): "cells" or "near", on the line's narrows (line.narrow; None: the whole line).
+    Returns (depth, record)."""
     from scipy.spatial import cKDTree
 
     from meshom.bathymetry import node_spacing_m
@@ -272,7 +340,9 @@ def line_raise(sub: Mesh, depth: np.ndarray, ins: np.ndarray, grid: Grid, line: 
     from meshom.straits import locate
 
     d = np.asarray(depth, dtype=np.float64).copy()
-    pts = lonlat_to_xyz(line.lon, line.lat)
+    keep = line.narrow if line.narrow is not None else np.ones(len(line.lon), bool)
+    lon, lat = line.lon[keep], line.lat[keep]
+    pts = lonlat_to_xyz(lon, lat)
     if mode == "cells":
         el = locate(sub, pts)
         area = np.abs(signed_area(sub))
@@ -282,7 +352,7 @@ def line_raise(sub: Mesh, depth: np.ndarray, ins: np.ndarray, grid: Grid, line: 
             if not ins[nd].any():
                 continue
             k = el == e
-            bm = grid.box_mean(line.lon[k], line.lat[k], np.full(k.sum(), 0.5 * np.sqrt(area[e])))
+            bm = grid.box_mean(lon[k], lat[k], np.full(k.sum(), 0.5 * np.sqrt(area[e])))
             bm = bm[np.isfinite(bm)]
             if len(bm):
                 m = nd[ins[nd]]
@@ -292,7 +362,7 @@ def line_raise(sub: Mesh, depth: np.ndarray, ins: np.ndarray, grid: Grid, line: 
         dist, j = cKDTree(pts).query(sub.points)
         arc = 2.0 * np.arcsin(np.minimum(dist / 2.0, 1.0)) * R_EARTH_M
         near = ins & (arc <= CHANNEL_NEAR * spacing)
-        bm = grid.box_mean(line.lon[j[near]], line.lat[j[near]], 0.5 * spacing[near])
+        bm = grid.box_mean(lon[j[near]], lat[j[near]], 0.5 * spacing[near])
         idx = np.flatnonzero(near)
         ok = np.isfinite(bm)
         d[idx[ok]] = np.maximum(d[idx[ok]], bm[ok])

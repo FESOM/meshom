@@ -26,6 +26,12 @@ on the left bank "N"). Steps:
    the host size at the joins: step 2's cap), then lays the rows out again (steps 3-5), at most FLOOR_ROUNDS rounds.
    The rows near a cape get fewer, larger cells; the caller checks the result and refuses a cell still below the
    floor.
+7. Widen (B207, an option per side): on a side with a set join count the count target is held only at or above the
+   smaller of the neck's and the join's counts (not between them, B200), and the rounds of step 6 also lower the
+   target (a per-row ceiling, its slope limited to the side's slope) in each row interval holding a cell above
+   WIDEN_CAP x the host size, at most WIDEN_ROUNDS rounds (the floor wins over it): where the harmonic map fans out
+   (the outer bank of a bend, a convex bank corner) the rows get more columns and more rows, and the counts come back
+   to the join's count before the join (the birth rule of step 3).
 """
 from dataclasses import dataclass, field
 
@@ -55,6 +61,8 @@ CORNER_TURN_DEG = 60.0       # B180: a fixed row's node is a convex bend (corner
 CORNER_W = 2                 # B180: ... between the chords over this many edges before and after it
 FLOOR_ROUNDS = 10            # B165: layout rounds that raise the target where the map compresses cells below the floor
 FLOOR_MARGIN = 1.02          # B165: the rounds aim at cells >= this x the floor (the final check has no tolerance)
+WIDEN_CAP = 1.1              # B207: with widen, rounds lower the target where a cell exceeds this x the host size
+WIDEN_ROUNDS = 6             # B207: at most this many layout rounds for it
 
 
 @numba.njit(cache=True)
@@ -193,29 +201,37 @@ def birth_rows(a: int, b: int) -> int:
     return k
 
 
-def monotone_counts(raw: np.ndarray, nA: int, nB: int, sides=(False, False), i_n: int | None = None) -> np.ndarray:
+def monotone_counts(raw: np.ndarray, nA: int, nB: int, sides=(False, False), i_n: int | None = None,
+                    widen=(False, False)) -> np.ndarray:
     """B200: the count target of a side with a set join count runs monotonically from the neck (row i_n, the
     shortest row; default the row with the fewest cells) to the join's count: clipped to between the two and made
-    monotone outward from the neck, so equal counts only widen the rows (no columns born and killed again)."""
+    monotone outward from the neck, so equal counts only widen the rows (no columns born and killed again).
+    widen (side A, side B; B207): on that side the target is only held at or above the smaller of the two counts, so
+    it rises above both where the rows are long and comes back to the join's count before the join."""
     raw = raw.copy()
     i_n = int(np.argmin(raw)) if i_n is None else int(i_n)
     rn = float(raw[i_n])
-    for on, idx, nj in ((sides[0], np.arange(i_n, -1, -1), nA), (sides[1], np.arange(i_n, len(raw)), nB)):
+    for on, wd, idx, nj in ((sides[0], widen[0], np.arange(i_n, -1, -1), nA),
+                            (sides[1], widen[1], np.arange(i_n, len(raw)), nB)):
         if not on:
             continue
         lo, hi = min(rn, nj), max(rn, nj)
+        if wd:
+            raw[idx] = np.maximum(raw[idx], lo)
+            continue
         v = np.clip(raw[idx], lo, hi)
         v = np.maximum.accumulate(v) if nj >= rn else np.minimum.accumulate(v)
         raw[idx] = v
     return raw
 
 
-def layout(h, L, ds, nA, nB, fixed_count: bool = False, monotone=(False, False), rows: int | None = None):
+def layout(h, L, ds, nA, nB, fixed_count: bool = False, monotone=(False, False), rows: int | None = None,
+           widen=(False, False)):
     """Rows xi_i and counts N_i (module docstring, step 3). The row count is at least what the birth rule needs to
     go from the join A count down to the fewest cells the target asks for and up to the join B count (with a
     floor-raised target, Denmark's default-floor block got 3 rows for 17 -> 14 -> 17 -> 21 cells, its
     Y-splits crowded and a quad folded at 350 deg). rows: the row count asked for (B204; the birth rule may add
-    rows), else by the size target, at least 2."""
+    rows), else by the size target, at least 2. widen: (side A, side B) of monotone_counts (B207)."""
     Mf = len(L) - 1
     xi_f = np.linspace(0, 1, Mf + 1)
     q = np.r_[0, np.cumsum(ds / (0.5 * (h[1:] + h[:-1])))]
@@ -239,7 +255,7 @@ def layout(h, L, ds, nA, nB, fixed_count: bool = False, monotone=(False, False),
     neck[lo:hi + 1] = True
     raw = np.where(neck, np.minimum(raw, unsm), raw)
     if any(monotone):
-        raw = monotone_counts(raw, nA, nB, monotone, int(np.argmin(Lr)))
+        raw = monotone_counts(raw, nA, nB, monotone, int(np.argmin(Lr)), widen)
     raw[0], raw[-1] = nA, nB
     want = np.empty(M + 1, int)
     want[0] = nA
@@ -521,7 +537,7 @@ def _upper_envelope(f, s, g):
 
 def build(xyA, xyB, bS: Polyline, bN: Polyline, n_neck: int, fixed_count: bool = False, h_min: float = 0.0,
           cell_floor: float = 0.0, scale=None, corners=False, growth=G_LAYOUT, monotone=(False, False),
-          rows: int | None = None, steps=(False, False)) -> Block:
+          rows: int | None = None, steps=(False, False), widen=False) -> Block:
     """The block of the module docstring: xyA, xyB (n+1,2) the join chains from bank S to bank N (exact host node
     positions), bS / bN the banks from join A to join B. h_min: the size target's floor (m); cell_floor: the floor of
     the cells' mean great-circle edge length (m, step 6; 0 = none); scale: the chart's scale (chart m per sphere m)
@@ -529,8 +545,11 @@ def build(xyA, xyB, bS: Polyline, bN: Polyline, n_neck: int, fixed_count: bool =
     for both rows or a pair (row A, row B). growth: the size target's slope, or (side A, side B) (B201); monotone:
     (side A, side B) counts run monotonically from the neck to the join's count (B200); rows: the row count (B204;
     None: by the size target); steps: (row A, row B) cut every convex step of a staircase row, not only its bends
-    over CORNER_W edges (B206; with corners on)."""
+    over CORNER_W edges (B206; with corners on); widen: a bool for both sides or a pair (side A, side B): on that
+    side the counts are not held between the neck's and the join's (B200) and the layout rounds lower the target
+    where a cell exceeds WIDEN_CAP x the host size (step 7, B207)."""
     nA, nB = len(xyA) - 1, len(xyB) - 1
+    widen = widen if isinstance(widen, tuple) else (bool(widen), bool(widen))
     LA = np.linalg.norm(np.diff(xyA, axis=0), axis=1).sum()
     LB = np.linalg.norm(np.diff(xyB, axis=0), axis=1).sum()
     ca_on, cb_on = corners if isinstance(corners, tuple) else (corners, corners)
@@ -546,10 +565,17 @@ def build(xyA, xyB, bS: Polyline, bN: Polyline, n_neck: int, fixed_count: bool =
     xi_f = np.linspace(0, 1, Mf + 1)
     cap = LA / nA + (LB / nB - LA / nA) * xi_f                 # step 2's cap: the host size at the joins
     floor = np.zeros(Mf + 1)
-    rounds = FLOOR_ROUNDS if cell_floor > 0 else 1
+    ceil = np.full(Mf + 1, np.inf)                           # B207: the target's ceiling from the widen rounds
+    i_nf = int(np.argmin(L))
+    wide = np.zeros(Mf + 1, bool)                            # B207: the fine rows of a widened side
+    wide[:i_nf + 1] |= widen[0]
+    wide[i_nf:] |= widen[1]
+    rounds = max(FLOOR_ROUNDS if cell_floor > 0 else 1, WIDEN_ROUNDS if wide.any() else 1)
     for rnd in range(rounds):
-        h = np.maximum(h0, np.minimum(floor, cap))           # never coarser than the host (then the caller refuses)
-        xi, N = layout(h, L, ds, nA_v, nB_v, fixed_count=fixed_count and nA == nB, monotone=monotone, rows=rows)
+        h = np.maximum(np.maximum(np.minimum(h0, ceil), h_min * sc_row),
+                       np.minimum(floor, cap))               # never coarser than the host (then the caller refuses)
+        xi, N = layout(h, L, ds, nA_v, nB_v, fixed_count=fixed_count and nA == nB, monotone=monotone, rows=rows,
+                       widen=widen)
         N = N.copy()
         N[0], N[-1] = nA, nB
         row = np.concatenate([np.full(N[i] + 1, i) for i in range(len(N))])
@@ -559,25 +585,45 @@ def build(xyA, xyB, bS: Polyline, bN: Polyline, n_neck: int, fixed_count: bool =
         xy = phi(np.c_[np.clip(xi[row], 0, 1), np.clip(eta, 0, 1)])
         xy[off[0]:off[0] + nA + 1] = xyA
         xy[off[M]:off[M] + nB + 1] = xyB
-        if cell_floor <= 0:
+        if cell_floor <= 0 and not wide.any():
             break
         sz = cell_sizes(xy, tris, quads, scale)
-        info["cell_min_m"] = float(sz.min())
-        info["floor_rounds"] = rnd
-        if sz.min() >= FLOOR_MARGIN * cell_floor or rnd == rounds - 1:
-            break
         rc = np.r_[row[tris].min(1) if len(tris) else np.zeros(0, int), row[quads].min(1)]
-        deficit = np.zeros(M)
-        np.maximum.at(deficit, np.minimum(rc, M - 1), FLOOR_MARGIN * cell_floor / sz)
-        need = np.zeros(Mf + 1)
-        for i in np.flatnonzero(deficit > 1.0):            # the fine rows of row interval i, one fine row beyond
-            lo = max(int(np.searchsorted(xi_f, xi[i])) - 1, 0)
-            hi = min(int(np.searchsorted(xi_f, xi[i + 1])) + 1, Mf)
-            need[lo:hi + 1] = np.maximum(need[lo:hi + 1], h[lo:hi + 1] * deficit[i])
-        floor = _upper_envelope(np.maximum(floor, need), s, g_rows)
+        if cell_floor > 0:
+            info["cell_min_m"] = float(sz.min())
+            info["floor_rounds"] = rnd
+        low = cell_floor > 0 and sz.min() < FLOOR_MARGIN * cell_floor
+        excess = np.zeros(M)                                 # B207: per row interval, largest cell / its cap
+        if wide.any():
+            xm = 0.5 * (xi[1:] + xi[:-1])
+            host = np.interp(xm, xi_f, cap) / np.interp(xm, xi_f, np.broadcast_to(sc_row, xi_f.shape))
+            np.maximum.at(excess, np.minimum(rc, M - 1), sz / (WIDEN_CAP * host[np.minimum(rc, M - 1)]))
+            excess[~np.interp(xm, xi_f, wide.astype(float)).astype(bool)] = 0.0
+            info["widen_rounds"] = rnd
+            info["cell_max_host"] = float(WIDEN_CAP * excess.max()) if excess.max() > 0 else None
+        more = excess.max() > 1.0 and rnd < WIDEN_ROUNDS - 1
+        if not (low or more) or rnd == rounds - 1:
+            break
+        if low:
+            deficit = np.zeros(M)
+            np.maximum.at(deficit, np.minimum(rc, M - 1), FLOOR_MARGIN * cell_floor / sz)
+            need = np.zeros(Mf + 1)
+            for i in np.flatnonzero(deficit > 1.0):        # the fine rows of row interval i, one fine row beyond
+                lo = max(int(np.searchsorted(xi_f, xi[i])) - 1, 0)
+                hi = min(int(np.searchsorted(xi_f, xi[i + 1])) + 1, Mf)
+                need[lo:hi + 1] = np.maximum(need[lo:hi + 1], h[lo:hi + 1] * deficit[i])
+            floor = _upper_envelope(np.maximum(floor, need), s, g_rows)
+        if more:                                           # B207: the same rows, the target lowered by the excess
+            top = np.full(Mf + 1, -np.inf)
+            for i in np.flatnonzero(excess > 1.0):
+                lo = max(int(np.searchsorted(xi_f, xi[i])) - 1, 0)
+                hi = min(int(np.searchsorted(xi_f, xi[i + 1])) + 1, Mf)
+                top[lo:hi + 1] = np.maximum(top[lo:hi + 1], -h[lo:hi + 1] / excess[i])
+            ceil = np.minimum(ceil, -_upper_envelope(top, s, g_rows))
     info.update(rows=int(M), counts=[int(x) for x in N], n_neck_target=int(n_neck),
                 h_min_m=float(h.min()), h_max_m=float(h.max()), neck_row_len_m=float(L.min()),
                 y_splits=int(len(tris) - len(cA) - len(cB)), corners=[[int(k) for k in cA], [int(k) for k in cB]],
-                floor_raised=bool(floor.max() > 0),
-                growth=[float(g) for g in np.atleast_1d(growth)], monotone=[bool(m) for m in monotone])
+                floor_raised=bool(floor.max() > 0), ceiling_lowered=bool(np.isfinite(ceil).any()),
+                growth=[float(g) for g in np.atleast_1d(growth)], monotone=[bool(m) for m in monotone],
+                widen=[bool(w) for w in widen])
     return Block(xy, quads, tris, row, off, N, xi, X, h, info)

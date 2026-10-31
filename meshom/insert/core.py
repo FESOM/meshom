@@ -58,6 +58,7 @@ class Spec:
     fill: list = field(default_factory=list)  # B204: fill lines, each (K,3) unit vectors: the bank follows them
     fill_rows: int | None = None             # B204: rows of the strip behind a fill line (None: by its depth)
     corner_steps: bool = False               # B206: a hinted join cuts every convex step of its staircase
+    widen: bool = False                      # B207: target lowered where a block cell > 1.1 x host; counts not capped
 
 
 @dataclass
@@ -115,7 +116,7 @@ def spec_from(cfg_entry, cfg=None) -> Spec:
                 e.coast_source, e.bank_sigma_cells, e.bays, e.kind, e.width_km * 1e3 if e.width_km else None,
                 e.band_km * 1e3 if e.band_km is not None else None, e.ljoins, e.rows, e.coast_rounds,
                 e.coast_shift_cells, e.cells_a, e.cells_b, e.growth_a, e.growth_b, e.bank_land_cells,
-                [_ll(f) for f in e.fill], e.fill_rows, e.corner_steps)
+                [_ll(f) for f in e.fill], e.fill_rows, e.corner_steps, e.widen)
 
 
 def _path_frame(path: np.ndarray):
@@ -176,7 +177,7 @@ def insert_window(win: Window, spec: Spec, h_run, tol=0.20, gates=None, log=prin
     rules = {"A": None, "B": None}                     # B200 / B201: per-side join counts and size slopes
     for sd, nj, gr in (("A", spec.cells_a, spec.growth_a), ("B", spec.cells_b, spec.growth_b)):
         if nj is not None or gr is not None:
-            rules[sd] = region.SideRule(nj, gr)
+            rules[sd] = region.SideRule(nj, gr, spec.widen)
     g_side = tuple(r.growth if r is not None and r.growth is not None else block.G_LAYOUT
                    for r in (rules["A"], rules["B"]))
     if rc is not None:
@@ -374,7 +375,8 @@ def insert_window(win: Window, spec: Spec, h_run, tol=0.20, gates=None, log=prin
                       corners=(jA.shape in ("L", "hint"), jB.shape in ("L", "hint")),   # B180 / B203: at a bend
                       growth=g_side if any(r is not None for r in rules.values()) else block.G_LAYOUT,
                       monotone=(spec.cells_a is not None, spec.cells_b is not None),       # B200, B201
-                      steps=(spec.corner_steps and jA.shape == "hint", spec.corner_steps and jB.shape == "hint"))
+                      steps=(spec.corner_steps and jA.shape == "hint", spec.corner_steps and jB.shape == "hint"),
+                      widen=spec.widen)                                                    # B207
     rec["timing"]["block_s"] = time.perf_counter() - t
     rec["block"] = blk.info
     log(f"[insert {spec.name}] block: {blk.M} rows, counts {blk.N.min()}-{blk.N.max()}, {len(blk.tris)} Y-splits, "

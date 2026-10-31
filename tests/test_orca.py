@@ -103,6 +103,65 @@ def test_quadrature_presets(name, ref, cols, rows):
     assert np.median(d) < 0.005 and d.max() < 0.05, (np.median(d), d.max())
 
 
+EORCA36 = MAIN / "curvilinear_grids" / "nemo_eorca36" / "eORCA36.L121-coordinates_4.2.nc"
+
+
+def _lattice_points(name, kind, rows, cols):
+    """lon, lat of a lattice preset's T or F points at our rows x cols (generator.lattice, NEMO's standard rows)."""
+    from meshom.orca import PRESETS
+    from meshom.orca.generator import lattice, row_map, set_coefficients
+
+    pr = PRESETS[name]
+    c = set_coefficients(pr.params)
+    rm = row_map(pr.params, c)
+    joff = (c.rjpj + rm.shift) - pr.pole_row / pr.q
+    h = 0.5 / pr.q if kind == "f" else 0.0
+    lo, la = lattice(pr.params, c, rm, {kind: pr.i_offset + np.asarray(cols) / pr.q + h},
+                     {kind: joff + np.asarray(rows) / pr.q + h})
+    return lo[kind], la[kind]
+
+
+def test_orca36_preset_nests_in_orca12_and_orca025():
+    """B231: ORCA36 is ORCA05's map on the 1/18 lattice: 12960 columns, its pole row 9171 of 9173 rows, and every
+    third F line is ORCA12's with b_i = -1, b_j = +1 (F_36(3 r + 1, 3 c - 1) = F_12(r, c)), every ninth ORCA025's
+    (b_i = -4, b_j = +4); its NEMO water source is read with the reference's own offsets."""
+    from meshom.orca import PRESETS
+    from meshom.orca.fesom3 import SOURCES
+
+    p36, p12 = PRESETS["ORCA36"], PRESETS["ORCA12"]
+    assert p36.params == p12.params == PRESETS["ORCA025"].params
+    assert (p36.q, p36.pole_row, p36.rows, (p36.params.jpi - 1) * p36.q) == (18, 9171, 9173, 12960)
+    assert (SOURCES["ORCA36"].row_offset, SOURCES["ORCA36"].col_offset) == (p36.ref_row_offset, p36.ref_col_offset)
+    r = np.arange(200, 3000, 397)
+    c = np.arange(1, 4320, 611)
+    R, C = np.meshgrid(r, c, indexing="ij")
+    for coarse, k, b in (("ORCA12", 3, (-1, 1)), ("ORCA025", 9, (-4, 4))):
+        lo_c, la_c = _lattice_points(coarse, "f", r, c)
+        lo_f, la_f = _lattice_points("ORCA36", "f", k * r + b[1], k * c + b[0])
+        d = _dist_km(lo_c, la_c, lo_f, la_f) * 1e3
+        assert d.max() < 1e-6, (coarse, d.max())
+        lo_s, la_s = _lattice_points("ORCA36", "f", k * r + b[1] + 1, k * c + b[0])
+        assert _dist_km(lo_c, la_c, lo_s, la_s).min() > 0.01                    # one fine row off: a fine step away
+
+
+@pytest.mark.skipif(not EORCA36.exists(), reason="eORCA36 coordinates (../curvilinear_grids/nemo_eorca36) not found")
+def test_orca36_is_eorca36():
+    """B231: the preset's T and F points against eORCA36.L121's coordinates (the reference's row of our row 0 is
+    1670, its column of ours -1) on rows from the first exact parallel to 43 N: within 2 m (B231: south of 20 N at
+    most 1.8 m, 30-42 N 3 mm)."""
+    netCDF4 = pytest.importorskip("netCDF4")
+    from meshom.orca import PRESETS
+
+    pr = PRESETS["ORCA36"]
+    rows = np.array([1300, 2400, 3000, 4200, 5500, 6500])
+    cols = np.array([1, 2000, 4321, 6481, 9000, 12959])
+    with netCDF4.Dataset(EORCA36) as ds:
+        for k in "tf":
+            lo, la = _lattice_points("ORCA36", k, rows, cols)
+            ref = [np.asarray(ds[v + k][rows + pr.ref_row_offset, cols + pr.ref_col_offset]) for v in ("glam", "gphi")]
+            d = _dist_km(lo, la, ref[0], ref[1]) * 1e3
+            assert d.max() < 2.0 and np.median(d) < 0.01, (k, d.max())
+
 def test_fold_closed():
     """The whole grid as a mesh: the fold (F pivot here) closes, the only open edges are the southern row and the
     small holes left at the two poles (the clamped pole line's slivers, on land); every element CCW."""

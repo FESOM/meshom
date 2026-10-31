@@ -191,3 +191,101 @@ def test_cleanup_context_keeps_a_channel_across_the_box_edge():
                        context=lambda o: ~in_box(o.cell_ij, o.ni, box))
     assert part["belt"].n_elems == int((kept & in_box(ij, ni, box)).sum()) == 126
     assert all(part["wetmap"][r, 70] == 2 for r in range(56, 61))
+
+
+# ------------------------------------------------------------------------------- B230: a nest in the nest
+
+@pytest.fixture(scope="module")
+def tiny_family():
+    """A coarse map of 6 deg (NEMO's generator with 60 columns, T pivot) and its lattices refined 3 and 9 times: the
+    nest in the nest's three presets at a size a test can build (ORCA2 refined 9 times takes minutes)."""
+    from meshom.orca.generator import GenParams, row_map, set_coefficients
+    from meshom.orca.presets import PRESETS, Preset
+
+    p = GenParams(jpi=61, jpeqt=27, jpeqn=3, jpnord=19, pivot="T")
+    c = set_coefficients(p)
+    pole = int(round(c.rjpj + row_map(p, c).shift - 1.0))                  # T rows at J = 1 + j / q
+    names = {1: "TINY", 3: "TINYX3", 9: "TINYX9"}
+    for q, nm in names.items():
+        PRESETS[nm] = Preset(nm, p, layout="lattice", q=q, i_offset=0.5, pole_row=q * pole, verified=False)
+    yield PRESETS
+    for nm in names.values():
+        PRESETS.pop(nm, None)
+
+
+def _f_points(name, rows, cols):
+    """Unit vectors of a lattice preset's F points (r, c) for the pairs of rows and cols (generator.lattice)."""
+    from meshom.geo import lonlat_to_xyz
+    from meshom.orca.generator import lattice, row_map, set_coefficients
+    from meshom.orca.presets import PRESETS
+
+    pr = PRESETS[name]
+    c = set_coefficients(pr.params)
+    rm = row_map(pr.params, c)
+    joff = (c.rjpj + rm.shift) - pr.pole_row / pr.q
+    h = 0.5 / pr.q
+    out = []
+    for r, cc in zip(rows, cols):
+        lo, la = lattice(pr.params, c, rm, {"f": [pr.i_offset + cc / pr.q + h]}, {"f": [joff + r / pr.q + h]})
+        out.append(lonlat_to_xyz(lo["f"][:, 0], la["f"][:, 0]))
+    return np.vstack(out)
+
+
+def _box_edge(box):
+    c0, c1, r0, r1 = box
+    cols = np.r_[np.arange(c0, c1 + 1), np.arange(c0, c1 + 1), np.full(r1 - r0 + 1, c0), np.full(r1 - r0 + 1, c1)]
+    rows = np.r_[np.full(c1 - c0 + 1, r0), np.full(c1 - c0 + 1, r1), np.arange(r0, r1 + 1), np.arange(r0, r1 + 1)]
+    return rows, cols
+
+
+def test_nest_in_the_nest(tiny_family):
+    """B230: `nest.inner` with a preset that refines the nest's fine preset by 3: its box is the fine box in the fine
+    preset's F lines less inner.width / 3 fine cells on every side; a second frame joins it, its ring 0 the first
+    frame's ring n (every fine F point of the fine box's edge), its ring n the inner box's edge; the box holds no cell
+    of the middle preset, the innermost preset's cells fill the inner box; both frames conform, every ORCA part stays
+    unchanged, the frames' cells are near rectangular and their size changes slowly."""
+    from scipy.spatial import cKDTree
+
+    from meshom.compete import irregular_counts
+    from meshom.mesh import build_topology, signed_area
+    from meshom.methods.m16_orca import _STATE, _ruled, belt_unchanged, run
+    from meshom.quality.kernel import element_geometry
+    from meshom.size import Uniform
+
+    box, width = [23, 35, 14, 26], 21
+    mesh, info = run(Domain([], "sphere"), Uniform(1e5),
+                     {"orca": "TINY", "mask": "all", "size_tolerance": None,
+                      "nest": {"fine_orca": "TINYX3", "box": box, "width": width,
+                               "inner": {"fine_orca": "TINYX9", "width": width}}})
+    pts, quads, tris = _STATE["belt"]
+    w = width // 3
+    fine_box = [3 * box[0] + 1, 3 * box[1] + 1, 3 * box[2] + 1, 3 * box[3] + 1]      # b_i = b_j = 1
+    inner_box = [fine_box[0] + w, fine_box[1] - w, fine_box[2] + w, fine_box[3] - w]
+    assert info["fine_inner"]["nesting"]["col_offset"] == info["fine_inner"]["nesting"]["row_offset"] == 1
+    assert info["nest_inner_coarse_box"] == fine_box and info["nest_inner_box"] == inner_box
+    assert "fine" not in info                                             # no cell of the middle preset
+    assert info["fine_inner"]["orca_quads"] == 9 * (inner_box[1] - inner_box[0]) * (inner_box[3] - inner_box[2])
+    for key in ("nest", "nest_inner"):
+        assert info["joints"][key]["conforming"] and info["joints"][key]["max_match_rad"] == 0.0
+    ji, ni = info["joints"]["nest_inner"], info["nest_inner"]
+    assert ji["unmatched"] == 0 and ji["matched"] == ni["ring0_nodes"] + ni["ringn_nodes"]
+    assert ni["tris"] == ni["tris_expected"] and mesh.n_tris == len(tris) + info["nest"]["tris"] + ni["tris"]
+    r3, c3 = _box_edge(fine_box)
+    r9, c9 = _box_edge([3 * inner_box[0] + 1, 3 * inner_box[1] + 1, 3 * inner_box[2] + 1, 3 * inner_box[3] + 1])
+    edge = np.vstack([_f_points("TINYX3", r3, c3), _f_points("TINYX9", r9, c9)])
+    assert cKDTree(mesh.points).query(edge)[0].max() < 1e-12                # both rings are nodes of the mesh
+    assert ni["ring0_nodes"] == len(np.unique(np.c_[r3, c3], axis=0))
+    u = belt_unchanged(mesh, pts, quads, tris)
+    assert u["max_displacement_m"] == 0.0 and u["belt_elems_kept"] == u["belt_elems_total"]
+    assert u["belt_elems_altered"] == 0
+    assert (signed_area(mesh) > 0).all() and irregular_counts(mesh)["euler_ok"]
+    orca = _ruled(mesh, pts, quads, tris)
+    g = element_geometry(mesh)
+    T = mesh.n_tris
+    qmax = np.degrees(g.quad_angles.max(axis=1))[~orca[T:]]
+    me = np.r_[g.tri_edges.mean(axis=1), g.quad_edges.mean(axis=1)]
+    ee = build_topology(mesh).edge_elems
+    ee = ee[ee[:, 1] >= 0]
+    fr = ~orca[ee[:, 0]] | ~orca[ee[:, 1]]
+    ratio = np.maximum(me[ee[fr, 0]], me[ee[fr, 1]]) / np.minimum(me[ee[fr, 0]], me[ee[fr, 1]])
+    assert qmax.max() < 120.0 and np.percentile(ratio, 99) < 1.25

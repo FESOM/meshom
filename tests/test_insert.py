@@ -909,3 +909,371 @@ def test_side_fields_parse():
     assert (s.cells_a, s.cells_b, s.growth_a, s.growth_b, s.bank_land_cells) == (6, 9, 0.3, None, 1.0)
     d = spec_from(_build(InsertCfg, parse_inline('name=g; path=[[0, 0], [0, 1]]'), "insert"))
     assert (d.cells_a, d.cells_b, d.growth_a, d.growth_b, d.bank_land_cells) == (None, None, None, None, 0.0)
+
+
+# ------------------------------------------------------------------ banks into land near bays, fill lines (B202, B204)
+
+def test_banks_into_land_hold_still_near_a_meshed_bays_mouth(monkeypatch):
+    """B202: no into-land move within LAND_BAY_H (2) local cells of a meshed bay's mouth end: the allowance is 0
+    there, the full bank_land_cells x h from twice that distance on, linear between; a cape one cell from the mouth
+    end keeps most of its height (only the last rounding touches it) where the same cape far away is cut."""
+    from meshom.insert import realcoast as rcm
+
+    km, h = 1e3, 1e3
+    x = np.linspace(-30, 40, 7001) * km
+    cape = lambda x0: 0.8 * km * np.clip(1 - np.abs(x - x0 * km) / km, 0, None)       # noqa: E731
+    y = np.where(np.abs(x) < 2 * km, -6 * km, cape(3.0) + cape(25.0))                 # a bay of 4 x 6 cells
+    seen = {}
+    orig = rcm.into_land
+
+    def spy(q, closed, D, hh, iters=None):
+        seen["q"], seen["D"] = q.copy(), np.array(D, copy=True)
+        return orig(q, closed, D, hh, iters)
+
+    monkeypatch.setattr(rcm, "into_land", spy)
+    rc = rcm.RealCoast([np.c_[x, y]], [False])
+    rc.prepare(lambda q: np.full(len(q), h), lambda q: np.full(len(q), np.inf), h, 0.0, "auto", land_cells=1.0)
+    bays = [b for b in rc.bays if b.meshed]
+    assert len(bays) == 1
+    ends = np.array([bays[0].a, bays[0].b])
+    dn = np.min(np.linalg.norm(seen["q"][:, None] - ends[None], axis=-1), axis=1)
+    want = 1.0 * h * np.clip(dn / (rcm.LAND_BAY_H * h) - 1.0, 0.0, 1.0)
+    assert np.allclose(seen["D"], want) and (seen["D"][dn < 2 * h] == 0).all() and (seen["D"][dn > 4 * h] == h).all()
+    m, base = rc.main[0], rc.base[0]
+
+    def top(p, x0):
+        return p[np.abs(p[:, 0] - x0 * km) < 1.2 * km, 1].max()
+    assert top(base, 3.0) > 0.7 * km and top(base, 25.0) > 0.7 * km
+    assert top(m, 3.0) > 0.25 * km and top(m, 25.0) < 0.05 * km
+
+
+def test_fill_line_cuts_water_off_and_holds_the_bank():
+    """B204: a fill line across a wide bay (60 km, 3 cells deep) becomes the main coast where the water behind it is
+    at least FILL_DEPTH_H (0.5) cells deep, that water a meshed bay of its own (its mouth the line's run and its steps
+    onto the coast); over a dent 0.4 cells deep the coast is kept. With bank_land_cells the into-land move holds the
+    line (a cape on it is not cut; only B202's last rounding of one cell touches it) but rounds it within FILL_FREE_H
+    (1) cell of its ends, and the bay is taken again from where the moved bank leaves the coast behind."""
+    from meshom.insert import realcoast as rcm
+    from meshom.insert.geom import Polyline
+
+    km, h = 1e3, 2e3
+    x = np.linspace(-80, 80, 1601) * km
+    bay = -6 * km * np.clip(1 - (x / (30 * km)) ** 4, 0, None)
+    dent = -0.8 * km * np.clip(1 - ((x - 45 * km) / (5 * km)) ** 2, 0, None)
+    coast = np.c_[x, bay + dent]                                                       # water to the north
+    lx = np.linspace(-40, 55, 191) * km
+    line = np.c_[lx, 0.2 * km + 1.0 * km * np.exp(-(lx / (3 * km)) ** 2)]             # a cape at x = 0
+    out = {}
+    for lc in (0.0, 1.0):
+        rc = rcm.RealCoast([coast], [False])
+        rc.prepare(lambda q: np.full(len(q), h), lambda q: np.full(len(q), np.inf), h, 0.0, "auto", land_cells=lc,
+                   fill=[line])
+        fb = [b for b in rc.bays if b.fill >= 0]
+        assert len(fb) == 1 and fb[0].fill == 0 and fb[0].meshed and fb[0].mouth is not None
+        assert 55 * km < fb[0].mouth_m < 62 * km and 6.0 * km < fb[0].depth_m < 7.5 * km
+        assert np.all(np.abs(fb[0].mouth[[0, -1], 0]) < 31 * km)                       # the run ends near the bay's
+        m = rc.main[0]
+        dn = np.abs(m[:, 0] - 45 * km) < 2 * km
+        assert m[dn, 1].max() < -0.4 * km                                              # the dent: the coast kept
+        out[lc] = (rc, fb[0], m)
+    line_pl = Polyline(line)
+    _, _, m0 = out[0.0]
+    assert line_pl.distance(m0[np.abs(m0[:, 0]) < 20 * km]).max() < 10.0               # the line (resampled)
+    rc, b, m = out[1.0]
+    straight = (np.abs(m[:, 0]) > 14 * km) & (np.abs(m[:, 0]) < 20 * km)
+    assert line_pl.distance(m[straight]).max() < 1e-6                                  # held where it is straight
+    assert m[np.abs(m[:, 0]) < 1 * km, 1].max() > 0.9 * km                             # the cape (1.2 km) is not cut
+    pl = Polyline(b.mouth)
+    sp = pl.project(m)
+    ends = (pl.distance(m) < 0.5 * km) & (np.minimum(sp, pl.L - sp) < 1.0 * h)
+    assert pl.distance(m[ends]).max() > 1.0 or line_pl.distance(m[ends]).max() > 1.0  # rounded near its ends
+    assert Polyline(rc.base[0]).distance(b.mouth[[0, -1]]).max() < rcm.FILL_EPS_H * b.h_m + 1.0
+
+
+def test_fill_bay_block_takes_its_rows():
+    """B204: the block behind a fill line has fill_rows rows, by default max(1, round(depth / the mouth's cell))."""
+    from meshom.insert import network
+    from meshom.insert.realcoast import Bay
+
+    xa = np.c_[np.zeros(9), np.linspace(0, 80e3, 9)]
+    xb = np.c_[np.full(9, 200e3), np.linspace(0, 80e3, 9)]
+    bS = Polyline(np.c_[np.linspace(0, 200e3, 50), np.zeros(50)])
+    bN = Polyline(np.c_[np.linspace(0, 200e3, 50), np.full(50, 80e3)])
+    blk = block.build(xa, xb, bS, bN, 8, fixed_count=True)
+    top = blk.xy[blk.off[:blk.M + 1] + blk.N]                                         # the north bank's nodes
+    i0, i1 = int(np.argmin(np.abs(top[:, 0] - 60e3))), int(np.argmin(np.abs(top[:, 0] - 140e3)))
+    a, b = top[i0], top[i1]
+    dep = 32e3
+    arc = np.vstack([np.c_[np.full(9, a[0]), np.linspace(a[1], a[1] + dep, 9)],
+                     np.c_[np.linspace(a[0], b[0], 41)[1:-1], np.full(39, a[1] + dep)],
+                     np.c_[np.full(9, b[0]), np.linspace(a[1] + dep, b[1], 9)]])[::-1]
+    h_mouth = float(np.mean(np.linalg.norm(np.diff(top[i0:i1 + 1], axis=0), axis=1)))
+    sc = lambda p: np.ones(len(p))                                                       # noqa: E731
+    rows = {}
+    for fr in (None, 2, 5):
+        bay = Bay(0, -1, -1, arc, dep, float(np.linalg.norm(b - a)), h_mouth, True, fill=0, mouth=top[i0:i1 + 1])
+        net = network.build(blk, bS, bN, [bay], sc, fill_rows=fr, log=lambda *a, **k: None)
+        rec = net.bays[0]
+        assert rec["status"] == "meshed", rec
+        rows[fr] = rec["rows"]
+    assert rows[None] == max(1, round(dep / h_mouth)) and rows[2] == 2 and rows[5] == 5
+
+
+# ------------------------------------------------------------------ the block's rules (B203, B205-B209)
+
+def _signed(xy, cells):
+    p = xy[cells]
+    return 0.5 * np.sum(p[..., 0] * np.roll(p[..., 1], -1, 1) - p[..., 1] * np.roll(p[..., 0], -1, 1), axis=1)
+
+
+def _l_case():
+    leg1 = np.c_[np.zeros(11), np.linspace(100e3, 0, 11)]
+    leg2 = np.c_[np.linspace(0, 100e3, 11)[1:], np.zeros(10)]
+    xyL = np.vstack([leg1, leg2])
+    xyD = np.c_[np.linspace(60e3, 100e3, 9), np.linspace(100e3, 60e3, 9)]
+    bS = Polyline(np.c_[np.linspace(0, 60e3, 50), np.full(50, 100e3)])
+    bN = Polyline(np.c_[np.full(50, 100e3), np.linspace(0, 60e3, 50)])
+    return xyL, xyD, bS, bN
+
+
+@pytest.mark.parametrize("row", ["A", "B"])
+def test_corner_triangle_turns_with_the_block_on_either_join(row):
+    """B203: the corner triangle at an L-join's bend runs the way of the block's cells on join A (row 0) as on join B
+    (row M): every quad and triangle of the block has the same orientation (one of join A came out inverted)."""
+    xyL, xyD, bS, bN = _l_case()
+    if row == "A":
+        b = block.build(xyL, xyD, bS, bN, 8, corners=(True, False))
+        ids = np.arange(b.off[0], b.off[0] + b.N[0] + 1)
+        assert b.info["corners"] == [[10], []]
+    else:
+        b = block.build(xyD[::-1], xyL[::-1], Polyline(bN.xy[::-1]), Polyline(bS.xy[::-1]), 8, corners=(False, True))
+        ids = np.arange(b.off[b.M], b.off[b.M] + b.N[b.M] + 1)
+        assert b.info["corners"] == [[], [10]]
+    corner = [t for t in b.tris if ids[10] in t]
+    assert len(corner) == 1 and sorted(corner[0]) == sorted(ids[9:12])
+    s = np.r_[_signed(b.xy, b.quads), _signed(b.xy, b.tris)]
+    assert (s < 0).all() or (s > 0).all()
+
+
+def test_hinted_l_join_gets_the_corner_triangle(monkeypatch):
+    """B203 / B206: a join from a hint that turns a corner (here join A, row 0) gets the corner triangle at its bend
+    as an L-join does, the result valid with no inverted or overlapping cell; corner_steps reaches the block only for
+    a hinted join."""
+    from meshom.insert import region
+
+    win, ch, path, loops = synth.cape_mouth(L=450e3)
+    path = path[::-1]                                           # basin A beyond the cape: the L on join A
+    quiet = lambda *a, **k: None                                # noqa: E731
+    orig = region.candidates
+    monkeypatch.setattr(region, "candidates", lambda side, *a, **k: orig(side, *a, **k) if side == "B" else [])
+    auto = insert_window(win, Spec("capeA", path, cells=4, stages="", reach_m=200e3), Uniform(H), real=loops,
+                         log=quiet)
+    assert auto.ok and auto.joins[0].shape == "L" and auto.record["block"]["corners"][0]
+    monkeypatch.setattr(region, "candidates", orig)
+    seen = {}
+    build0 = block.build
+
+    def spy(*a, **k):
+        seen.update(corners=k.get("corners"), steps=k.get("steps"))
+        return build0(*a, **k)
+
+    monkeypatch.setattr(block, "build", spy)
+    r = insert_window(win, Spec("capeA_hint", path, cells=4, stages="", reach_m=200e3, corner_steps=True,
+                                mouth_a=win.mesh.points[auto.joins[0].nodes]), Uniform(H), real=loops, log=quiet)
+    assert r.ok and r.record["valid"] and r.joins[0].shape == "hint" and r.joins[1].shape != "hint"
+    assert r.record["block"]["corners"][0] == auto.record["block"]["corners"][0]
+    assert seen == {"corners": (True, r.joins[1].shape == "L"), "steps": (True, False)}
+    for m in (r.merged, r.window):
+        v = validity(m)
+        assert v["inverted"] == 0 and v["same_direction_edges"] == 0
+
+
+def test_neck_rows_keep_the_requested_count():
+    """B205: the count target smoothed along the rows must not lift the narrowest place: the narrowest row and its
+    neighbours whose own count target is within NECK_BAND (0.5) of it keep their own target, with no hysteresis, so
+    the neck has the requested cells (a V-shaped profile 15 -> 5 -> 11 gave 6 across)."""
+    M = 400
+    xf = np.linspace(0, 1, M + 1)
+    L = np.interp(xf, [0, 0.5, 1], [15.0, 5.0, 11.0])
+    xi, N = block.layout(np.ones(M + 1), L, np.full(M, 30.0 / M), 15, 11)
+    own = np.interp(xi, xf, L)                                     # each row's own count target (h = 1)
+    band = own < own.min() + block.NECK_BAND
+    assert N.min() == 5 and (N[band] == 5).any()                   # within the band (the birth rule steps down)
+    x = np.linspace(0, 400e3, 200)
+    w = np.where(x <= 200e3, 150e3 - 100e3 * x / 200e3, 50e3 + 60e3 * (x - 200e3) / 200e3)
+    b = block.build(np.c_[np.zeros(16), np.linspace(-75e3, 75e3, 16)], np.c_[np.full(12, 400e3),
+                    np.linspace(-55e3, 55e3, 12)], Polyline(np.c_[x, -w / 2]), Polyline(np.c_[x, w / 2]), 5)
+    rl = np.array([np.linalg.norm(np.diff(b.xy[b.off[i]:b.off[i] + b.N[i] + 1], axis=0), axis=1).sum()
+                   for i in range(b.M + 1)])
+    assert b.N[np.argmin(rl)] == 5 and (b.N == 5).sum() >= 2 and b.N.min() == 5
+
+
+def _stair(moves, H=10e3):
+    step = {"E": (1, 0), "N": (0, 1)}
+    return np.vstack([[0.0, 0.0], np.cumsum([step[m] for m in moves], axis=0) * H])
+
+
+def _stair_block(moves):
+    """A block whose join A is the staircase `moves` from bank S (at its start) to bank N, the block on its right
+    (south-east), join B the same staircase 200 km east and 120 km south."""
+    xyA = _stair(moves)
+    end = xyA[-1]
+    bS = Polyline(np.c_[np.linspace(0, 200e3, 60), np.linspace(0, -120e3, 60)])
+    bN = Polyline(np.c_[np.linspace(end[0], end[0] + 200e3, 60), np.linspace(end[1], end[1] - 120e3, 60)])
+    return xyA, xyA + np.array([200e3, -120e3]), bS, bN
+
+
+def test_staircase_join_cuts_every_convex_step():
+    """B206: corner_steps: a hinted staircase join gets a corner triangle at every convex step (turns measured
+    between single edges, at least 2 nodes apart: every second node of a single-step staircase), where the 2-edge
+    rule of B180 sees none; the quads on the join lose their ~180 deg corners and every cell keeps the block's
+    orientation."""
+    from meshom.insert.network import ccw
+
+    moves = "ENENENENENENENENE"
+    xyA, xyB, bS, bN = _stair_block(moves)
+    inside = xyB.mean(0)
+    assert block.bend_corners(xyA, inside) == []
+    assert block.bend_corners(xyA, inside, w=1, gap=2) == list(range(2, len(moves), 2))   # the N -> E (right) turns
+    plain = block.build(xyA, xyB, bS, bN, 8, corners=(True, False))
+    cut = block.build(xyA, xyB, bS, bN, 8, corners=(True, False), steps=(True, False))
+    assert plain.info["corners"] == [[], []] and cut.info["corners"][0] == list(range(2, len(moves), 2))
+    def wide(b):                                                 # quads on the join with a corner above 140 deg
+        return int((_cell_angles(b.xy, ccw(b.xy, b.quads)).max(1)[b.row[b.quads].min(1) == 0] > 140.0).sum())
+    assert wide(plain) >= 5 and wide(cut) <= 1                   # the one left: at the bank's end
+    s = np.r_[_signed(cut.xy, cut.quads), _signed(cut.xy, cut.tris)]
+    assert (s > 0).all()
+
+
+@pytest.mark.xfail(strict=True, reason="B206: the block's side is read from the turning between the chain's first and "
+                                       "last single edges (+90 deg here), so the corners go to the reflex steps")
+def test_staircase_join_cuts_the_convex_steps_whatever_its_first_and_last_step():
+    """B206: a staircase whose first step is east and last step north (its single edges turn by 90 deg) with the
+    block on its right: the convex steps are its N -> E turns, every cell keeps the block's orientation."""
+    moves = "ENENENENENENENEN"
+    xyA, xyB, bS, bN = _stair_block(moves)
+    cut = block.build(xyA, xyB, bS, bN, 8, corners=(True, False), steps=(True, False))
+    assert cut.info["corners"][0] == list(range(2, len(moves), 2))
+    s = np.r_[_signed(cut.xy, cut.quads), _signed(cut.xy, cut.tris)]
+    assert (s > 0).all()
+
+
+def _bulge(**kw):
+    """Joins of 8 host edges (10 km) 300 km apart, the north bank bulging out to 200 km between them, the counts
+    held at the joins' 8 (cells_a = cells_b, B200)."""
+    xa = np.c_[np.zeros(9), np.linspace(0, 80e3, 9)]
+    xb = np.c_[np.full(9, 300e3), np.linspace(0, 80e3, 9)]
+    bS = Polyline(np.c_[np.linspace(0, 300e3, 80), np.zeros(80)])
+    x = np.linspace(0, 300e3, 120)
+    bN = Polyline(np.c_[x, 80e3 + 120e3 * np.sin(np.pi * x / 300e3) ** 2])
+    b = block.build(xa, xb, bS, bN, 8, monotone=(True, True), **kw)
+    return b, block.cell_sizes(b.xy, b.tris, b.quads) / 10e3
+
+
+def test_add_columns_where_the_block_fans_out():
+    """B207: add_columns: on a side with a set join count the target is held only at or above the smaller of the
+    neck's and the join's counts (not clipped between them), in the block and in the funnel rule; the layout rounds
+    lower the target where a cell exceeds ADD_COLUMNS_CAP (1.1) x the host size, so the rows get more columns where
+    the block fans out and come back to the join's count by the birth rule."""
+    from meshom.insert import region
+
+    raw = np.array([9.0, 8, 7, 6.5, 6, 6.3, 7, 12, 9, 7, 6])
+    both = block.monotone_counts(raw, 6, 6, (True, True), 4, add_columns=(False, True))
+    assert np.array_equal(both[:5], [6, 6, 6, 6, 6]) and np.array_equal(both[4:], np.maximum(raw[4:], 6))
+    assert both.max() == 12
+    Ns = np.array([4.0, 8.0, 20.0])
+    assert np.array_equal(region.funnel_counts(Ns, 10, region.SideRule(14, add_columns=True)), [10, 10, 20])
+    held, sz0 = _bulge()
+    wide, sz1 = _bulge(add_columns=True)
+    assert (held.N == 8).all() and sz0.max() > 3.0                               # B200 alone: 4 x the host
+    assert wide.N.max() > 30 and wide.N[0] == wide.N[-1] == 8
+    lim = np.maximum(1, (block.BIRTH_FRAC * wide.N[:-1]).astype(int))
+    assert (np.abs(np.diff(wide.N)) <= lim).all()
+    assert sz1.max() < 1.15 and wide.info["ceiling_lowered"]
+    assert wide.info["cell_max_host"] == pytest.approx(sz1.max(), rel=1e-6)
+    assert wide.info["add_columns_rounds"] < block.ADD_COLUMNS_ROUNDS
+
+
+def test_split_corner_triangles():
+    """B208: corner_split: the corner triangle is split at the midpoint of its diagonal into two triangles that
+    share the corner node and the midpoint; the midpoint takes the corner's place in row 0 (so the block's first row
+    meets all the join's segments), the corner node is appended at its host position and the join's host nodes in
+    chain order (Block.joins, Net.ids_a) name it."""
+    from meshom.insert import network
+
+    xyL, xyD, bS, bN = _l_case()
+    b = block.build(xyL, xyD, bS, bN, 8, corners=(True, False), split=True)
+    row0 = np.arange(b.off[0], b.off[0] + b.N[0] + 1)
+    assert b.N[0] == len(xyL) - 1 and b.info["split"] == [True, False] and b.info["corners"] == [[10], []]
+    assert np.allclose(b.xy[row0], block.split_chain(xyL, [10]))
+    assert np.allclose(b.xy[row0[10]], 0.5 * (xyL[9] + xyL[11]))
+    ja, jb = b.joins()
+    assert np.array_equal(b.xy[ja], xyL) and ja[10] == len(b.xy) - 1 and np.array_equal(ja[:10], row0[:10])
+    c = ja[10]
+    tri = [t for t in b.tris if c in t]
+    assert len(tri) == 2 and all(row0[10] in t for t in tri) and not any(c in q for q in b.quads)
+    assert sorted(set(np.concatenate(tri))) == sorted([row0[9], row0[10], row0[11], c])
+    seg = {tuple(sorted(e)) for e in zip(row0[:-1], row0[1:])}
+    cells = [np.r_[q, q[:1]] for q in b.quads] + [np.r_[t, t[:1]] for t in b.tris if c not in t]
+    used = {tuple(sorted(e)) for cl in cells for e in zip(cl[:-1], cl[1:])}
+    assert seg <= used                                           # every row-0 segment meets a block cell
+    assert b.info["y_splits"] == len(b.tris) - 2
+    s = np.r_[_signed(b.xy, b.quads), _signed(b.xy, b.tris)]
+    assert (s < 0).all() or (s > 0).all()
+    net = network.from_block(b, 2, lambda p: np.ones(len(p)))
+    assert np.array_equal(net.ids_a, ja) and np.array_equal(net.ids_b, jb)
+
+
+def test_join_margin_makes_the_outermost_rows_finer():
+    """B209: join_margin scales the size target's cap at the joins (each join's host edge, linear between), so the
+    outermost rows are finer than the host; add_columns (B207) still measures the cells against the host size
+    itself: its rounds stop once every cell is within 1.1 x the host, not 1.1 x the margin."""
+    one, sz1 = _bulge()
+    m85, sz85 = _bulge(margin=0.85)
+    assert one.fine_h[0] == pytest.approx(10e3) and m85.fine_h[0] == pytest.approx(8.5e3)
+    assert m85.fine_h[-1] == pytest.approx(8.5e3) and m85.info["margin"] == 0.85
+    first = lambda b, sz: sz[len(b.tris):][b.row[b.quads].min(1) == 0].mean()           # noqa: E731
+    assert first(m85, sz85) < 0.95 < first(one, sz1)
+    wide, szw = _bulge(margin=0.85, add_columns=True)
+    assert 0.85 * block.ADD_COLUMNS_CAP < szw.max() <= block.ADD_COLUMNS_CAP
+
+
+# ------------------------------------------------------------------ the spliced insert's smoothing (B210)
+
+def test_fix_rings_relaxes_the_insert_and_holds_the_cut_and_the_host_coast():
+    """B210: stage a of the mesh fixer on the cells the insert created or changed and fix_rings rings round them:
+    the worst corners relax, no cell inverts; the window's cut and the host's coast nodes stay; no node outside the
+    rings moves; the record counts the host nodes moved and returns them."""
+    from meshom.insert import assemble, measure
+    from meshom.insert.core import _part
+
+    win, ch, path, loops = synth.strait_real(H=H, L=400e3)
+    res = insert_window(win, Spec("fix", path, cells=10, stages=""), Uniform(H), real=loops, log=lambda *a, **k: None)
+    assert res.ok
+    full, sinfo = splice(win.mesh, win, res.window)
+    h2n = sinfo["host_to_new"]
+    cut = np.zeros(full.n_nodes, bool)
+    cut[h2n[win.old_id[win.kind == 2]]] = True
+    rings = 3
+    out, rec, moved = assemble.fix_rings(win.mesh, full, _part(full, res.window), cut, rings, 0.0, H,
+                                         res.chart.inv(np.zeros((1, 2)))[0], "fix")
+    b, a = rec["before"], rec["after"]
+    assert a["qmax"] < b["qmax"] - 20.0 and a["q120"] < b["q120"]
+    assert rec["validity"]["after"]["inverted"] == 0 and rec["validity"]["after"]["same_direction_edges"] == 0
+    mv = np.linalg.norm(out.points - full.points, axis=1) > 0
+    hc = h2n[np.unique(win.coast_edges)]
+    assert mv.sum() > 100 and not mv[cut].any() and not mv[hc[hc >= 0]].any()
+    T = full.n_tris
+    keep = measure.changed_cells(win.mesh, full)
+    for _ in range(rings):
+        near = np.zeros(full.n_nodes, bool)
+        near[full.quads[keep[T:]].ravel()] = True
+        near[full.tris[keep[:T]].ravel()] = True
+        keep |= np.r_[near[full.tris].any(1), near[full.quads].any(1)]
+    case = np.zeros(full.n_nodes, bool)
+    case[full.quads[keep[T:]].ravel()] = True
+    case[full.tris[keep[:T]].ravel()] = True
+    assert not (mv & ~case).any()
+    at_host = np.zeros(full.n_nodes, bool)
+    at_host[h2n[h2n >= 0]] = True
+    assert rec["host_moved"] == (mv & at_host).sum() > 0 and np.array_equal(np.sort(moved), np.flatnonzero(mv & at_host))

@@ -14,7 +14,8 @@ Reference grids (`ref`, converted by scripts/grids/orca_refs_npz.py; `ref_row_of
 0): ORCA2 is NEMO 5.0's ORCA_R2 domain_cfg (its halo column 0 and fold row 148 cut off, so `ref_col_offset` -1);
 eORCA1 / eORCA025 / eORCA12 are the Met Office GO6 grids and eORCA05 MEOM's eORCA05.L121 (Grenoble), ORCA plus the
 ice-shelf rows of Mathiot et al. (2017) in the south (those rows are not ORCA's: the mask there falls back to the depth
-rule).
+rule). eORCA36 is MEOM / IGE's eORCA36.L121 (Grenoble, NEMO 4.2 files without halos: no wrap column and no fold row,
+so `ref_col_offset` -1 as ORCA2's: our column 0, near 73 E, has no reference point).
 """
 from dataclasses import dataclass, field, replace
 
@@ -77,6 +78,12 @@ PRESETS = {
         ref_row_offset=547,
         sources={"q": "counted: eORCA12 is ORCA05's map on the 1/6 lattice (ORCA025 x 3)",
                  "i_offset, pole_row": "counted on eORCA12 (T pivot)"}),
+    "ORCA36": Preset(
+        "ORCA36", ORCA05_BASE, layout="lattice", q=18, i_offset=17.0 / 18.0, pole_row=9171, rows=9173, ref="eorca36",
+        ref_row_offset=1670, ref_col_offset=-1,
+        sources={"q": "counted: eORCA36 is ORCA05's map on the 1/18 lattice (ORCA12 x 3, ORCA025 x 9)",
+                 "i_offset, pole_row": "counted on eORCA36 (T pivot; its file has no halo column, ORCA12's layout)",
+                 "reference": "MEOM / IGE eORCA36.L121 coordinates, NEMO 4.2 (12960 x 10842, no halos)"}),
 }
 
 

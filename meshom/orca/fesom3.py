@@ -645,6 +645,8 @@ SOURCES = {
     "ORCA025": Source("nemo025q", 0, 0, "level", "FESOM3's ORCA025.L46 mesh_zgr mbathy (fesom3_orca025/nemo025q)",
                       True),
     "ORCA12": Source("eorca12", 547, 0, "depth", "Met Office GO6 eORCA12 bathymetry (GEBCO 2021)"),
+    "ORCA36": Source("eorca36", 1670, -1, "depth", "MEOM eORCA36.L121 domain_cfg bathy_metry where bottom_level > 0 "
+                     "and top_level = 1 (ice-shelf cavities land), NEMO 4.2 without halos"),
 }
 
 

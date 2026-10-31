@@ -10,8 +10,9 @@ description: How to build NEMO's ORCA grids as quad meshes with m16_orca - whole
 `m16_orca` (`meshom/methods/m16_orca.py`, the package `meshom.orca`) builds NEMO's tripolar ORCA grids with NEMO's
 own grid generator, ported from G. Madec's ORCA generator (NEMO; Madec and Imbard, 1996; see `NOTICE`), with
 A. Sellar's tropical stretch. The presets (`meshom.orca.presets.PRESETS`): `ORCA2`, `ORCA1`, `ORCA05`, `ORCA025`,
-`ORCA12`. ORCA1, ORCA05, ORCA025 and ORCA12 match NEMO's grids to below 1 m away from the poles; ORCA2 to a few km,
-without NEMO's hand-made 1-degree Mediterranean patch (B78-B81).
+`ORCA12`, `ORCA36`. ORCA1, ORCA05, ORCA025, ORCA12 and ORCA36 match NEMO's grids to below 1 m away from the poles;
+ORCA2 to a few km, without NEMO's hand-made 1-degree Mediterranean patch (B78-B81, B231). ORCA36 (119 M cells) is
+for a box inside a nest, not for a whole mesh.
 
 The ORCA cells take the land-sea mask of NEMO's own file of that grid, cell for cell (B82), cleaned as FESOM3 needs
 (B84); the run's land cut leaves them alone (B85). NEMO's closed seas (the Caspian, ORCA025's Great Lakes) are
@@ -28,7 +29,8 @@ removed, as every water body cut off from the ocean (B171, C48); `keep_seas = tr
    `MESHOM_ORCA_REFS`) at `OUT_DIR`.
 3. For FESOM3's rules (below) also NEMO's levels: `scripts/grids/orca_levels_npz.py LEVELS NAME=PATH ...` (the
    Met Office GO6 bathymetries, Zenodo records 22010172, 15494369, 15495870; NEMO's ORCA2 domain_cfg; MEOM's
-   eORCA05) and `scripts/grids/nemo_inputs_npz.py NEMO_DIR LEVELS/nemo025q.npz` for FESOM3's own ORCA025 inputs.
+   eORCA05; MEOM's eORCA36.L121 domain_cfg as `eorca36=PATH`) and `scripts/grids/nemo_inputs_npz.py NEMO_DIR
+   LEVELS/nemo025q.npz` for FESOM3's own ORCA025 inputs.
    `[mesh.opts] levels_dir` (or `MESHOM_ORCA_LEVELS`) points at `LEVELS`.
 
 ## Build a whole grid
@@ -36,7 +38,7 @@ removed, as every water body cut off from the ocean (B171, C48); `keep_seas = tr
 Copy `docs/examples/orca2_whole.toml`, `orca1_whole.toml` or `orca025_whole.toml`; set `[mesh.opts] orca`,
 `ref_dir`, `gebco` (a GEBCO-like grid for the cells NEMO's mask does not cover: eORCA's ice-shelf rows) and the
 `latitude` layer's `h_m` to the grid's zonal spacing (it is only the score's reference: the grid does not follow h):
-222 390 m for ORCA2, 111 195 ORCA1, 55 597.5 ORCA05, 27 798.75 ORCA025, 9 266.25 ORCA12.
+222 390 m for ORCA2, 111 195 ORCA1, 55 597.5 ORCA05, 27 798.75 ORCA025, 9 266.25 ORCA12, 3 088.75 ORCA36.
 
 Keep: `[coast] treatment = "cut"`, `min_area_km2 = 0`, `passage_min_cells = 0` (NEMO's straits are its own),
 `[mesh] optimize` unset and `[run] smooth = false` (both would move ORCA nodes).
@@ -83,6 +85,11 @@ Report it; do not try to fix it.
   `lonlat = [lon0, lat0, lon1, lat1]`, `width` (default 39 fine steps): the fine preset inside the box, a graded
   frame of rings between the boxes, square corners. Keep the box below the fold and away from the grid poles.
   `docs/examples/orca025_gs_nest.toml` (ORCA12 in a Gulf Stream box, written by `scripts/orca025_gs_nest.py`).
+- **A nest in the nest** (`[mesh.opts.nest.inner]`, B230): `fine_orca` = a preset refining the nest's by 3
+  (`ORCA36` in `ORCA12`), `width` (default 39 of its steps): a second frame inside the nest's box and that preset's
+  cells inside it, so the box goes from ORCA025 to ORCA36 in two frames and holds no ORCA12 cells. h: a second
+  `blend` zone (`h_factor = 1/3`, `polygon` the inner box's edge, `outer` the nest's box's edge). For a strait this
+  gives the cells NEMO's finer grid has there (Gibraltar: 6 at the narrowest section in ORCA36, 3 in ORCA12).
 
 ## FESOM3's ORCA rules
 

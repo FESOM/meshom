@@ -531,9 +531,10 @@ How a block enters the mesh:
 NEMO's ORCA grids built by NEMO's own generator, whole or between two latitudes with meshom elsewhere (decisions
 B71-B86). `meshom.orca` is a port of G. Madec's tripolar generator with A. Sellar's tropical stretch (B78; see
 `NOTICE`); the family is a set
-of presets (B79-B81): `ORCA2`, `ORCA1`, `ORCA05`, `ORCA025`, `ORCA12`, each checked against a NEMO grid (ORCA1, ORCA05,
-ORCA025, ORCA12 to below 1 m away from the poles; ORCA2 to a few km, its older generator's functions being fitted, and
-without its hand-made 1-degree Mediterranean patch).
+of presets (B79-B81, B231): `ORCA2`, `ORCA1`, `ORCA05`, `ORCA025`, `ORCA12`, `ORCA36`, each checked against a NEMO
+grid (ORCA1, ORCA05, ORCA025, ORCA12, ORCA36 to below 1 m away from the poles; ORCA2 to a few km, its older generator's
+functions being fitted, and without its hand-made 1-degree Mediterranean patch). `ORCA36` = `ORCA12` × 3 is meant for
+a box (`nest.inner`): its whole grid has 119 M cells.
 
 - **Whole** (`lat_south`, `lat_north` unset): the preset's grid, its north fold closed, as quads (a few pole cells
   dropped, on land); the land as NEMO's own file of that grid has it, cell for cell (B82; the depth rule where it does
@@ -570,6 +571,13 @@ without its hand-made 1-degree Mediterranean patch).
   box below the fold and away from NEMO's grid poles; a box across the east-west wrap is fine. Its h: a `blend` zone
   with `h_factor = 1/3`, `polygon` = the fine box's edge, `outer` = the coarse box's edge
   (`scripts/orca025_gs_nest.py`, `docs/examples/orca025_gs_nest.toml`).
+- **A nest in the nest** (`[mesh.opts.nest.inner]`, B230): a third preset that refines the nest's fine preset by 3
+  (`ORCA36` in `ORCA12`, so 9 times `ORCA025`) fills the nest's fine box: a second frame of `inner.width` steps of
+  the third preset runs inside the box's edge (its outer ring is the first frame's inner ring: the box's edge, every
+  ORCA12 F point) and the third preset's cells fill the rest, with their own NEMO source. The box then holds no cells
+  of the middle preset; the step from the coarse cells to the finest is two graded frames of 3. Size the box so that
+  the third preset's part (the box less `inner.width / 3` middle cells on every side) covers the region. Its h: a
+  second `blend` zone with `h_factor = 1/3`, `polygon` = the inner box's edge, `outer` = the nest's fine box's edge.
 - **A latitude range** (`lat_south` and / or `lat_north`): the ORCA rows from the first F row south of `lat_south` to
   the F row whose mean latitude is nearest `lat_north`, NEMO's mask on them; a north cap (when `lat_north` is set) and
   a south cap (when `lat_south` lies north of the preset's own first row) meshed by `cap_method` on the domain bounded
@@ -581,7 +589,7 @@ Options (`[mesh.opts]`):
 
 | key | type | default | meaning |
 |---|---|---|---|
-| `orca` | string | `"ORCA1"` | the preset: `ORCA2`, `ORCA1`, `ORCA05`, `ORCA025`, `ORCA12` (`meshom.orca.presets.PRESETS`) |
+| `orca` | string | `"ORCA1"` | the preset: `ORCA2`, `ORCA1`, `ORCA05`, `ORCA025`, `ORCA12`, `ORCA36` (`meshom.orca.presets.PRESETS`) |
 | `lat_south` | float or unset | unset | unset: the preset's own first row (NEMO's standard rows: ORCA1 78.3 S); a latitude: the first F row is the last one south of it; the grid is extended south when the preset ends north of it (B74) |
 | `lat_north` | float or unset | unset | unset: to the north fold (the whole grid); a latitude: the last F row is the one whose mean latitude is nearest it (B74) |
 | `region` | [[lon, lat], ...] or unset | unset | the ORCA part bounded by a line (B100): a polygon of the lon-lat plane (straight edges, holding the whole south: corners at lon ±181, lat −91); per ORCA column the cells from the first row up to the first T point outside it (ORCA's land cells count, so seas behind land inside it stay ORCA); the north cap is meshed against that staircase. Excludes `lat_north` |
@@ -590,7 +598,7 @@ Options (`[mesh.opts]`):
 | `transition` | string | `"fill"` | B114: between a coarse and a `fine_orca` part, `"fill"` = `cap_method` (B108-B112), `"ladder"` = the structured strip of `meshom.orca.ladder` between two plain rows |
 | `ladder_lat` | [float, float] | unset | B114: `transition = "ladder"`: the coarse part up to its last F row lying wholly south of the first latitude, the fine part from its last F row lying wholly south of the second (it covers everything north of it) |
 | `ladder_theta_deg` | float | 18 | B115: an arm's tilt on the sphere at a Y-split (the triangle's apex 2θ, the quad corner at the arm 90° + θ) |
-| `nest` | table or unset | unset | B176: `fine_orca` (the refined preset, k = 3), `box` = [c0, c1, r0, r1] (the fine box as coarse F lines of the preset's own rows; columns unwrapped, c0 < c1) or `lonlat` = [lon0, lat0, lon1, lat1] (the smallest box of F lines holding every cell whose T point lies inside; lon0 > lon1 crosses the antimeridian), `width` (the frame's width in fine steps, a multiple of 3, default 39: 24 rings, B172), `theta_deg` (an arm's tilt at a ladder Y-split, default 18, B115), `relax` (the frame's relaxation weights [widths, tilts, bases], default [1, 3, 3], false: off, B175) |
+| `nest` | table or unset | unset | B176: `fine_orca` (the refined preset, k = 3), `box` = [c0, c1, r0, r1] (the fine box as coarse F lines of the preset's own rows; columns unwrapped, c0 < c1) or `lonlat` = [lon0, lat0, lon1, lat1] (the smallest box of F lines holding every cell whose T point lies inside; lon0 > lon1 crosses the antimeridian), `width` (the frame's width in fine steps, a multiple of 3, default 39: 24 rings, B172), `theta_deg` (an arm's tilt at a ladder Y-split, default 18, B115), `relax` (the frame's relaxation weights [widths, tilts, bases], default [1, 3, 3], false: off, B175), `inner` (a table, unset by default: a nest in the nest, B230: `fine_orca` = a preset refining `fine_orca` by 3, `width` in its steps (default 39), `theta_deg`, `relax` as above) |
 | `mask` | string | `"nemo"` | `"nemo"`: NEMO's mask on the ORCA cells (B82-B84); `"fesom3"`: FESOM3's rules (below, B94); `"all"`: every cell, the land as the run's cut has it for the caps (the ORCA cells are still protected, B85; for tests) |
 | `ref_dir` | path | `$MESHOM_ORCA_REFS` | the folder of NEMO's reference grids as npz (`scripts/grids/orca_refs_npz.py OUT_DIR`; eORCA05: `... OUT_DIR eorca05=PATH`) |
 | `levels_dir` | path | `$MESHOM_ORCA_LEVELS` | `mask = "fesom3"`: the folder of NEMO's bottom levels / model bathymetry as npz (`scripts/grids/orca_levels_npz.py`, `scripts/grids/nemo_inputs_npz.py`; the names of `meshom.orca.fesom3.SOURCES`, B92) |
@@ -606,7 +614,8 @@ passage_min_cells` 0 for a whole grid, 2 for a range mesh (C51 acts on the caps 
 are skipped, B95), `[coast] min_area_km2 = 0`,
 `[mesh] optimize` unset and `[run] smooth` false (both would move ORCA nodes). h does not shape the ORCA part; give it
 the grid's zonal spacing (`latitude` layer: `h_m` = 222 390 for ORCA2, 111 195 ORCA1, 55 597.5 ORCA05, 27 798.75
-ORCA025, 9 266.25 ORCA12): the size gate then fails on ORCA's anisotropic cells by design (report it, do not fix it).
+ORCA025, 9 266.25 ORCA12, 3 088.75 ORCA36): the size gate then fails on ORCA's anisotropic cells by design (report it,
+do not fix it).
 The method writes `orca.json` (the grid, the rows, the mask and its clean-up with places, the joints) and
 `orca_belt.npz` (the ORCA part's points and elements, its T points and NEMO's flags) into the run folder;
 `scripts/orca_report.py` (the ORCA part unchanged, quality per part, the joint), `scripts/orca_mask_report.py` (the
@@ -638,9 +647,11 @@ one water component (C52). Two ways:
 
 Each preset's water (`meshom.orca.fesom3.SOURCES`, B92): ORCA025 FESOM3's own ORCA025.L46 `mbathy` (by index);
 ORCA2 NEMO 5.0's `bottom_level` (31 levels); ORCA05 MEOM's eORCA05.L121 `mbathy` (121 levels); ORCA1 and ORCA12 the
-Met Office GO6 model bathymetry (Zenodo 22010172, 15495870) on L46 (`level_of_depth`); cells without a NEMO value
-(eORCA's ice-shelf rows, ORCA2's Mediterranean patch, rows added in the south) by GEBCO (B83's rule) on the same
-levels. Every preset but ORCA025 takes the strait edits by place where the strait is closed (`carry_edits`, B91).
+Met Office GO6 model bathymetry (Zenodo 22010172, 15495870) on L46 (`level_of_depth`); ORCA36 MEOM's eORCA36.L121
+`bathy_metry` where `bottom_level` > 0 and `top_level` = 1 (an ice-shelf cavity is land) on L46 (B231); cells without
+a NEMO value (eORCA's ice-shelf rows, ORCA2's Mediterranean patch, rows added in the south) by GEBCO (B83's rule) on
+the same levels. Every preset but ORCA025 takes the strait edits by place where the strait is closed (`carry_edits`,
+B91).
 
 ### `[[inserts]]` (`python -m meshom.insert`)
 

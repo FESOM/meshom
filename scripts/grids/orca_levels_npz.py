@@ -10,7 +10,10 @@ NAME is the source name meshom.orca.fesom3.SOURCES uses:
 - eorca1=<...>/bathy_eORCA1_...nc, eorca025=<...>/bathy_eORCA025_...nc, eorca12=<...>/bathy_eORCA12_...nc (Met Office
   GO6 model bathymetry from GEBCO 2021 with its hand edits, Zenodo 22010172, 15494369, 15495870): depth_m =
   Bathymetry (positive down, 0 land); the T points from the GO6 grid_mask file of the same grid, given as
-  `eorca12_grid=<...>/grid_mask_eORCA12-GO6.nc` when the bathymetry file has no nav_lon / nav_lat.
+  `eorca12_grid=<...>/grid_mask_eORCA12-GO6.nc` when the bathymetry file has no nav_lon / nav_lat;
+- eorca36=<...>/eORCA36.L121_domain_cfg_v7_4.2.nc (MEOM / IGE eORCA36.L121, NEMO 4.2 without halos,
+  ige-meom-opendap.univ-grenoble-alpes.fr thredds meomopendap/extract/MEOM/eORCA36.L121/eORCA36.L121-I): depth_m =
+  bathy_metry where bottom_level > 0 and top_level = 1, else 0 (an ice-shelf cavity is land: FESOM3 has none).
 Every npz: glamt, gphit (float64, the file's rows x columns), and kb (int16) + z (float64, Nz + 1, 0 first) or
 depth_m (float32).
 """
@@ -37,6 +40,10 @@ def main(out: Path, src: dict) -> None:
             if name == "orca2":
                 arr["kb"] = _v(d, "bottom_level").astype(np.int16)
                 arr["z"] = np.r_[0.0, np.cumsum(_v(d, "e3t_1d").astype(np.float64))]
+                arr["glamt"], arr["gphit"] = _v(d, "glamt").astype(float), _v(d, "gphit").astype(float)
+            elif name == "eorca36":
+                wet = (_v(d, "bottom_level") > 0) & (_v(d, "top_level") == 1)
+                arr["depth_m"] = np.where(wet, _v(d, "bathy_metry"), 0.0).astype(np.float32)
                 arr["glamt"], arr["gphit"] = _v(d, "glamt").astype(float), _v(d, "gphit").astype(float)
             elif name == "eorca05":
                 arr["kb"] = _v(d, "mbathy").astype(np.int16)

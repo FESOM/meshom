@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
-"""A finer ORCA nested in a box of an ORCA grid (ORCA12 in ORCA025), joined by a structured frame built in ORCA's own
-index space: the nest (decisions B172-B176; m16_orca `nest`).
+"""A finer ORCA nested in a box of an ORCA grid (ORCA12 in ORCA025; ORCA36 in ORCA12 for m16_orca's `nest.inner`,
+B230), joined by a structured frame built in ORCA's own index space: the nest (decisions B172-B176; m16_orca `nest`).
 
 Coordinates: fine F indices. The box is given by four coarse F lines (the fine box: columns c0..c1, rows r0..r1 of
 the coarse grid); its edges are lines of both grids (a coarse F point (r, c) is the fine F point (k r + b_j, k c + b_i),

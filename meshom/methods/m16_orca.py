@@ -24,6 +24,10 @@ B74-B76, B78-B86, B108, B109).
 - The nest (`nest`; B172-B176): the refined preset's cells inside a box of coarse F lines, the coarse part without
   the box widened by the frame's width, between the two boxes meshom.orca.nest's frame (graded rectangular rings,
   tensor corners, the ladder along the sides), merged node for node with both parts.
+- A nest in the nest (`nest.inner`; B230): the nest's fine box holds a second frame of `inner.width` steps of a
+  preset that refines the nest's fine preset by 3 (ORCA36 in ORCA12), and that preset's cells inside it; the two
+  frames meet on the fine box's edge (ring n of the first is ring 0 of the second), so the box holds no cells of the
+  middle preset and the step from the coarse grid to the finest is 9 in two graded frames of 3.
 
 The ORCA part is never touched after: no smoothing or optimisation acts on it (keep `[mesh] optimize` unset and
 `[run] smooth` false). meshom run's land cut then cuts the caps by the coast (meshom's rule there) and leaves the ORCA
@@ -63,7 +67,9 @@ DEFAULTS = dict(
     ladder_relax=None,        # B115: the relaxation's weights [widths, tilts, bases] (None: ladder.RELAX; false: off)
     nest=None,                # B176: None; else {fine_orca, box = [c0, c1, r0, r1] (coarse F lines) or lonlat = [lon0,
                               # lat0, lon1, lat1], width (fine steps, default nest.H_DEFAULT), theta_deg, relax}: the
-                              # fine ORCA in the box, the coarse ORCA outside the widened box, meshom.orca.nest's frame
+                              # fine ORCA in the box, the coarse ORCA outside the widened box, meshom.orca.nest's frame;
+                              # B230: inner = {fine_orca (refines nest.fine_orca by 3), width, theta_deg, relax}: a
+                              # second frame inside the fine box and that preset's cells inside it
     mask="nemo",              # B82: NEMO's mask ("nemo"), FESOM3's rules ("fesom3", B94), or "all" (every cell)
     ref_dir=None,             # the reference npz (scripts/grids/orca_refs_npz.py); None: $MESHOM_ORCA_REFS
     levels_dir=None,          # B91: NEMO's levels npz (orca_levels_npz.py, nemo_inputs_npz.py); $MESHOM_ORCA_LEVELS
@@ -451,6 +457,8 @@ def run(domain: Domain, h: SizeField, opts: dict | None = None) -> tuple[Mesh, d
         if o.get("fine_orca") and str(o["fine_orca"]) != str(nest_o["fine_orca"]):
             raise ValueError("m16_orca: `nest.fine_orca` and `fine_orca` must be one preset")
         gf_l = build(str(nest_o["fine_orca"]), 0)
+    inner_o = dict(nest_o["inner"]) if nest_o is not None and nest_o.get("inner") else None
+    gf_in = build(str(inner_o["fine_orca"]), 0) if inner_o is not None else None     # B230: the nest in the nest
     if ladder:                                                    # B114: two plain rows, the strip between them
         from meshom.orca.ladder import edge_rows
 
@@ -486,6 +494,13 @@ def run(domain: Domain, h: SizeField, opts: dict | None = None) -> tuple[Mesh, d
             nbox = NS.box_from_lonlat(g, nest_o["lonlat"])
         cbox = NS.boxes(nbox, H, nk["k"], nk)["coarse_box"]
         info["nest_box"], info["nest_coarse_box"] = list(nbox), list(cbox)
+        if inner_o is not None:                                   # B230: the inner fine box in the fine grid's F lines:
+            H_in = int(inner_o.get("width") or NS.H_DEFAULT)      # the nest's fine box less the inner frame's width
+            k, b_i, b_j = nk["k"], nk["col_offset"], nk["row_offset"]
+            w = H_in // 3
+            ibox_c = (k * nbox[0] + b_i, k * nbox[1] + b_i, k * nbox[2] + b_j, k * nbox[3] + b_j)
+            ibox = (ibox_c[0] + w, ibox_c[1] - w, ibox_c[2] + w, ibox_c[3] - w)
+            info["nest_inner_box"], info["nest_inner_coarse_box"] = list(ibox), list(ibox_c)
         from meshom.orca.mesh import in_box
 
         r = NS.CONTEXT_CELLS                                     # the ring inside the box: context of the clean-up
@@ -497,23 +512,36 @@ def run(domain: Domain, h: SizeField, opts: dict | None = None) -> tuple[Mesh, d
     info.update(part["info"])
     belt, wetmap, wet, mapped, present = part["belt"], part["wetmap"], part["wet"], part["mapped"], part["present"]
     node_level, z = part["node_level"], part["z"]
-    fine = None
-    if o.get("fine_orca") or nest_o is not None:                  # B108: the refined part (around the fold, B176: the box)
+    fine = fine_in = None
+    coarse_belt = belt
+
+    def add_part(pt, key):                                        # one z for all parts (offset when they differ)
+        nonlocal node_level, z, belt
+        if node_level is not None:
+            fz, fl = np.asarray(pt["z"], float), np.asarray(pt["node_level"])
+            if not (len(fz) == len(z) and np.array_equal(fz, z)):
+                fl = fl + len(z)
+                z = np.r_[z, fz]
+                info[key]["levels_offset"] = True
+            node_level = np.r_[node_level, fl]
+        n0 = belt.n_nodes
+        belt = _union(belt, pt["belt"])
+        return n0
+
+    fbox_l = nbox if inner_o is None else None                    # B230: the inner frame and ORCA fill the fine box
+    if o.get("fine_orca") or (nest_o is not None and inner_o is None):   # B108: the refined part (B176: the box)
         top = bool(o.get("fine_orca"))
         if top and not north_cap:
             raise ValueError("m16_orca: `fine_orca` needs a north edge of the coarse part (`region` or `lat_north`)")
         fo = o if top else {**o, "fine_orca": nest_o["fine_orca"]}
-        fine = _fine_part(g, fo, gf_l, r_f + 1, nbox) if ladder else _fine_part(g, fo, gf_l, None, nbox, top)
+        fine = _fine_part(g, fo, gf_l, r_f + 1, fbox_l) if ladder else _fine_part(g, fo, gf_l, None, fbox_l, top)
         info["fine"] = fine["info"]
-        if node_level is not None:                                # one z for both parts (offset when they differ)
-            fz, fl = np.asarray(fine["z"], float), np.asarray(fine["node_level"])
-            if not (len(fz) == len(z) and np.array_equal(fz, z)):
-                fl = fl + len(z)
-                z = np.r_[z, fz]
-                info["fine"]["levels_offset"] = True
-            node_level = np.r_[node_level, fl]
-        coarse_belt = belt
-        belt = _union(belt, fine["belt"])
+        add_part(fine, "fine")
+    if inner_o is not None:                                       # B230: the innermost preset's cells in the inner box
+        io = {**o, "orca": str(nest_o["fine_orca"]), "fine_orca": str(inner_o["fine_orca"])}
+        fine_in = _fine_part(gf_l, io, gf_in, None, ibox, top=False)
+        info["fine_inner"] = fine_in["info"]
+        inner_n0 = add_part(fine_in, "fine_inner")
     mesh = belt
     joints = {}
     copts = dict(o["cap_opts"])
@@ -565,25 +593,32 @@ def run(domain: Domain, h: SizeField, opts: dict | None = None) -> tuple[Mesh, d
         th, rw = nest_o.get("theta_deg"), nest_o.get("relax")
         from meshom.orca.ladder import THETA_DEG
 
-        cap, ft, ninfo = nest_build(g, fine["g"], nbox, fine["nest"], H, THETA_DEG if th is None else float(th),
-                                    NRELAX if rw is None else (tuple(rw) if rw else None))
-        info["nest"] = ninfo
-        nest_rec = dict(nest_points=cap.points, nest_xy=np.c_[ft.x, ft.y], nest_ring=ft.ring, nest_side=ft.side)
-        edge = cap.points[(ft.ring == 0) | (ft.ring == ninfo["n"])]
-        dd, _ = cKDTree(edge).query(mesh.points, distance_upper_bound=JOINT_TOL)
-        row_nodes = np.flatnonzero(np.isfinite(dd))
-        mesh, joint = merge(mesh, row_nodes, cap)
-        joint.update(cap_nodes=int(cap.n_nodes), cap_tris=int(cap.n_tris), cap_quads=int(cap.n_quads),
-                     row_nodes=int(len(edge)), row_nodes_in_orca=int(len(row_nodes)),
-                     coarse_edge_nodes=int(ninfo["ring0_nodes"]), fine_edge_nodes=int(ninfo["ringn_nodes"]))
-        joints["nest"] = joint
-        if not joint["conforming"]:
-            raise RuntimeError(f"m16_orca: the nest's frame does not conform to the ORCA parts: {joint}")
+        nest_rec = {}
+        frames = [("nest", g, gf_l, nbox, nk, H, th, rw)]
+        if inner_o is not None:                                   # B230: the inner frame, merged after the first
+            frames.append(("nest_inner", gf_l, gf_in, ibox, fine_in["nest"], H_in, inner_o.get("theta_deg"),
+                           inner_o.get("relax")))             # (its ring 0 is the first frame's ring n)
+        for key, gc_, gf_, box_, nk_, H_, th, rw in frames:
+            cap, ft, ninfo = nest_build(gc_, gf_, box_, nk_, H_, THETA_DEG if th is None else float(th),
+                                        NRELAX if rw is None else (tuple(rw) if rw else None))
+            info[key] = ninfo
+            nest_rec.update({f"{key}_points": cap.points, f"{key}_xy": np.c_[ft.x, ft.y], f"{key}_ring": ft.ring,
+                             f"{key}_side": ft.side})
+            edge = cap.points[(ft.ring == 0) | (ft.ring == ninfo["n"])]
+            dd, _ = cKDTree(edge).query(mesh.points, distance_upper_bound=JOINT_TOL)
+            row_nodes = np.flatnonzero(np.isfinite(dd))
+            mesh, joint = merge(mesh, row_nodes, cap)
+            joint.update(cap_nodes=int(cap.n_nodes), cap_tris=int(cap.n_tris), cap_quads=int(cap.n_quads),
+                         row_nodes=int(len(edge)), row_nodes_in_orca=int(len(row_nodes)),
+                         coarse_edge_nodes=int(ninfo["ring0_nodes"]), fine_edge_nodes=int(ninfo["ringn_nodes"]))
+            joints[key] = joint
+            if not joint["conforming"]:
+                raise RuntimeError(f"m16_orca: the {key} frame does not conform to the ORCA parts: {joint}")
     info["joints"] = joints
     info["orca_nodes"] = int(belt.n_nodes)
     info["orca_quads"] = int(belt.n_quads)
     info["orca_tris"] = int(belt.n_tris)
-    if fine is not None:
+    if fine is not None or fine_in is not None:
         info["coarse_nodes"] = int(coarse_belt.n_nodes)
     _STATE["belt"] = (belt.points, belt.quads, belt.tris)
     d = _record_dir()
@@ -599,11 +634,17 @@ def run(domain: Domain, h: SizeField, opts: dict | None = None) -> tuple[Mesh, d
                                 fine_t_rows=np.array([fr.start, fr.stop - 1]),
                                 fine_edge=fine["loop"] if fine["loop"] is not None else np.zeros((0, 3)),
                                 fine_wetmap=fine["wetmap"][fr] if fine["wetmap"] is not None else np.zeros(0, np.int8),
-                                fine_nodes=np.arange(coarse_belt.n_nodes, belt.n_nodes),
+                                fine_nodes=np.arange(coarse_belt.n_nodes, coarse_belt.n_nodes + fine["belt"].n_nodes),
                                 fine_quads=fine["belt"].quads + coarse_belt.n_nodes,
                                 fine_tris=fine["belt"].tris + coarse_belt.n_nodes)
-            if nbox is not None:                                  # B176: the boxes (coarse F lines, this grid's rows)
-                extra_arrays.update(nest_box=np.array(nbox), nest_coarse_box=np.array(cbox), **nest_rec)
+        if fine_in is not None:                                   # B230: the innermost part (belt node ids)
+            extra_arrays.update(inner_orca=np.array(fine_in["name"]),
+                                inner_nodes=np.arange(inner_n0, inner_n0 + fine_in["belt"].n_nodes),
+                                inner_quads=fine_in["belt"].quads + inner_n0,
+                                inner_tris=fine_in["belt"].tris + inner_n0,
+                                nest_inner_box=np.array(ibox), nest_inner_coarse_box=np.array(ibox_c))
+        if nbox is not None:                                      # B176: the boxes (coarse F lines, this grid's rows)
+            extra_arrays.update(nest_box=np.array(nbox), nest_coarse_box=np.array(cbox), **nest_rec)
         np.savez(d / "orca_belt.npz", points=belt.points, quads=belt.quads, tris=belt.tris,
                  lon=g.lon["f"][j0 - 1:j1 + 1, :-2], lat=g.lat["f"][j0 - 1:j1 + 1, :-2],
                  tlon=g.lon["t"][rs, :-2], tlat=g.lat["t"][rs, :-2], t_rows=np.array([j0, j1]),

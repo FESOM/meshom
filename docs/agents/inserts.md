@@ -97,6 +97,9 @@ h_min_m = 1000.0                   # the size floor (default: the host mesh's sm
 | `routes` | | group: `[[inserts.routes]]` tables `name`, `a`, `b` (points in the basins at the strait's ends), optional `via`, `corridor_km`: the channel raise, the dam (across islands, every passage) and the section areas act along each route's line over blocks and patches (B246) |
 | `blend_cells` | 2 | group: the real coast blends onto a join's end node over this many join cells; 1 keeps the real coast on short coast runs (B247) |
 | `split_deg` | | group: after fix_rings, patch quads with a corner above this become two triangles (B243) |
+| `growth_max` | 0.5 | group: the steepest slope with which the fill's size reaches the host's at the joins; = `growth`: one slope (B252) |
+| `even_sweeps` | 40 | group: sweeps of the pass that evens the neighbour areas of the patches, blocks and two host rings; 0: off (B252) |
+| `even_blocks` | `""` | group: the blocks' nodes in that pass: `""` move, `"cross"` the cross lines held, `"block"` every block node held (B252) |
 | `force` | false | build with the least-violating joins when none passes |
 
 ## Rules and refusals
@@ -294,8 +297,11 @@ for node); the host's coast between two joins is replaced by the real coast; the
 holes, joined to nearby land (`gap_km`) or dropped (`island_km2`) (B241). Each `[[inserts.channels]]` entry is a
 structured quad block between its cross lines `a` and `b`, `cells` across from end to end, no triangle inside (B242);
 the rest of the water (basins, junctions, the passages round islands) is a quad-dominant fill whose size grows from
-the cross lines and the narrow gaps (at least `gap_cells` cells across) to the host's at the joins (B243). With
-`sill_level = "grid"` each channel holds its own saddle (B244).
+the cross lines and the narrow gaps (at least `gap_cells` cells across) to the host's at the joins (B243), each fine
+sample's slope steep enough to reach the host's size at every join node (at most `growth_max`, B252). After
+fix_rings a pass moves the nodes of the patches, the blocks and two host rings round them to even the neighbour areas
+(a triangle counted as half a quad), no corner above 120 deg, the coast held (B252). With `sill_level = "grid"`
+each channel holds its own saddle (B244).
 
 ```toml
 [[inserts]]
@@ -345,7 +351,8 @@ Choose in this order:
 4. **Capes.** A block wrapping round a thin cape folds; `bank_smooth_cells = 1-2` cuts the cape (the block covers
    it). `bank_sigma_cells = 0.5` keeps islands near a coast from overlapping it after the smoothing.
 5. **`fix_rings = 3`** relaxes the angles of the patches and of the host rings round them (B210, B220);
-   `split_deg = 120` then turns the patch quads still above 120 deg into triangle pairs (B243).
+   `split_deg = 120` then turns the patch quads still above 120 deg into triangle pairs (B243); the area pass
+   (`even_sweeps`, on by default) runs before the split and again after it (B252).
 6. **Routes.** One `[[inserts.routes]]` per strait through the group (`a`, `b` in its two basins, in or next to the
    envelope's cells; `corridor_km` for a strait beside a deeper one, as Alas beside Lombok) with `depth_channel =
    "near"`, `sill_level = "grid"` or `"nearest"` and `depth_area = true`: the raise, the dam and the section areas
@@ -354,24 +361,27 @@ Choose in this order:
 
 Judge it as a strait (above), per channel: cells across at its narrowest and sill sections, the section areas against
 the bathymetry in the model's levels, the sills (records `depth.branches`, `depth.routes`), and over the group: the worst quad and the
-quads above 120 deg, the smallest cell, the largest cell against the host and the neighbour size ratio. Known limits:
-the patch cells next to the joins stay finer than the host when the envelope is small (an area ratio of 1.6-2 in
-the first ring); without routes a sill in a patch gets no dam; on three or four cells across, FESOM3's element bottom (the shallowest
+quads above 120 deg, the smallest cell, the largest cell against the host, the neighbour size ratio and the neighbour
+area ratio (a triangle as half a quad; aim p99 <= 1.5). Known limits: an envelope that leaves less than about
+(host cell - channel cell) / 0.2 between a channel or an island and a join cannot grade the size at an area ratio of
+1.5 per cell (Ombai on ORCA025 v5: Atauro 25 km from the envelope's corner, area ratio p99 2.5; one host cell more
+on four sides: 1.76); the node moves of the area pass shift the section areas by up to about 0.1-0.15 of GEBCO's at
+the dam-held narrows (the area rule acts after them but holds the dam); without routes a sill in a patch gets no dam; on three or four cells across, FESOM3's element bottom (the shallowest
 of its nodes' levels) leaves a channel one or two levels shallower than its dam.
 
 ## Config keys used
 
-- `[[inserts]]` (group): `envelope`, `channels`, `gap_km`, `island_km2`, `gap_cells`, `growth`, `bank_smooth_cells`, `routes`, `blend_cells`, `split_deg`
+- `[[inserts]]` (group): `envelope`, `channels`, `gap_km`, `island_km2`, `gap_cells`, `growth`, `bank_smooth_cells`, `routes`, `blend_cells`, `split_deg`, `growth_max`, `even_sweeps`, `even_blocks`
 - `[[inserts]]`: `name`, `kind`, `strait`, `path`, `cells`, `h_fine_m`, `h_min_m`, `reach_km`, `mouth_a`, `mouth_b`, `ljoins`, `bays`, `collar_rings`, `coast`, `coast_source`, `bank_sigma_cells`, `width_km`, `band_km`, `rows`, `coast_rounds`, `coast_shift_cells`, `cells_a`, `cells_b`, `growth_a`, `growth_b`, `bank_land_cells`, `fill`, `fill_rows`, `corner_steps`, `corner_split`, `join_margin`, `add_columns`, `fix_rings`, `depth_at`, `depth_smooth`, `strait_floor`, `sill_level`, `depth_channel`, `depth_quantile`, `stages`, `force`
 
 ## Sources
 
 - Code: `meshom/insert/` (`__main__.py` the command, `core.py`, `group.py` the group inserts, `region.py` the rules, `block.py`, `band.py`,
   `harmonic.py`, `realcoast.py`, `network.py` the bays, `assemble.py` the collar, `measure.py`, `channel.py` the
-  channel depth rules, `area.py` the section areas), `meshom/io/fesom.py` (`model_levels`: FESOM3's levels),
+  channel depth rules, `area.py` the section areas, `even.py` the area pass), `meshom/io/fesom.py` (`model_levels`: FESOM3's levels),
   `meshom/config.py` (`InsertCfg`).
 - Docs: [`docs/config.md` "`[[inserts]]`"](../config.md#inserts-python--m-meshominsert), `docs/examples/inserts.toml`,
   `docs/examples/inserts_gulf_stream.toml`.
 - Decisions: B158-B169, B180-B186, B190, B192-B220, B250.
 - Decisions: B158-B169, B180-B186, B190, B192-B223.
-- Decisions: B158-B169, B180-B186, B190, B192-B212, B240-B249.
+- Decisions: B158-B169, B180-B186, B190, B192-B212, B240-B249, B252.

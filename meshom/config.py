@@ -48,7 +48,7 @@ docs/config.md has the full description and an example. Tables (units: metres, k
               (B250); kind "depth": a depth region, the mesh unchanged (width_km round the path, or
               polygon; B223); group: envelope,
               channels (B240, B242), gap_km, island_km2 (B241), growth, gap_cells (B243), bank_smooth_cells (B245),
-              routes (B246), blend_cells (B247)
+              routes (B246), blend_cells (B247), growth_max, even_sweeps, even_blocks (B252)
               (meshom.config.InsertCfg)
     [size]    grad_max (|grad h| limit of the gradient limiter, default 0.1; inf = no limiting), h_min_m / h_max_m
               (optional global clip), preview_deg (UI preview grid), limiter_max_nodes (grid size cap), from (an h
@@ -338,6 +338,13 @@ class InsertCfg:
                                                        # route's line across blocks and patches (B246)
     blend_cells: float | None = None                   # group: the real coast blends onto a join's end node over this
                                                        # many join cells (None: 2, as a strait's banks, B164; B247)
+    growth_max: float | None = None                    # group: the steepest slope with which the fill's size reaches
+                                                       # the host's at the joins (None: 0.5; = growth: one slope, B252)
+    even_sweeps: int | None = None                     # group: sweeps of the pass that evens the neighbour areas of
+                                                       # the patches and the host rings round them (None: 40; 0: off;
+                                                       # B252)
+    even_blocks: str = ""                              # group: the blocks' nodes in that pass: "" move, "cross" the
+                                                       # cross lines held, "block" every block node held (B252)
 
 
 @dataclass

@@ -1,5 +1,5 @@
-"""Group inserts (kind = "group", decisions B240-B245): several channels, the basin and junction patches between them
-and their islands, in one envelope of host cells.
+"""Group inserts (kind = "group", decisions B240-B249, B252): several channels, the basin and junction patches
+between them and their islands, in one envelope of host cells.
 
 The envelope is a polygon: the host cells whose centroid lies inside it are the region R, replaced as a whole. Every
 step works in the stereographic chart at the envelope's centre:
@@ -18,9 +18,12 @@ step works in the stereographic chart at the envelope's centre:
    between the cross lines' ends;
 5. patches: the water outside the blocks, traced from the pieces (joins, coast pieces, the cross lines, which a patch
    and a block share node for node), each meshed by m02 (quad-dominant: packing along a cross field, Delaunay,
-   recombination; its loop nodes kept exactly) at the size GroupH (B243);
+   recombination; its loop nodes kept exactly) at the size GroupH (B243; each fine sample's slope reaches the host's
+   size at every join node, B252);
 6. blocks and patches merged by node positions and put in place of R (meshom.insert.assemble.replace_part: the join
-   nodes keep their host ids, every host cell outside R stays).
+   nodes keep their host ids, every host cell outside R stays);
+7. after the splice and fix_rings, the area pass on the patches, the blocks and two host rings (even_group,
+   meshom.insert.even, B252), the obtuse patch quads split (split_obtuse, B243) and the pass again.
 
 The depth of a group: the insert's own rule on its nodes (meshom.insert.core.insert_depth), then each channel's own
 sill (branch_depth, B244), or, when the group names its routes (the straits through it, from basin to basin), the
@@ -41,6 +44,7 @@ GAP_CELLS = 3                # B243: every passage between two boundary pieces g
                              # across (3 at a narrowest where 5 would force small cells)
 ISLAND_KM2 = 10.0            # B241: islands smaller than this are dropped (water) unless asked otherwise
 GROWTH = 0.12                # B243: the size slope of the fill (as the block's G_LAYOUT)
+GROWTH_MAX = 0.5             # B252: the steepest slope a fine sample's cone takes to reach the host's size at the joins
 BRIDGE_REACH = 1.5           # B241: the coast cut off by a joined island: its points within the island's distance
                              # + half gap_km of it, at most this x gap_km
 ISLAND_SIGMA = 0.03          # B241: an island's coast is smoothed by at most this fraction of its perimeter (the bank
@@ -275,16 +279,85 @@ def crossings(loops: list) -> list:
     return out
 
 
+class SlopeCone:
+    """h(x) = min(cap(x), min_k h_k + g_k |x - p_k|) (chord distance) with a slope g_k per sample (B252), exact: the
+    K_NEAR nearest samples give a first bound; a farther sample gives at least min(h_k) + min(g_k) d_K, so only the
+    queries where that can beat the bound search the samples within its radius (as assemble.InsertH). Picklable."""
+
+    K_NEAR = 16
+
+    def __init__(self, cap, pts: np.ndarray, hk: np.ndarray, gk: np.ndarray):
+        self.cap, self.pts, self.hk, self.gk = cap, np.asarray(pts), np.asarray(hk, float), np.asarray(gk, float)
+        self._t = None
+
+    def __call__(self, xyz):
+        if self._t is None:
+            self._t = cKDTree(self.pts)
+        q = np.atleast_2d(xyz)
+        cap = np.asarray(self.cap(q), dtype=float)
+        G = self.gk * R_EARTH_M
+        k = min(self.K_NEAR, len(self.pts))
+        d, j = self._t.query(q, k=k)
+        d, j = d.reshape(len(d), k), j.reshape(len(j), k)
+        best = np.min(self.hk[j] + G[j] * d, axis=1)
+        bound = np.minimum(best, cap)
+        hmin, gmin = float(self.hk.min()), float(G.min())
+        if k < len(self.pts):
+            need = np.flatnonzero(hmin + gmin * d[:, -1] < bound)
+            if len(need):
+                r = (bound[need] - hmin) / gmin
+                for i, idx in zip(need, self._t.query_ball_point(q[need], r)):
+                    if idx:
+                        idx = np.asarray(idx)
+                        best[i] = min(best[i], float(np.min(self.hk[idx] + G[idx] * np.linalg.norm(
+                            self.pts[idx] - q[i], axis=1))))
+        return np.minimum(best, cap)
+
+    def __getstate__(self):
+        return {"cap": self.cap, "pts": self.pts, "hk": self.hk, "gk": self.gk}
+
+    def __setstate__(self, s):
+        self.__dict__.update(s)
+        self._t = None
+
+
+def join_slopes(pts: np.ndarray, hk: np.ndarray, fine: np.ndarray, join_pts: np.ndarray, join_h: np.ndarray,
+                g: float, g_max: float = None) -> np.ndarray:
+    """B252: each fine sample's slope (pts, hk: all samples; fine: the samples that are no join node): the least slope
+    >= g with which its cone reaches every join node's host size, h_k + g_k |p_j - p_k| >= H_j, at most g_max (default
+    GROWTH_MAX); the join samples keep g. So the field reaches the host's size at the joins however near a channel or
+    a narrow gap lies to them, and the size steps are spread over the whole way from there (a plain slope g left
+    the patch cells along the joins 1.6-2.5 times finer than the host's, ORCA025 v5: a fan of triangles on every
+    join edge)."""
+    gk = np.full(len(pts), float(g))
+    g_max = GROWTH_MAX if g_max is None else float(g_max)
+    if not len(join_pts) or not fine.any():
+        return gk
+    from scipy.spatial.distance import cdist
+
+    d = R_EARTH_M * cdist(pts[fine], join_pts)
+    need = (np.asarray(join_h)[None, :] - hk[fine][:, None]) / np.maximum(d, 1.0)
+    gk[fine] = np.clip(need.max(1), g, max(g, g_max))
+    return gk
+
+
 class GroupH:
-    """B243: the group's size field (sphere metres): h(x) = max(h_min, min(cap(x), min_k h_k + g |x - p_k|)), the cone
-    over the samples p_k (the cross lines' nodes at their spacing, the joins' nodes at their host edge length, the
-    narrow gaps' points at their width / GAP_CELLS), capped by the host's cell size (MeshH of the host window).
+    """B243: the group's size field (sphere metres): h(x) = max(h_min, min(cap(x), min_k h_k + g_k |x - p_k|)), the
+    cone over the samples p_k (the cross lines' nodes at their spacing, the joins' nodes at their host edge length, the
+    narrow gaps' points at their width / GAP_CELLS), capped by the host's cell size (MeshH of the host window); with
+    the join samples given (`join`: (K,) bool), each other sample's slope g_k from join_slopes (B252), else g.
     Picklable."""
 
-    def __init__(self, cap, pts: np.ndarray, hk: np.ndarray, g: float, h_min: float):
-        from meshom.insert.assemble import InsertH
-
-        self.cone = InsertH(cap, pts, hk, g)
+    def __init__(self, cap, pts: np.ndarray, hk: np.ndarray, g: float, h_min: float, join: np.ndarray | None = None,
+                 g_max: float | None = None):
+        pts, hk = np.asarray(pts), np.asarray(hk, float)
+        if join is None or not np.any(join):
+            gk = np.full(len(pts), float(g))
+        else:
+            join = np.asarray(join, bool)
+            gk = join_slopes(pts, hk, ~join, pts[join], hk[join], g, g_max)
+        self.gk = gk
+        self.cone = SlopeCone(cap, pts, hk, gk)
         self.h_min = float(h_min)
 
     def __call__(self, xyz):
@@ -446,7 +519,8 @@ def join_raw(rc, env_xy: np.ndarray, gap_m: float, island_km2: float, chart: Cha
 def build(win, chart: Chart, env_xy: np.ndarray, channels: list, real, h_min: float, gap_m: float,
           island_km2: float, growth: float, bank_sigma_cells: float = 1.5, log=print, name: str = "group",
           fill_opts: dict | None = None, land_cells: float = 0.0, gap_cells: int = GAP_CELLS,
-          bank_smooth: float = 0.0, state: dict | None = None, blend_cells: float | None = None) -> GroupResult:
+          bank_smooth: float = 0.0, state: dict | None = None, blend_cells: float | None = None,
+          growth_max: float | None = None) -> GroupResult:
     """The group insert in the host window `win` (module docstring). real: the run's coast loops ((K,3), water on the
     left; None: the host's coast). Returns a GroupResult (window: the window mesh with the group in place of R).
     state: a dict that receives the real coast, the outline and the holes as they are built (for the maps of a
@@ -720,10 +794,11 @@ def build(win, chart: Chart, env_xy: np.ndarray, channels: list, real, h_min: fl
             f"{len(blk.tris)} triangles", flush=True)
 
     # --- the size field of the patches (B243)
-    sp_x, sp_h = [], []
+    sp_x, sp_h, sp_j = [], [], []
     for (zA, zB), (hA, hB) in zip(cross_xyz, cross_h):
         sp_x += [zA, zB]
         sp_h += [hA, hB]
+        sp_j += [np.zeros(len(zA), bool), np.zeros(len(zB), bool)]
     for p in pieces:
         if p.kind == "join":
             z = mesh.points[p.ids]
@@ -731,6 +806,7 @@ def build(win, chart: Chart, env_xy: np.ndarray, channels: list, real, h_min: fl
             L = R_EARTH_M * arc_length(z[1:], z[:-1])
             sp_x.append(z)
             sp_h.append(np.r_[L[0], 0.5 * (L[1:] + L[:-1]), L[-1]] if len(L) > 1 else np.r_[L, L])
+            sp_j.append(np.ones(len(z), bool))
     step_d = max(0.25 * h_min * sc0, 1.0)
     o_pts, o_q = [], []
     for p in outer_seq:
@@ -746,9 +822,17 @@ def build(win, chart: Chart, env_xy: np.ndarray, channels: list, real, h_min: fl
     keep = gh < np.asarray(capH(chart.inv(gp)))
     sp_x.append(chart.inv(gp[keep]))
     sp_h.append(gh[keep])
-    H = GroupH(capH, np.vstack(sp_x), np.concatenate(sp_h), growth, h_min)
+    sp_j.append(np.zeros(int(keep.sum()), bool))
+    H = GroupH(capH, np.vstack(sp_x), np.concatenate(sp_h), growth, h_min, join=np.concatenate(sp_j),
+               g_max=growth_max)
+    fine = ~np.concatenate(sp_j)
     rec["size"] = {"growth": growth, "gap_samples": int(keep.sum()),
-                   "gap_h_min_km": float(gh[keep].min() / 1e3) if keep.any() else None}
+                   "gap_h_min_km": float(gh[keep].min() / 1e3) if keep.any() else None,
+                   "growth_max": GROWTH_MAX if growth_max is None else float(growth_max),
+                   "slope_fine": [float(H.gk[fine].min()), float(np.median(H.gk[fine])), float(H.gk[fine].max())]}
+    log(f"[insert {name}] size: slope {growth:g}, the fine samples' slopes to the joins' host size "
+        f"{H.gk[fine].min():.3f} / {np.median(H.gk[fine]):.3f} / {H.gk[fine].max():.3f} (min / median / max)",
+        flush=True)
 
     def h_xy(q):
         q = np.atleast_2d(q)
@@ -1001,7 +1085,7 @@ def insert_group(win, spec, log=print, real=None, h_min: float | None = None):
         g = build(win, chart, env_xy, spec.channels, real if spec.coast == "real" else None, h_min, gap_m,
                   spec.island_km2, growth, spec.bank_sigma_cells, log, spec.name, land_cells=spec.bank_land_cells,
                   gap_cells=spec.gap_cells, bank_smooth=spec.bank_smooth_cells, state=state,
-                  blend_cells=spec.blend_cells)
+                  blend_cells=spec.blend_cells, growth_max=spec.growth_max)
     except InsertError as ex:
         log(f"[insert {spec.name}] REFUSED {ex}", flush=True)
         res = Result(False, {"name": spec.name, "refused": [str(ex)]}, host_window=win, chart=chart,
@@ -1273,4 +1357,50 @@ def split_obtuse(full: Mesh, window: Mesh, own: np.ndarray, blocks: list, deg: f
     nt, nq = window.n_tris + 2 * len(q), window.n_quads - len(q)
     win = Mesh(full.points, out.tris[out.n_tris - nt:], out.quads[out.n_quads - nq:], full.node_flag)
     rec.update(split=int(len(q)), worst_after_deg=float(worst[~bad].max()) if (~bad).any() else 0.0)
+    return out, win, rec
+
+
+EVEN_RINGS = 2               # B252: the host cell rings round the insert whose nodes the area pass may move too
+EVEN_BLOCKS = ""             # B252: the blocks' nodes in the area pass by default (`even_blocks`): "" free, "cross"
+                             # the cross lines held, "block" every block node held
+
+
+def even_group(full: Mesh, window: Mesh, own: np.ndarray, blocks: list, fixed: np.ndarray, h_min: float,
+               sweeps: int, rings: int = EVEN_RINGS, limit_deg: float = 120.0, log=print, tag: str = "",
+               verbose: bool = False, hold: str | None = None) -> tuple:
+    """B252: meshom.insert.even.even_areas on the group's patches and the host rings round them, in the spliced mesh:
+    the free nodes are the insert's own nodes (`own`; hold (default EVEN_BLOCKS) "cross": not the cross lines' nodes,
+    "block": no block's node, `blocks` as ids_in; "": all, as fix_rings moves them; a block's banks are coast and
+    stay, its cells stay its cells) and the host nodes of the cells within `rings` element rings of the own cells
+    (the size steps then spread into the host's cells next to the joins); `fixed` (the window's cut) and the mesh's
+    boundary (the coast) never move. Returns (mesh, the window part with the new positions, record)."""
+    from meshom.insert.even import even_areas
+
+    T = full.n_tris
+    isb = np.zeros(full.n_nodes, bool)
+    hold = hold or EVEN_BLOCKS
+    for b, x in blocks:
+        if hold in ("cross", "block"):                     # the cross lines' nodes stay
+            isb[x] = True
+        if hold == "block":                                # and the blocks' own nodes
+            isb[b] = True
+
+    def touch(mask):
+        return np.r_[mask[full.tris].any(1) if T else np.zeros(0, bool), mask[full.quads].any(1)]
+
+    reach = own.copy()
+    for _ in range(int(rings)):
+        c = touch(reach)
+        reach = reach.copy()
+        reach[np.r_[full.tris[c[:T]].ravel(), full.quads[c[T:]].ravel()]] = True
+    c = touch(np.asarray(fixed, bool))                       # no node of a cell on the window's cut
+    bad = np.zeros(full.n_nodes, bool)
+    bad[np.r_[full.tris[c[:T]].ravel(), full.quads[c[T:]].ravel()]] = True
+    mov = reach & ~isb & ~bad
+    d, gid = cKDTree(full.points).query(window.points)
+    out, rec = even_areas(full, mov, h_min, limit_deg, sweeps, log=lambda s: log(f"{tag} {s}", flush=True),
+                          verbose=verbose)
+    rec["rings"] = int(rings)
+    rec["host_nodes_free"] = int((mov & ~own).sum())
+    win = Mesh(out.points[gid], window.tris, window.quads, window.node_flag, window.tri_zone)
     return out, win, rec

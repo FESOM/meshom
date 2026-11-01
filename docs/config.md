@@ -743,8 +743,11 @@ cells, the host's coast between them becomes the real coast, the real islands in
 `gap_km`, default 5 x `h_min_m`, joins the land; one smaller than `island_km2`, default 10 km^2, is dropped); each
 `[[inserts.channels]]` table (`name`, cross lines `a` and `b` bank to bank, `cells` default 5) is a quad block with that
 count from `a` to `b`, and the rest is a quad-dominant fill (at least `gap_cells`, default 3, cells across any passage,
-size slope `growth`, default 0.12); `bank_smooth_cells` (default 0) smooths each block bank over that many block cells
-(capes cut); `sill_level` and `depth_channel` act per channel. The general recipe with examples of each kind:
+size slope `growth`, default 0.12, steeper where the size must reach the host's at the joins, at most `growth_max`,
+default 0.5, B252); `bank_smooth_cells` (default 0) smooths each block bank over that many block cells (capes cut);
+`even_sweeps` (default 40; 0 off) sweeps of the pass that evens the neighbour areas of the patches, the blocks
+(`even_blocks`: `""` move, `"cross"` or `"block"` held) and two host rings after fix_rings (B252); `sill_level` and
+`depth_channel` act per channel. The general recipe with examples of each kind:
 `docs/examples/inserts.toml`; bands: `docs/examples/inserts_gulf_stream.toml`.
 
 ### `[gates]`

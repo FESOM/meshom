@@ -323,3 +323,143 @@ def test_split_obtuse_splits_patch_quads_above_the_limit():
     assert all(obt in t for t in out.tris.tolist())                                 # the diagonal from that corner
     assert win.n_tris == 2 and win.n_quads == 2 and np.array_equal(win.quads, out.quads[-2:])
     assert (element_geometry(out).tri_angles.max() < np.radians(120.0))
+
+
+# ------------------------------------------------------------------------------------------------ B252
+
+def test_join_slopes_reach_the_host_size_at_every_join_node():
+    """B252: each fine sample's slope is the least >= growth with which its cone reaches every join node's host size;
+    the field then equals the host size at the joins, also with a fine sample 50 km off a join (a plain slope of
+    0.12 gave 8 + 0.12 x 50 = 14 km there), and the cap growth_max bounds the slope."""
+    from meshom.insert.geom import Chart
+
+    ch = Chart(lonlat_to_xyz(np.array(0.0), np.array(0.0)))
+    join = ch.inv(np.c_[np.full(9, 50e3), np.linspace(-80e3, 80e3, 9)])          # a join along x = 50 km
+    fine = ch.inv(np.c_[np.zeros(5), np.linspace(-20e3, 20e3, 5)])               # a cross line at x = 0, 8 km cells
+    pts = np.vstack([fine, join])
+    hk = np.r_[np.full(5, 8e3), np.full(9, 20e3)]
+    isj = np.r_[np.zeros(5, bool), np.ones(9, bool)]
+    cap = lambda x: np.full(len(np.atleast_2d(x)), 20e3)                          # noqa: E731
+    H = group.GroupH(cap, pts, hk, 0.12, 2e3, join=isj)
+    assert np.allclose(H(join), 20e3, rtol=1e-6)
+    assert H.gk[2] == pytest.approx(12e3 / 50e3, rel=0.01)                       # (20 - 8) km over 50 km
+    assert np.allclose(H.gk[isj], 0.12)
+    old = group.GroupH(cap, pts, hk, 0.12, 2e3, join=isj, g_max=0.12)              # one slope: the field of B243
+    assert old(join)[4] == pytest.approx(14e3, rel=0.01)
+    capped = group.GroupH(cap, pts, hk, 0.12, 2e3, join=isj, g_max=0.18)
+    assert capped.gk.max() == pytest.approx(0.18)
+
+
+def test_group_patch_cells_at_the_joins_near_the_host_size():
+    """B252: an envelope that leaves 50 km from 8 km channel cells to the 20 km host: the patch cells on the joins
+    are close to the host's size (the plain slope 0.12 left them at about 0.7 of it, with a fan of triangles on the
+    join edges)."""
+    win, ch, loops = _two_channels()
+    env = np.array([[-135e3, -110e3], [135e3, -110e3], [135e3, 110e3], [-135e3, 110e3]])
+    chans = [group.Channel("north", ch.inv(np.array([[-80e3, 15e3], [-80e3, 95e3]])),
+                           ch.inv(np.array([[80e3, 15e3], [80e3, 95e3]])), 10),
+             group.Channel("south", ch.inv(np.array([[-80e3, -95e3], [-80e3, -15e3]])),
+                           ch.inv(np.array([[80e3, -95e3], [80e3, -15e3]])), 10)]
+    out = {}
+    for gm in (0.12, None):
+        res = group.build(win, ch, env, chans, loops, h_min=2e3, gap_m=9.9e3, island_km2=10.0, growth=0.12,
+                          log=lambda *a, **k: None, fill_opts={"verbose": False}, growth_max=gm)
+        assert res.ok
+        m = res.window
+        jn = np.unique(np.concatenate([p.ids for p in res.pieces if p.kind == "join"]))
+        dj, _ = cKDTree(win.mesh.points[jn]).query(m.points)
+        isj = dj < 1e-9                                                           # the join nodes (by position)
+        d, _ = cKDTree(win.mesh.points).query(m.points)
+        new = d > 1e-9                                                            # a node of the fill
+        from meshom.quality.kernel import element_geometry
+        g = element_geometry(m)
+        me = np.r_[g.tri_edges.mean(1) if m.n_tris else np.zeros(0), g.quad_edges.mean(1)]
+        at = np.r_[isj[m.tris].any(1) & new[m.tris].any(1) if m.n_tris else np.zeros(0, bool),
+                   isj[m.quads].any(1) & new[m.quads].any(1)]
+        out[gm] = float(np.median(me[at])) / H
+    assert out[0.12] < 0.8 and out[None] > 0.85
+
+
+def _grid_mesh(nx, ny, k, move=None):
+    from meshom.insert.geom import Chart
+    from meshom.mesh import Mesh, orient_ccw
+
+    ch = Chart(lonlat_to_xyz(np.array(0.0), np.array(0.0)))
+    X, Y = np.meshgrid(np.arange(nx + 1) * k, np.arange(ny + 1) * k, indexing="ij")
+    xy = np.c_[X.ravel(), Y.ravel()].astype(float)
+    if move is not None:
+        for i, dxy in move.items():
+            xy[i] += dxy
+    idx = np.arange((nx + 1) * (ny + 1)).reshape(nx + 1, ny + 1)
+    q = np.stack([idx[:-1, :-1], idx[1:, :-1], idx[1:, 1:], idx[:-1, 1:]], -1).reshape(-1, 4)
+    return orient_ccw(Mesh(ch.inv(xy), np.zeros((0, 3), np.int64), q, np.zeros(len(xy), np.int8))), idx
+
+
+def _pair_ratios(m):
+    from meshom.insert.even import _cells, _geom
+
+    el, nv = _cells(m)
+    A = np.zeros(len(el))
+    for k in (3, 4):
+        i = np.flatnonzero(nv == k)
+        if len(i):
+            A[i] = np.abs(_geom(m.points[el[i, :k]], k)[0]) * (2.0 if k == 3 else 1.0)
+    ee = build_topology(m).edge_elems
+    ee = ee[ee[:, 1] >= 0]
+    return np.maximum(A[ee[:, 0]], A[ee[:, 1]]) / np.minimum(A[ee[:, 0]], A[ee[:, 1]])
+
+
+def test_even_areas_evens_a_pulled_node_and_holds_the_rest():
+    """B252: a grid node pulled 40 % of a cell towards a corner (neighbour areas up to 1.67 x) goes back near its place:
+    the largest pair ratio below 1.15, no corner above 120 deg, boundary and fixed nodes and every cell's node ids
+    unchanged."""
+    from meshom.insert.even import even_areas
+    from meshom.quality.kernel import element_geometry
+
+    k = 10e3
+    m, idx = _grid_mesh(6, 6, k, move={int(np.arange(49).reshape(7, 7)[3, 3]): np.array([0.4 * k, 0.4 * k])})
+    r0 = _pair_ratios(m)
+    assert r0.max() > 1.6
+    mov = np.ones(m.n_nodes, bool)
+    mov[idx[1, 1]] = False                                                      # a fixed inner node
+    out, rec = even_areas(m, mov, 1e3)
+    assert _pair_ratios(out).max() < 1.15 and rec["pairs_gt15_after"] == 0
+    assert np.degrees(element_geometry(out).quad_angles.max()) < 120.0
+    bnd = build_topology(m).boundary_node
+    assert np.array_equal(out.points[bnd], m.points[bnd]) and np.array_equal(out.points[idx[1, 1]], m.points[idx[1, 1]])
+    assert np.array_equal(out.quads, m.quads) and rec["nodes_moved"] >= 1
+
+
+def test_even_areas_counts_a_triangle_as_half_a_quad():
+    """B252: a uniform grid with one quad split into two triangles is even already (a triangle counts twice):
+    nothing moves."""
+    from meshom.insert.even import even_areas
+    from meshom.mesh import Mesh
+
+    m, idx = _grid_mesh(4, 4, 10e3)
+    q = m.quads[5]
+    tris = np.array([[q[0], q[1], q[2]], [q[0], q[2], q[3]]])
+    m2 = Mesh(m.points, tris, np.delete(m.quads, 5, axis=0), m.node_flag)
+    assert _pair_ratios(m2).max() < 1.0 + 1e-4
+    out, rec = even_areas(m2, np.ones(m2.n_nodes, bool), 1e3)
+    assert rec["nodes_moved"] == 0 and np.array_equal(out.points, m2.points)
+
+
+def test_even_group_lowers_the_patch_area_ratios(grp):
+    """B252: the pass on a group's own nodes and two host rings: fewer edge pairs above 1.5 (triangle = half a quad),
+    the result valid, the window's cut nodes and the coast in place."""
+    win, ch, env, reg, res = grp
+    m = res.window
+    d, _ = cKDTree(win.mesh.points).query(m.points)
+    own = d > 1e-9
+    cut = np.zeros(m.n_nodes, bool)
+    dk, j = cKDTree(m.points).query(win.mesh.points[win.kind == 2])
+    cut[j[dk < 1e-9]] = True
+    r0 = _pair_ratios(m)
+    out, w2, rec = group.even_group(m, m, own, [], cut, 2e3, 40, log=lambda *a, **k: None)
+    r1 = _pair_ratios(out)
+    assert (r1 > 1.5).sum() < (r0 > 1.5).sum() and r1.max() <= r0.max()
+    v = validity(out)
+    assert v["inverted"] == 0 and v["nonconvex"] == 0
+    bnd = build_topology(m).boundary_node
+    assert np.array_equal(out.points[bnd | cut], m.points[bnd | cut])

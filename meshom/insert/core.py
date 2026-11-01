@@ -80,6 +80,9 @@ class Spec:
     bank_smooth_cells: float = 0.0           # B245: a group's block banks smoothed over this many block cells
     routes: list = field(default_factory=list)    # B246: a group's routes: (name, a (3,), b (3,), via, corridor m)
     blend_cells: float | None = None         # B247: a group's coast blend onto the join ends (None: BLEND_H)
+    growth_max: float | None = None          # B252: a group's steepest slope to the joins' host size (None: GROWTH_MAX)
+    even_sweeps: int = 0                     # B252: a group's sweeps of the area pass on its patches and host rings
+    even_blocks: str = ""                    # B252: the blocks' nodes in that pass ("", "cross", "block")
 
 
 @dataclass
@@ -116,6 +119,7 @@ def spec_from(cfg_entry, cfg=None) -> Spec:
     e = cfg_entry
     path = _ll(e.path)
     if e.kind == "group":                    # B240: the envelope is the path; the channels as Channel
+        from meshom.insert.even import EVEN_SWEEPS
         from meshom.insert.group import Channel
 
         env = _ll(e.envelope)
@@ -132,7 +136,10 @@ def spec_from(cfg_entry, cfg=None) -> Spec:
                     gap_cells=e.gap_cells, bank_smooth_cells=e.bank_smooth_cells,
                     routes=[(str(r.get("name", f"route{k}")), _ll([r["a"]])[0], _ll([r["b"]])[0],
                              _ll(r.get("via")), float(r["corridor_km"]) * 1e3 if r.get("corridor_km") else None)
-                            for k, r in enumerate(e.routes)], blend_cells=e.blend_cells, split_deg=e.split_deg)
+                            for k, r in enumerate(e.routes)], blend_cells=e.blend_cells, split_deg=e.split_deg,
+                    growth_max=e.growth_max,
+                    even_sweeps=EVEN_SWEEPS if e.even_sweeps is None else int(e.even_sweeps),
+                    even_blocks=e.even_blocks)
     if e.kind not in ("strait", "depth"):
         if path is None or e.width_km is None:
             raise InsertError(f"an insert of kind {e.kind!r} needs a path and width_km")
@@ -1300,16 +1307,28 @@ def run(run_dir: Path, spec: Spec, out_dir: Path | None = None, mesh_name: str |
                      **{f"{w}{k}": v for k, (b, x) in enumerate(res.group_ids) for w, v in (("block", b), ("cross", x))})
         if spec.fix_rings > 0 and res.record.get("valid"):           # B210: stage a on the insert and its rings
             full, rec["fix_rings"], moved, res.window = fix_spliced(mesh, win, res, full, sinfo, spec, h_min, log)
-        if spec.kind == "group" and spec.split_deg and res.record.get("valid"):   # B243: obtuse patch quads split
-            from meshom.insert.group import split_obtuse
+        if spec.kind == "group" and res.record.get("valid") and (spec.even_sweeps or spec.split_deg):
+            from meshom.insert.group import even_group, split_obtuse
 
             own = np.zeros(full.n_nodes, bool)
             own[full.n_nodes - sinfo["appended_nodes"]:] = True
             own[np.asarray(cfid, np.int64)] = False
-            full, res.window, rec["split_obtuse"] = split_obtuse(full, res.window, own, res.group_ids,
-                                                                 spec.split_deg)
-            log(f"[insert {spec.name}] split_deg {spec.split_deg:g}: {rec['split_obtuse']['split']} patch quads "
-                f"split into two triangles (worst corner {rec['split_obtuse']['worst_deg']:.1f} deg)", flush=True)
+            cut = np.zeros(full.n_nodes, bool)
+            cut[sinfo["host_to_new"][win.old_id[win.kind == 2]]] = True
+            tag = f"[insert {spec.name}]"
+            if spec.even_sweeps:                                     # B252: even neighbour areas
+                full, res.window, rec["even_areas"] = even_group(full, res.window, own, res.group_ids, cut, h_min,
+                                                                 spec.even_sweeps, log=log, tag=tag,
+                                                                 hold=spec.even_blocks)
+            if spec.split_deg:                                       # B243: obtuse patch quads split
+                full, res.window, rec["split_obtuse"] = split_obtuse(full, res.window, own, res.group_ids,
+                                                                     spec.split_deg)
+                log(f"{tag} split_deg {spec.split_deg:g}: {rec['split_obtuse']['split']} patch quads split into two "
+                    f"triangles (worst corner {rec['split_obtuse']['worst_deg']:.1f} deg)", flush=True)
+                if spec.even_sweeps and rec["split_obtuse"]["split"]:   # B252: the split triangles evened too
+                    full, res.window, rec["even_areas_split"] = even_group(
+                        full, res.window, own, res.group_ids, cut, h_min, spec.even_sweeps, log=log, tag=tag,
+                        hold=spec.even_blocks)
     seg = res.chart.fwd(win.mesh.points)[win.coast_edges]
     real_seg = res.real.segments("raw") if res.real is not None else None
     if res.profile is not None:

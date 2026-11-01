@@ -308,7 +308,10 @@ class InsertCfg:
                                                        # cells in their node box instead of the mean (0: off, B214)
     depth_area: bool = False                           # the insert's nodes scaled so that each section across
                                                        # the strait has the grid's wet area in FESOM3's element
-                                                       # bottoms (after the other own rules; the dam kept, B250)
+                                                       # bottoms (after the other own rules; the dam's cap kept,
+                                                       # B250; the deepest connection within a level of the grid
+                                                       # saddle's, B251; kind "depth": the region's nodes, the
+                                                       # path's sections)
     polygon: list = field(default_factory=list)       # kind "depth": the region [[lon, lat], ...] (great-circle
                                                        # edges) instead of width_km round the path (B223)
     envelope: list = field(default_factory=list)      # group: [[lon, lat], ...] polygon: the host cells whose

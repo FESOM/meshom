@@ -87,7 +87,7 @@ h_min_m = 1000.0                   # the size floor (default: the host mesh's sm
 | `sill_level` | `""` | `"shallower"`: the insert's sill gets the shallower of the two model levels round its depth (B212); `"grid"`: the grid's own saddle between the joins is held at the deepest level not below its depth by a dam of the insert's nodes (B215); `"nearest"`: the same dam at the level nearest the saddle's depth (B249) |
 | `depth_channel` | `""` | the grid's deepest channel between the joins (box means at the fine size; its ends the deepest box means along the joins, or the deeper basin beyond a join too shallow for the strait, kept inside the insert, B218): `"cells"`: the insert's nodes of every cell it crosses take at least its box-mean depth there; `"near"`: the insert's nodes within one spacing of it take at least the box mean of their own box centred on it; both only on the strait's narrows (B213) |
 | `depth_quantile` | 0 | the insert's nodes take this quantile of the grid's ocean cells in their node box instead of the mean (B214) |
-| `depth_area` | false | after the other depth rules, the insert's nodes are scaled so that each section across the strait has the grid's wet area in FESOM3's element bottoms (the dam of `sill_level` kept; B250) |
+| `depth_area` | false | after the other depth rules, the insert's nodes are scaled so that each section across the strait has the grid's wet area in FESOM3's element bottoms (the dam's cap kept, the strait's deepest connection within a level of the grid saddle's; B250, B251) |
 | `stages` | `"d,b,e,a"` | the clean-up stages on the join ring ([`cleanup.md`](cleanup.md); B162) |
 | `envelope` | | group: `[[lon, lat], ...]`, the host cells whose centroid lies inside are replaced as a whole (B240) |
 | `channels` | | group: `[[inserts.channels]]` tables `name`, `a`, `b` (cross lines bank to bank), `cells` (default 5, held from `a` to `b`) (B242) |
@@ -178,8 +178,11 @@ grid lines as they are. Choose in this order; the worked examples are the `gibra
    or smaller than the bathymetry's. `depth_area = true` scales the insert's own nodes after steps 8-9 so that every
    section across the strait (every half fine cell along its centreline, on the strait's narrows, not in the open
    basins) has the grid's raw wet area in FESOM3's element bottoms (fesom_ini's levels); the dam of
-   `sill_level = "grid"` and the cells along the channel line keep the sill and the deepest route, so use it with
-   steps 8-9. It changes depth only: the mesh is the same. It cannot make a section smaller than the depth floor
+   `sill_level = "grid"` keeps its cap and the channel line names the grid's saddle, so use it with steps 8-9: the
+   dam's nodes and the channel's cells are scaled as the others, but the strait's deepest connection in the element
+   bottoms stays within one level of the level nearest the saddle (at most one level shallower, never deeper than one
+   level below it; B251); a strait whose sill is already more than a level shallow keeps it: nothing on its channel
+   is made shallower (Bab el Mandeb, whose Hanish sill the insert holds at 100 m against GEBCO's 143 m). It changes depth only: the mesh is the same. It cannot make a section smaller than the depth floor
    allows (FESOM3's minimum, 30 m with 4 CORE2 layers, times the mesh's width), nor than the channel's cells hold: a
    shallow strait whose banks moved into land (Dover) and a strait with 3-4 cells across and its capes cut (Bab el
    Mandeb: the channel's cells fill most of the section) stay larger than the bathymetry's (B250). Gibraltar: the
@@ -232,8 +235,8 @@ areas too large: an ORCA host's nodes take the deepest of their four NEMO cells'
 depth only (B223): the host's nodes in a region round the strait take the grid rule of an insert's own nodes, as the
 nest's depth does inside its box (B216): the box mean per node, no smoothing, no strait depth floor, the run's slope
 limiter, the depth floor and the run's regions; with `depth_channel` the channel raise on the narrows (B213) and with
-`sill_level` the sill (B215, B212). Every other node keeps the host's depth (the run's rules, or on another insert's
-result its saved depth, B217). The mesh is not changed.
+`sill_level` the sill (B215, B212), and with `depth_area` the section areas (B250). Every other node keeps the host's
+depth (the run's rules, or on another insert's result its saved depth, B217). The mesh is not changed.
 
 ```toml
 [[inserts]]
@@ -260,6 +263,14 @@ depth_channel = "near"             # optional: the channel raise on the narrows
 - **The sill.** `sill_level = "grid"` holds the grid's saddle at the deepest level not below its depth: at Nares
   (saddle 224 m, levels 190 and 230 m) that is 190 m, a level shallower than the nearest level (230 m) the box mean
   gives without it.
+- **Section areas.** `depth_area = true` scales the region's nodes as an insert's own (B250), on sections across the
+  entry's path (`strait` or `path`; a polygon alone has no axis: the rule is skipped and recorded). A section counts
+  only when at least 90 % of the mesh's run across it lies in the region's cells, so the region must cover the whole
+  crossing the mesh has there (Tsushima's east channel on ORCA025 v5: with 100 km round the path 2 of 21 sections
+  counted; with 250 km, Korea to Kyushu, 15). Without the dam and the channel line the scaling may make the strait's
+  deepest connection shallower (Tsushima: 135 -> 90 m, two levels): use it with `sill_level = "grid"` and
+  `depth_channel = "near"`, and check `depth.channel.ends` (the line takes the deepest route of the whole region,
+  which may be a parallel channel).
 - **Outputs.** `insert_<name>.npz` (the host mesh), `.host_to_new.npy` (every node kept), `.collar_moved.npy` (none),
   `insert_<name>.json` (`region`: the nodes and the width or the polygon; `depth`: the rule's record) and
   `fesom-insert_<name>/depth.npy`, with model files when the run wrote them.

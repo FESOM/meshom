@@ -820,11 +820,11 @@ def test_depth_area_brings_the_sections_to_the_grids_area(strait, rows):
     wet area in FESOM3's element bottoms: the 3-row mesh (8.4 km in the 13.3 km strait) is deepened, the 5-row mesh
     (14 km, its outer nodes on land) made shallower; sections checked here on their own (the meridians 0.30 W, 0.20 W,
     0.30 E: mesh / grid within 10 % and nearer than before). Only the strait's sections count (the basins beyond
-    0.45 deg are open water past the mesh's banks). The dam of sill_level = "grid" holds: the nodes it capped keep the
-    cap, none of its nodes goes deeper than the cap, its cells' bottoms stay at the saddle's level or above; the cells
-    the channel line crosses are not made shallower, so the deepest connection between the basins in the element
-    bottoms stays the saddle's (300 m); no host node changes, no node rises above the floor; the factor changes
-    smoothly along the axis; the record names the counted and skipped sections and the deviation before and after."""
+    0.45 deg are open water past the mesh's banks). The dam of sill_level = "grid" holds its cap: none of its nodes
+    goes deeper, its cells' bottoms stay at the saddle's level or above; the deepest connection between the basins in
+    the element bottoms stays in the sill band of B251 (275-325 m round the saddle's 300 m level), here at 300 m; no
+    host node changes, no node rises above the floor; the factor changes smoothly along the axis; the record names
+    the counted and skipped sections and the deviation before and after."""
     nc = strait[0]
     m, ins, cfg, base = _wide_strait(nc, rows)
     from meshom.insert.core import rule_depth
@@ -851,7 +851,8 @@ def test_depth_area_brings_the_sections_to_the_grids_area(strait, rows):
     cap = r1["sill"]["cap_m"]
     assert a["dam"]["cap_m"] == cap and a["dam"]["nodes"] > a["dam"]["kept_at_cap"] > 0
     capped = ins & (np.abs(d0 - cap) < 1e-9)
-    assert capped.sum() == a["dam"]["kept_at_cap"] and (d1[capped] == cap).all()
+    assert capped.sum() == a["dam"]["kept_at_cap"] and (d1[capped] <= cap).all()
+    assert a["sill"]["band_m"] == [275.0, 325.0] and a["sill"]["connection_m"] == 300.0
     lo = xyz_to_lonlat(m.points)[0]
     lo_c = xyz_to_lonlat(m.points[m.quads].mean(1))[0]
     dam = np.abs(lo_c - r1["sill"]["via"][0]) < 0.5 * DX / 111e3 + 1e-3        # the cells on both sides of the chain
@@ -863,14 +864,9 @@ def test_depth_area_brings_the_sections_to_the_grids_area(strait, rows):
     assert a["factor"]["max_step"] < 0.35 and a["nodes_changed"] > 50
 
 
-def test_depth_area_keeps_the_sill_on_the_channel_line(tmp_path_factory):
-    """B250: a strait of 7.8 km (150 m, its channel 350 m, the 300 m sill at 0.10-0.12 E) under the 5-row mesh of 14
-    km: the sections are about twice the grid's, so the factor halves the depths; the nodes of the cells the channel
-    line crosses are not made shallower, so the deepest connection in the element bottoms stays the saddle's level
-    (300 m) while the sections shrink on their flanks."""
-    from meshom.insert.core import rule_depth
-    from meshom.io.fesom import model_levels
-
+def _narrow_strait(tmp_path_factory):
+    """a strait of 7.8 km (150 m, its channel 350 m, the 300 m sill at 0.10-0.12 E) under the 5-row mesh of 14 km:
+    the sections are about twice the grid's."""
     def narrow(z, LO, LA):
         st = (np.abs(LO) < 0.45) & (np.abs(LA) < 0.06)
         z[st] = 50.0
@@ -879,23 +875,108 @@ def test_depth_area_keeps_the_sill_on_the_channel_line(tmp_path_factory):
         z[(LO > 0.10) & (LO < 0.12) & (np.abs(LA) < 0.013)] = -300.0
 
     nc = _variant(tmp_path_factory, "narrow", narrow)
-    m, ins, cfg, base = _wide_strait(nc, 5)
+    return (nc,) + _wide_strait(nc, 5)
+
+
+def test_depth_area_lets_the_sill_rise_one_level(tmp_path_factory):
+    """B251: on the narrow strait (sections about twice the grid's) the dam's nodes and the channel line's cells are
+    scaled as the others, so the sections come nearer the grid's (the meridians 0.30 W, 0.20 W, 0.30 E within 20 %;
+    holding them, as before, left 26 %), while the deepest connection in FESOM3's element bottoms rises by one level
+    and no more (the saddle's 300 m level -> 275 m, the band 275-325 m): a chain of cells from join to join keeps its
+    cells' mean depth at the midpoint of 250 and 275 m plus 1 m. The dam's nodes are made shallower, none goes deeper
+    than the cap; the record names the band, the connection before and after and the chain."""
+    from meshom.insert.core import rule_depth
+    from meshom.io.fesom import model_levels
+
+    nc, m, ins, cfg, base = _narrow_strait(tmp_path_factory)
     axis = lonlat_to_xyz(np.linspace(-0.8, 0.8, 33), np.zeros(33))
     kw = dict(depth_at="node", depth_smooth=0, strait_floor=False, sill_level="grid", depth_channel="near", h_fine=DX,
               log=QUIET)
     d0, r0 = rule_depth(m, ins, base, cfg, "fesom2", None, **kw)
     d1, r1 = rule_depth(m, ins, base, cfg, "fesom2", None, depth_area=True, axis=axis, **kw)
-    a = r1["area"]
-    assert r1["sill"]["saddle_m"] == pytest.approx(300.0) and a["route_nodes"] > 0
-    assert a["factor"]["min"] < 0.7 and a["after"]["mean"] < a["before"]["mean"]
+    for lon_at in (-0.30, -0.20, 0.30):
+        mb, g = _section_areas(m, d0, nc, lon_at)
+        ma, _ = _section_areas(m, d1, nc, lon_at)
+        assert mb / g > 1.5 and abs(ma / g - 1.0) < 0.20, (lon_at, mb, ma, g)
     bot0, bot1 = model_levels(m, d0, ZFINE)[2], model_levels(m, d1, ZFINE)[2]
-    assert _deepest_connection(m, bot0) == _deepest_connection(m, bot1) == 300.0
+    assert _deepest_connection(m, bot0) == 300.0 and _deepest_connection(m, bot1) == 275.0
+    a, s = r1["area"], r1["area"]["sill"]
+    assert r1["sill"]["saddle_m"] == pytest.approx(300.0) and a["factor"]["min"] < 0.5
+    assert s["level_m"] == 300.0 and s["band_m"] == [275.0, 325.0] and s["connection_in_m"] == 300.0
+    assert s["connection_m"] == 275.0 and s["chain_cells"] >= 46 and s["chain_mean_m"] == 263.5
+    cap = r1["sill"]["cap_m"]
+    capped = ins & (np.abs(d0 - cap) < 1e-9)
+    near = ins & (np.abs(xyz_to_lonlat(m.points)[0] - r1["sill"]["via"][0]) < 1.5 * DX / 111e3)   # the dam's nodes
+    assert s["dam_nodes_shallower"] > 0 and (d1[capped] < cap - 1.0).any() and (d1[near] <= cap + 1e-9).all()
+    assert np.array_equal(d1[~ins], d0[~ins])
+
+
+def test_depth_area_sill_band_refuses_rounds_that_leave_it(tmp_path_factory, monkeypatch):
+    """B251: without the chain (none found) every round is checked: a round whose deepest connection leaves the band
+    is not kept, so the kept depth still has its connection at 275 m or deeper, never two levels up (250 m)."""
+    from meshom.insert import area
+    from meshom.insert.core import rule_depth
+    from meshom.io.fesom import model_levels
+
+    nc, m, ins, cfg, base = _narrow_strait(tmp_path_factory)
+    axis = lonlat_to_xyz(np.linspace(-0.8, 0.8, 33), np.zeros(33))
+    monkeypatch.setattr(area, "_chain", lambda *a, **k: None)
+    d1, r1 = rule_depth(m, ins, base, cfg, "fesom2", None, depth_area=True, axis=axis, depth_at="node",
+                        depth_smooth=0, strait_floor=False, sill_level="grid", depth_channel="near", h_fine=DX,
+                        log=QUIET)
+    s = r1["area"]["sill"]
+    assert s["chain_cells"] == 0 and s["rounds_out_of_band"] > 0
+    assert any(not h["in_band"] and h["connection_m"] < 275.0 for h in r1["area"]["rounds"])
+    assert s["connection_m"] >= 275.0 and _deepest_connection(m, model_levels(m, d1, ZFINE)[2]) >= 275.0
+
+
+def test_depth_area_sill_band_ties_and_a_sill_already_shallow(tmp_path_factory):
+    """B251: the band's lower edge is one level above the level nearest the grid's saddle, a tie taking the deeper
+    level (a saddle of 287.5 m between 275 and 300 m: 275 m, not 250 m), its upper edge one level below the nearest
+    with a tie taking the shallower (300 m). When the input's deepest connection already lies above the band (a
+    saddle of 400 m: the band 375-425 m, the input's connection 300 m) B250's holds stay: the depth equals the rule's
+    without a saddle, node for node."""
+    from meshom.insert.area import area_depth
+    from meshom.insert.core import rule_depth
     from meshom.straits import locate
 
-    on = np.zeros(m.n_nodes, bool)
+    nc, m, ins, cfg, base = _narrow_strait(tmp_path_factory)
+    axis = lonlat_to_xyz(np.linspace(-0.8, 0.8, 33), np.zeros(33))
+    d0, _ = rule_depth(m, ins, base, cfg, "fesom2", None, depth_at="node", depth_smooth=0, strait_floor=False,
+                       sill_level="grid", depth_channel="near", h_fine=DX, log=QUIET)
+    route = np.zeros(m.n_nodes, bool)
     el = locate(m, lonlat_to_xyz(np.linspace(-0.44, 0.44, 200), np.zeros(200)))
-    on[m.quads[el[el >= 0] - m.n_tris].ravel()] = True                      # the cells along the channel (its axis)
-    assert (d1[on & ins] >= d0[on & ins] - 1e-9).all() and (d1[ins & ~on] < d0[ins & ~on] - 1.0).sum() > 20
+    route[m.quads[el[el >= 0] - m.n_tris].ravel()] = True
+    kw = dict(held=None, route=route, log=QUIET)
+    z = np.array(ZFINE)
+    _, tie = area_depth(m, d0, ins, axis, z, 40.0, nc, "elevation", DX, saddle_m=287.5, **kw)
+    assert tie["sill"]["band_m"] == [275.0, 300.0] and tie["sill"]["connection_in_m"] == 300.0
+    d_old, r_old = area_depth(m, d0, ins, axis, z, 40.0, nc, "elevation", DX, **kw)
+    d_deep, r_deep = area_depth(m, d0, ins, axis, z, 40.0, nc, "elevation", DX, saddle_m=400.0, **kw)
+    assert "sill" not in r_old and "B250's holds" in r_deep["sill"]["skipped"] and "375-425" in r_deep["sill"]["skipped"]
+    assert np.array_equal(d_deep, d_old) and (d_old[route & ins] >= d0[route & ins] - 1e-9).all()
+
+
+def test_depth_area_connection_runs_along_the_line():
+    """B251: the strait's connection is sought only through the cells within two fine cells of the channel line:
+    on a 20 x 9 patch whose row 0 is 500 m deep and whose middle row (the line) is 100 m, the connection between the
+    two end columns is 500 m through every cell and 100 m through the line's cells (no stored zero counts as an
+    edge); the cheapest chain there follows the line."""
+    from meshom.insert import area
+
+    m = structured_patch(20, 9, DX)
+    lo, la = xyz_to_lonlat(m.points[m.quads].mean(1))
+    row = np.rint((la - la.min()) / (DX / 111.2e3)).astype(int)
+    col = np.rint((lo - lo.min()) / (DX / 111.2e3)).astype(int)
+    bot = np.where(row == 0, 500.0, np.where(row == 4, 100.0, 40.0))
+    ea, eb = np.flatnonzero(col == 0), np.flatnonzero(col == col.max())
+    line = lonlat_to_xyz(np.linspace(lo.min(), lo.max(), 40), np.full(40, la[row == 4].mean()))
+    adj = area._adjacency(m)
+    ladj = area.line_adjacency(m, adj, [line], DX, np.r_[ea[row[ea] == 4], eb[row[eb] == 4]])
+    assert area.connection(adj, bot, ea, eb) == 500.0
+    assert area.connection(ladj, bot, ea[row[ea] == 4], eb[row[eb] == 4]) == 100.0
+    ch = area._chain(ladj, bot >= 100.0, ea, eb, np.where(row == 4, 1.0, area.AREA_CHAIN_COST))
+    assert ch is not None and (row[ch] == 4).all() and len(ch) == col.max() + 1
 
 
 def test_depth_area_counts_only_the_strait_narrows(tmp_path_factory):
@@ -1078,6 +1159,8 @@ def test_grid_sill_nearest_takes_the_level_nearest_the_saddle(strait, line):
     assert r["sill"]["rule"] == "nearest" and r["sill"]["level_m"] == 280.0 and r["sill"]["capped"] > 0
 
 
+# ------------------------------------------------------------------------------------------------ B223, B250
+
 def test_depth_region_with_depth_area(strait, depth_run_dir, tmp_path):
     """B223, B250: kind = "depth" with depth_area: the region's nodes take the section-area rule along the region's
     path (its axis) after the grid rule and the dam; region_depth gives the same depth; host nodes outside the
@@ -1099,3 +1182,63 @@ def test_depth_region_with_depth_area(strait, depth_run_dir, tmp_path):
     dep = np.load(tmp_path / "area" / "fesom-insert_dep" / "depth.npy")
     exp, _ = region_depth(m, inside, run_d, cfg, "fesom2", "", "grid", log=QUIET, depth_area=True, axis=spec.path)
     assert np.array_equal(dep, exp) and np.array_equal(dep[~inside], run_d[~inside])
+
+
+def test_depth_area_on_a_depth_region(strait, tmp_path):
+    """B223 / B250: `depth_area` acts on a depth region: its nodes play the insert's own nodes and the sections run
+    across the entry's path. On the 3-row mesh (8.4 km inside the 13.3 km strait, the region |lon| < 0.65) the region's
+    sections come to the grid's area (checked on three meridians on their own), the dam of sill_level = "grid" holds
+    (the nodes it capped keep the cap) and the deepest connection in the element bottoms stays the saddle's (300 m);
+    every node off the region keeps its depth; without depth_area nothing changes. Through `run` (kind = "depth"):
+    the record's `depth.area` is applied with the path as the axis, the depth equals region_depth's; a polygon alone
+    has no axis (skipped, the depth as without the rule)."""
+    from meshom import compete, config
+    from meshom.config import load
+    from meshom.insert.core import depth_region_nodes, region_depth, run, spec_from
+    from meshom.io.fesom import model_levels
+    from meshom.run import model_depth
+
+    nc = strait[0]
+    m, ins, cfg, base = _wide_strait(nc, 3)
+    axis = lonlat_to_xyz(np.linspace(-0.8, 0.8, 33), np.zeros(33))
+    d0, r0 = region_depth(m, ins, base, cfg, "fesom2", "near", "grid", log=QUIET)
+    d1, r1 = region_depth(m, ins, base, cfg, "fesom2", "near", "grid", log=QUIET, depth_area=True, axis=axis)
+    assert "area" not in r0 and r1["rule"]["depth_area"] and "held" not in r1["sill"]
+    a = r1["area"]
+    assert a["applied"] and a["counted"] >= 50 and a["after"]["mean"] < 0.10 < a["before"]["mean"]
+    assert all(abs(c["lonlat"][0]) <= 0.4501 for c in a["curve"] if c["ok"])
+    for lon_at in (-0.30, -0.20, 0.30):
+        mb, g = _section_areas(m, d0, nc, lon_at)
+        ma, _ = _section_areas(m, d1, nc, lon_at)
+        assert abs(ma / g - 1.0) < min(0.10, abs(mb / g - 1.0) - 0.03) and ma > mb, (lon_at, mb, ma, g)
+    assert np.array_equal(d1[~ins], base[~ins]) and np.array_equal(d0[~ins], base[~ins])
+    cap = r1["sill"]["cap_m"]
+    capped = ins & (np.abs(d0 - cap) < 1e-9)
+    assert a["dam"]["cap_m"] == cap and capped.sum() == a["dam"]["kept_at_cap"] > 0 and (d1[capped] == cap).all()
+    bot0, bot1 = model_levels(m, d0, ZFINE)[2], model_levels(m, d1, ZFINE)[2]
+    assert _deepest_connection(m, bot1) == _deepest_connection(m, bot0) == 300.0
+
+    d = tmp_path / "run"                                       # the same mesh as a run's host
+    d.mkdir()
+    compete._save(m, d / "raw.npz")
+    cfg = dataclasses.replace(cfg, size=dataclasses.replace(cfg.size, layers=[config.ConstantLayer(h_m=2800.0)]))
+    config.save(cfg, d / "config.resolved.toml")
+    cfg = load(d / "config.resolved.toml")
+    entry = _depth_entry(path=[[-0.6, 0.0], [0.6, 0.0]], width_km=10.0, depth_channel="near", sill_level="grid",
+                         depth_area=True)
+    spec = spec_from(entry, cfg)
+    rec = run(d, spec, tmp_path / "area", log=QUIET)
+    dep = np.load(tmp_path / "area" / "fesom-insert_dep" / "depth.npy")
+    inside = depth_region_nodes(m, spec.path, spec.width_m)
+    run_d = model_depth(m, cfg, "fesom2", [], d)
+    exp, _ = region_depth(m, inside, run_d, cfg, "fesom2", "near", "grid", log=QUIET, depth_area=True,
+                          axis=spec.path)
+    assert rec["status"] == "ok" and rec["depth"]["area"]["applied"] and rec["depth"]["area"]["counted"] > 20
+    assert np.array_equal(dep, exp) and np.array_equal(dep[~inside], run_d[~inside])
+    poly = [[-0.71, -0.09], [0.71, -0.09], [0.71, 0.09], [-0.71, 0.09]]
+    rec = run(d, spec_from(_depth_entry(path=[], width_km=None, polygon=poly, depth_area=True), cfg),
+              tmp_path / "poly", log=QUIET)
+    assert rec["depth"]["area"]["applied"] is False and "no axis" in rec["depth"]["area"]["skipped"]
+    rec0 = run(d, spec_from(_depth_entry(path=[], width_km=None, polygon=poly), cfg), tmp_path / "poly0", log=QUIET)
+    assert np.array_equal(np.load(tmp_path / "poly" / "fesom-insert_dep" / "depth.npy"),
+                          np.load(tmp_path / "poly0" / "fesom-insert_dep" / "depth.npy")) and "area" not in rec0["depth"]

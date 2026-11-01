@@ -1100,8 +1100,8 @@ def route_depth(full: Mesh, depth: np.ndarray, own: np.ndarray, routes: list, cf
     along the narrows (meshom.insert.channel.line_raise), across blocks and patches alike; with sill_level = "grid"
     the dam (channel.grid_sill) from bank to bank through the saddle, its banks the open coast on each side of the
     line (route_banks), so that it cuts every passage of the group beside islands; with depth_area the section-area
-    rule (meshom.insert.area.area_depth, B250) along the route's line, its dam kept, the nodes of the cells any
-    route's line crosses never made shallower and the other routes' dam nodes left alone. Each end is the deepest box
+    rule (meshom.insert.area.area_depth, B250) along the route's line, its dam's cap kept, the deepest connection
+    between the route's ends within a level of its grid saddle's (B251) and the other routes' dam nodes left alone. Each end is the deepest box
     mean within ROUTE_END_H x h_fine of the given point (in the corridor when it has one there). A route with a
     corridor width keeps its line, saddle and narrows within half that width of the polyline a, via..., b (a strait
     beside a deeper one would otherwise take the deeper one's path). Returns (depth, records)."""
@@ -1218,9 +1218,10 @@ def route_depth(full: Mesh, depth: np.ndarray, own: np.ndarray, routes: list, cf
             for j_, h in enumerate(held):
                 if h is not None and j_ != i:
                     other[np.asarray(h[0], np.int64)] = True
-            d, r["area"] = area_depth(sub, d, ins & ~other, lonlat_to_xyz(line.lon, line.lat), zbar, floor,
-                                      Path(b.source), b.variable, h_fine, held[i], on_line,
-                                      f"{tag} route {r['route']}", log)
+            ax = lonlat_to_xyz(line.lon, line.lat)
+            d, r["area"] = area_depth(sub, d, ins & ~other, ax, zbar, floor, Path(b.source), b.variable, h_fine,
+                                      held[i], on_line, f"{tag} route {r['route']}", log,
+                                      saddle_m=line.saddle[0])                 # B251: the band, the route's ends
     for line, r in zip(lines, recs):
         s, lr = r.get("sill", {}), r["line"]
         raise_ = f"; raise {r['raise']['nodes_raised']} nodes" if "raise" in r else ""

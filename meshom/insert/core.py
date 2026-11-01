@@ -888,8 +888,9 @@ def rule_depth(sub: Mesh, ins: np.ndarray, base: np.ndarray, cfg, fmt: str, stra
     them, B218), box means at h_fine, None: the median spacing of `ins`) and sill_level ("shallower", B212:
     sill_shallower; "grid", B215: meshom.insert.channel.grid_sill), both on the grid rule's node depths of `sub`
     (host nodes included); then depth_area (B250: meshom.insert.area.area_depth along `axis` (K,3), the strait's
-    centreline from one join to the other, the dam of sill_level kept, the cells the channel line crosses never made
-    shallower). `tag` heads the log lines. Returns (the
+    centreline from one join to the other, the dam's cap kept; with the channel line the deepest connection between
+    the joins within a level of the grid saddle's, B251, else the dam's capped nodes and the cells the channel line
+    crosses never made shallower). `tag` heads the log lines. Returns (the
     depth on `sub`, the rule's values on `ins`; the record)."""
     from meshom import run as runmod
     from meshom.bathymetry import (apply_regions, cells_deepest_depth, depth_policy, levels, node_area_m2,
@@ -989,7 +990,9 @@ def rule_depth(sub: Mesh, ins: np.ndarray, base: np.ndarray, cfg, fmt: str, stra
                 route[sub.tris[el[el < T_]].ravel()] = True
                 route[sub.quads[el[el >= T_] - T_].ravel()] = True
             d, rec["area"] = area_depth(sub, d, ins, axis, levels(b.levels), floor, Path(b.source), b.variable, h_f,
-                                        held, route, tag, log)
+                                        held, route, tag, log,                           # B251: the band
+                                        saddle_m=line.saddle[0] if line is not None else None,
+                                        line=lonlat_to_xyz(line.lon, line.lat) if line is not None else None)
     rec["nodes_m"] = {"min": float(d[ins].min()), "max": float(d[ins].max())}
     return d, rec
 
@@ -1089,6 +1092,7 @@ def sill_shallower(sub: Mesh, depth: np.ndarray, ins: np.ndarray, zbar: np.ndarr
 
 
 REGION_STEP_M = 1000.0       # B223: a depth region's path is densified to this spacing for the distance to it
+REGION_AREA_RINGS = 2        # B223 / B250: with depth_area a region's window holds this many more cell rings
 
 
 def _canonical(e: np.ndarray) -> np.ndarray:
@@ -1107,20 +1111,23 @@ def region_depth(mesh: Mesh, inside: np.ndarray, depth: np.ndarray, cfg, fmt: st
     """B216, B223: the nodes `inside` take an insert's own grid rule (rule_depth, B211): the box mean per node, no
     smoothing, no strait depth floor, the run's slope limiter, the depth floor and the regions; with `depth_channel`
     the channel raise (B213) and with `sill_level` the sill (B215 / B212), the channel line between the two largest
-    pieces of the other nodes of their cells (B218); with `depth_area` the section-area rule (B250) along `axis`
-    ((K,3): the region's path), the dam kept. Computed on their cells and one cell ring round them, nodes
-    ordered by position and cells by their nodes, so the depth is the same in every mesh that holds those cells.
-    Every other node keeps `depth`. Returns (depth, record)."""
+    pieces of the other nodes of their cells (B218); with `depth_area` the section areas (B250, the nodes `inside`
+    playing the insert's own nodes, the sections across `axis` (K,3), the strait's path; None: skipped). Computed on
+    their cells and one cell ring round them (with depth_area REGION_AREA_RINGS more, so that a section's mesh run is
+    not cut at the window's edge), nodes ordered by position and cells by their nodes, so the depth is the same in
+    every mesh that holds those cells. Every other node keeps `depth`. Returns (depth, record)."""
     T = mesh.n_tris
 
     def cells_of(nodes):
         return np.r_[nodes[mesh.tris].any(1) if T else np.zeros(0, bool), nodes[mesh.quads].any(1)]
 
-    near = np.zeros(mesh.n_nodes, bool)
-    c = cells_of(inside)
-    near[mesh.tris[c[:T]].ravel()] = True
-    near[mesh.quads[c[T:]].ravel()] = True
-    c = cells_of(near)                                        # the cells of `inside` and one ring round them
+    near = inside
+    for _ in range(1 + (REGION_AREA_RINGS if depth_area else 0)):
+        c = cells_of(near)
+        near = np.zeros(mesh.n_nodes, bool)
+        near[mesh.tris[c[:T]].ravel()] = True
+        near[mesh.quads[c[T:]].ravel()] = True
+    c = cells_of(near)                                        # the cells of `inside` and one ring (or more) round them
     wid = np.unique(np.r_[mesh.tris[c[:T]].ravel(), mesh.quads[c[T:]].ravel()])
     wid = wid[np.lexsort(mesh.points[wid].T[::-1])]
     loc = np.full(mesh.n_nodes, -1, np.int64)
@@ -1129,8 +1136,8 @@ def region_depth(mesh: Mesh, inside: np.ndarray, depth: np.ndarray, cfg, fmt: st
                _canonical(loc[mesh.quads[c[T:]]].reshape(-1, 4)), np.zeros(len(wid), np.int8))
     ins = inside[wid]
     d, rec = rule_depth(sub, ins, depth[wid], cfg, fmt, None, depth_at="node", depth_smooth=0, strait_floor=False,
-                        sill_level=sill_level, depth_channel=depth_channel, tag=tag, log=log,
-                        depth_area=depth_area, axis=axis)
+                        sill_level=sill_level, depth_channel=depth_channel, tag=tag, log=log, depth_area=depth_area,
+                        axis=axis)
     out = np.array(depth, dtype=np.float64)
     out[wid[ins]] = d[ins]
     rec["change_m"] = {"min": float((d - depth[wid])[ins].min()), "max": float((d - depth[wid])[ins].max())}
@@ -1156,11 +1163,11 @@ def depth_run(run_dir: Path, spec: Spec, cfg, mesh: Mesh, src: Path, straits: li
               log=print) -> dict:
     """B223, kind = "depth": no mesh change; the host nodes inside the polygon or within width_m / 2 of the path
     (depth_region_nodes) take the nest's grid rule (region_depth: B211's box mean per node, no smoothing, no strait
-    floor; the entry's depth_channel, B213, sill_level, B215 / B212, and depth_area along the path, B250), every
-    other node keeps the host's depth (the run's rules, meshom.run.model_depth, or the host mesh's own saved depth
-    when it is an insert's result, B217). Writes insert_<name>.npz (the host mesh), .host_to_new.npy (every node
-    kept), .collar_moved.npy (none), .json (the record: `region`, `depth`) and fesom-insert_<name>/depth.npy, with
-    model files when the run wrote them."""
+    floor; the entry's depth_channel, B213, sill_level, B215 / B212 / B249, and depth_area, B250, on sections across
+    the entry's path, none for a polygon alone), every other node keeps the host's depth (the run's rules,
+    meshom.run.model_depth, or the host mesh's own saved depth when it is an insert's result, B217). Writes
+    insert_<name>.npz (the host mesh), .host_to_new.npy (every node kept), .collar_moved.npy (none), .json (the
+    record: `region`, `depth`) and fesom-insert_<name>/depth.npy, with model files when the run wrote them."""
     from meshom import compete
     from meshom import run as runmod
 
@@ -1184,12 +1191,17 @@ def depth_run(run_dir: Path, spec: Spec, cfg, mesh: Mesh, src: Path, straits: li
     if host is not None:                                   # B217: a chain keeps the host mesh's own depth
         depth = np.array(host, dtype=np.float64)
         rec["host_depth"] = {"source": "the host mesh's own (an insert's result)", "nodes": int(mesh.n_nodes)}
+    axis = None                                            # B250: the sections across the strait's path
+    alone = (spec.polygon is not None and spec.path.shape == spec.polygon.shape   # a polygon alone: its outline
+             and np.array_equal(spec.path, spec.polygon))
+    if spec.depth_area and len(spec.path) >= 2 and not alone:
+        axis = spec.path
     out, rec["depth"] = region_depth(mesh, inside, depth, cfg, fmt, spec.depth_channel, spec.sill_level,
-                                     f"[insert {spec.name}]", log, spec.depth_area,
-                                     spec.path if spec.depth_area else None)
+                                     f"[insert {spec.name}]", log, spec.depth_area, axis)
     log(f"[insert {spec.name}] depth region {where}: {int(inside.sum())} "
         f"host nodes by the grid rule{', channel ' + spec.depth_channel if spec.depth_channel else ''}"
-        f"{', sill ' + spec.sill_level if spec.sill_level else ''}: {out[inside].min():.0f}-{out[inside].max():.0f} m "
+        f"{', sill ' + spec.sill_level if spec.sill_level else ''}{', section areas' if spec.depth_area else ''}: "
+        f"{out[inside].min():.0f}-{out[inside].max():.0f} m "
         f"(before: {depth[inside].min():.0f}-{depth[inside].max():.0f} m); the mesh unchanged", flush=True)
     compete._save(mesh, stem.with_suffix(".npz"))
     np.save(stem.parent / (stem.name + ".host_to_new.npy"), np.arange(mesh.n_nodes, dtype=np.int64))

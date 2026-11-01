@@ -17,7 +17,8 @@ every node gets the placeholder 4400 m: always give a grid for a model run.
 - `depth_at`:
   - `"node"` (default): the mean of the grid's **ocean** cells in a lon-lat box of half-width = half the node's mean
     edge (its control cell). Nodes without an ocean cell take the length-weighted mean of their neighbours, ring by
-    ring (O16, O17).
+    ring (O16, O17). `box_factor` (1) scales the box's side: 2 gives a box of 4 times the area, a smoother depth
+    (B222; also in an insert's and the nest's own rule).
   - `"cells_deepest"` (B103): per element the mean of the ocean cells in a box of the element's area, and each node
     the deepest of its elements. Narrow straits keep their depth (the box means of `"node"` make coastal nodes
     shallow). FESOM3's ORCA rule applied to meshom's cells.
@@ -48,7 +49,8 @@ file with nl then nl values, such as an `aux3d.out`). Written into `aux3d.out` f
 
 ## Depth regions (`[[bathymetry.regions]]`, O35, O36)
 
-Rules by area, applied after every other depth step (including `m16_orca`'s NEMO depths), in file order, in
+Rules by area, applied after every other depth step (including `m16_orca`'s NEMO depths; `[mesh.opts] depth =
+"gebco"` switches those off, B221), in file order, in
 `meshom run` and in every `meshom write` of that run:
 
 ```toml
@@ -90,7 +92,7 @@ grid's box sums); a write after a few edits then takes seconds and gives the sam
 
 ## Config keys used
 
-- `[bathymetry]`: `source`, `variable`, `depth_at`, `min_depth_m`, `min_layers`, `smooth_passes`, `max_slope`, `carve_taper`, `levels`, `regions`
+- `[bathymetry]`: `source`, `variable`, `depth_at`, `box_factor`, `min_depth_m`, `min_layers`, `smooth_passes`, `max_slope`, `carve_taper`, `levels`, `regions`
 - `[[bathymetry.regions]]`: `name`, `box`, `polygon`, `depth_m`, `min_depth_m`, `max_depth_m`
 - `[[straits]]`: `depth_m`, `h_m`
 - `[mesh]`: `format`
@@ -101,4 +103,4 @@ grid's box sums); a write after a few edits then takes seconds and gives the sam
   `meshom/straits.py` (`depth_floor`), `meshom/run.py` (`model_depth`, `write_mesh`).
 - Docs: [`docs/config.md` "`[bathymetry]`"](../config.md#bathymetry),
   [`docs/config.md` "Depth regions"](../config.md#depth-regions-bathymetryregions-and-node-edits).
-- Decisions: B94, B103, O16-O19, O27-O31, O33, O35-O38.
+- Decisions: B94, B103, B221, B222, O16-O19, O27-O31, O33, O35-O38.

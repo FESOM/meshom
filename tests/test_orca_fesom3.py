@@ -321,7 +321,7 @@ def test_run_puts_fesom3_node_depths_on_the_orca_nodes(tmp_path):
     np.savez(tmp_path / "orca_belt.npz", points=pts[[2, 0]], node_level=np.array([3, 1]),
              z=np.array([0.0, 10.0, 20.0, 35.0]))
     depth = np.array([100.0, 200.0, 300.0, 400.0])
-    cfg = SimpleNamespace(mesh=SimpleNamespace(method="m16_orca"))
+    cfg = SimpleNamespace(mesh=SimpleNamespace(method="m16_orca", opts={}))
     got = _method_node_depth(cfg, tmp_path, mesh, depth)
     assert got.tolist() == [10.0, 200.0, 35.0, 400.0]
     other = SimpleNamespace(mesh=SimpleNamespace(method="m14_blocks_rep"))

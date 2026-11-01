@@ -1355,3 +1355,60 @@ def test_open_water_path_is_clipped_to_the_region(open_run_dir):
     assert np.abs(lo[capped] - s["via"][0]).max() < 6.0 * DX / 111e3   # a chain across, not along the channel
     wide = np.abs(la) < 0.2                                     # the whole patch's width: its edges are coast
     assert not isinstance(chan.banks(m, wide & (np.abs(lo) < 0.66)), str)
+# ------------------------------------------------------------------------------------------------ B221, B222
+
+def test_orca_depth_gebco_keeps_the_run_rules_on_the_orca_nodes(strait, tmp_path):
+    """B221: m16_orca's ORCA nodes (orca_belt.npz `node_level`, `z`) take FESOM3's depth in model_depth by default
+    (`depth = "nemo"`, B94); with `[mesh.opts] depth = "gebco"` they keep the run's [bathymetry] depth like every
+    other node: the grid rule, the smoothing passes, the strait depth floors and the floor (mesh_depth), the regions
+    last."""
+    from meshom.config import DepthRegionCfg
+    from meshom.run import mesh_depth, model_depth
+    from meshom.straits import Strait
+
+    nc, _, _, m, _ = strait
+    lo, la = xyz_to_lonlat(m.points)
+    orca = np.flatnonzero(lo < 0.2)                                     # the "ORCA part": every node west of 0.2 E
+    z = np.array([0.0, 100.0, 1234.0])
+    np.savez(tmp_path / "orca_belt.npz", points=m.points[orca], node_level=np.full(len(orca), 2), z=z)
+    cfg = _cfg(nc, smooth_passes=2)
+    cfg.mesh.method = "m16_orca"
+    cfg.bathymetry.regions = [DepthRegionCfg(name="r", box=[0.5, -1.0, 1.0, 1.0], min_depth_m=2500.0)]
+    straits = [Strait("s", lonlat_to_xyz(np.linspace(-0.3, 0.3, 7), np.zeros(7)), 4000.0, 3000.0, depth_m=1500.0)]
+    run = mesh_depth(m, cfg, "fesom2", straits)                         # the run's rules, no regions
+    east = lo >= 0.2
+    reg = lo >= 0.5
+    nemo = model_depth(m, cfg, "fesom2", straits, tmp_path)             # default: depth = "nemo"
+    assert (nemo[orca] == 1234.0).all() and np.array_equal(nemo[east & ~reg], run[east & ~reg])
+    cfg.mesh.opts["depth"] = "gebco"
+    gebco = model_depth(m, cfg, "fesom2", straits, tmp_path)
+    assert np.array_equal(gebco[~reg], run[~reg]) and (gebco[reg] == np.maximum(run[reg], 2500.0)).all()
+    on = (np.abs(lo) < 0.1) & (np.abs(la) < 0.02)                       # on the strait's path, west of 0.2 E
+    assert on.sum() > 2 and (gebco[on] >= 1500.0).all() and (gebco[orca] != 1234.0).any()
+    cfg.mesh.opts["depth"] = "nemo"
+    assert np.array_equal(model_depth(m, cfg, "fesom2", straits, tmp_path), nemo)
+
+
+def test_box_factor_scales_the_node_box(strait):
+    """B222: `[bathymetry] box_factor` multiplies the node box's half-width (half the node's mean edge length): 2 gives
+    the box means of a box twice as wide each way (4 times the area); the default 1 is the rule as before, bit for
+    bit, in mesh_depth and in an insert's own rule."""
+    from meshom.bathymetry import box_means, node_spacing_m
+    from meshom.insert.core import rule_depth
+    from meshom.run import mesh_depth
+
+    nc, _, _, m, ins = strait
+    lo, la = xyz_to_lonlat(m.points)
+    sp, _, _ = node_spacing_m(m)
+    base = mesh_depth(m, _cfg(nc), "fesom2", [])
+    assert np.array_equal(mesh_depth(m, _cfg(nc, box_factor=1.0), "fesom2", []), base)
+    s1, n1 = box_means(lo, la, 0.5 * sp, nc)
+    s2, n2 = box_means(lo, la, sp, nc)
+    assert (n1 > 0).all() and (n2 > 0).all() and (n2 > 3 * n1).all()
+    assert np.allclose(base, np.maximum(-s1 / n1, 50.0))
+    two = mesh_depth(m, _cfg(nc, box_factor=2.0), "fesom2", [])
+    assert np.allclose(two, np.maximum(-s2 / n2, 50.0)) and not np.allclose(two, base)
+    cfg2 = _cfg(nc, box_factor=2.0)
+    d, _ = rule_depth(m, ins, base, cfg2, "fesom2", None, depth_at="node", depth_smooth=0, strait_floor=False,
+                      log=QUIET)
+    assert np.array_equal(d, two)

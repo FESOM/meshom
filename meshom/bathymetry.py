@@ -8,7 +8,8 @@ node_depth(mesh, path, variable, min_depth_m) -> depth (N,) metres, positive dow
    cells inside a lon-lat box around the node with half-width r = half the mean length of the node's edges (in metres
    north-south, r / cos(lat) east-west): the box has the area h^2 of the node's control cell (median dual of an
    equilateral mesh: 0.87 h^2), so the depth stands for the water the node represents, as FESOM2 uses it (element
-   depth = mean of its 3 nodes, the bottom level per element). Land cells (>= 0) are left
+   depth = mean of its 3 nodes, the bottom level per element); `[bathymetry] box_factor` scales r (B222: 2 = a box
+   of 4 h^2, a smoother depth). Land cells (>= 0) are left
    out, so a coastal node gets the depth of its wet part, not a mix with the land height. This rule is after
    D. Sein (AWI), fesom2_mesh_gen; the nearest grid cell would sample a 450 m pixel for a 25-110 km cell.
 2. **Nodes without an ocean cell** (GSHHS water where the grid has land: narrow bays, lagoons, the GSHHS / GEBCO
@@ -354,24 +355,27 @@ def limit_slope(depth: np.ndarray, edges: np.ndarray, length: np.ndarray, area: 
 
 
 def node_depth(mesh: Mesh, path: Path, variable: str = "elevation", min_depth_m: float = 10.0,
-               band_rows: int = 600, cache: Path | None = None) -> tuple[np.ndarray, dict]:
+               band_rows: int = 600, cache: Path | None = None, box_factor: float = 1.0) -> tuple[np.ndarray, dict]:
     """Depth (N,) metres positive down per node of `mesh` and a record for stages.json (module docstring). `cache`:
     a box-sum cache file (cached_box_means; `meshom write`): only the boxes not in it are read from the grid, the
-    depth is the same bit for bit; the record then also has "cache" and "n_boxes_read"."""
+    depth is the same bit for bit; the record then also has "cache" and "n_boxes_read". `box_factor` (`[bathymetry]
+    box_factor`, B222): the box's side in units of the node's mean edge length (half-width box_factor x half of
+    it; 2 = a box of 4 times the area, a smoother depth)."""
     lon, lat = xyz_to_lonlat(mesh.points)
     spacing, edges, length = node_spacing_m(mesh)
+    r = 0.5 * box_factor * spacing
     if cache is None:
-        ssum, scnt = box_means(lon, lat, 0.5 * spacing, Path(path), variable, band_rows)
+        ssum, scnt = box_means(lon, lat, r, Path(path), variable, band_rows)
     else:
-        ssum, scnt, n_read = cached_box_means(lon, lat, 0.5 * spacing, Path(path), Path(cache), variable, band_rows)
+        ssum, scnt, n_read = cached_box_means(lon, lat, r, Path(path), Path(cache), variable, band_rows)
     known = scnt > 0
     raw = np.where(known, -ssum / np.maximum(scnt, 1), 0.0)
     depth, rings, left = fill_from_neighbours(raw, known, edges, length, min_depth_m)
     shallow = depth < min_depth_m
     depth = np.maximum(depth, min_depth_m)
     info = {"source": str(path), "variable": variable, "min_depth_m": min_depth_m, "n_nodes": int(mesh.n_nodes),
-            "box_half_width_m": {"min": float(0.5 * spacing.min()), "median": float(0.5 * np.median(spacing)),
-                                 "max": float(0.5 * spacing.max())},
+            "box_factor": float(box_factor),
+            "box_half_width_m": {"min": float(r.min()), "median": float(np.median(r)), "max": float(r.max())},
             "cells_per_box_median": float(np.median(scnt[known])) if known.any() else 0.0,
             "n_without_ocean_cell": int((~known).sum()), "fill_rings": rings, "n_fallback": left,
             "n_raised_to_min_depth": int(shallow.sum()),

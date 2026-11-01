@@ -83,7 +83,8 @@ docs/config.md has the full description and an example. Tables (units: metres, k
               of elevation, positive up, such as GEBCO 2024), variable ("elevation"), min_depth_m (10: shallower
               wet nodes are set to it), depth_at ("node": depth per node, the mean of the grid's ocean cells in the
               node's control cell, meshom.bathymetry; "cells_deepest": per element the mean of its ocean cells, a
-              node the deepest of its elements, FESOM3's ORCA rule, B103), levels (the FESOM2 level surfaces zbar, metres: a list, a named
+              node the deepest of its elements, FESOM3's ORCA rule, B103), box_factor (1: the "node" box's side in
+              node mean edges, B222), levels (the FESOM2 level surfaces zbar, metres: a list, a named
               set, default "core2" = the 48 CORE2 levels, or a file with nl then nl values such as an aux3d.out),
               min_layers (4: fesom2 / fesom3 depth >= zbar[4] = 30 m), smooth_passes (0 = off), max_slope (0 = off),
               carve_taper (1: the strait floors' cosine taper in strait h_m; meshom.bathymetry.depth_policy)
@@ -442,6 +443,7 @@ class BathymetryCfg:
     variable: str = "elevation"                        # GEBCO's name; ocean = value < 0
     min_depth_m: float = 10.0                          # wet nodes shallower than this get it (fesom2_mesh_gen: 10 m)
     depth_at: str = "node"                             # "node" (box mean per node) | "cells_deepest" (B103)
+    box_factor: float = 1.0                            # "node": the box's side in node mean edges (B222; 2 = 4x area)
     levels: list | str = "core2"                       # FESOM2 level surfaces (m, positive down): a list, a named set
                                                        # (meshom.bathymetry.LEVEL_SETS) or a file (nl, then nl values)
     min_layers: int = 4                                # fesom2 / fesom3: depth >= zbar[min_layers] (CORE2: 30 m), the

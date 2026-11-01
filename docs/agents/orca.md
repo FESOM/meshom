@@ -107,6 +107,11 @@ ocean-connected water kept (B170).
 - In a meshom run: `[mesh.opts] mask = "fesom3"`, `levels_dir`; the ORCA nodes then get FESOM3's depths in the
   run's bathymetry stage (B94). For the meshom part `[bathymetry] depth_at = "cells_deepest"` keeps narrow straits at
   their cells' depth (B103).
+- **GEBCO depth on every node** (`[mesh.opts] depth = "gebco"`, B221): FESOM3's mask and cells, but no node takes
+  NEMO's depth; every node keeps the run's `[bathymetry]` rules, so give them: `depth_at = "node"` (the box mean per
+  node), `smooth_passes = 0`, `box_factor` (1; 2 = a box of 4 times the area, smoother), the strait depth floors of
+  the run's straits on (they keep a strait one or two cells wide open), the floor and the regions. Only the depth
+  changes: write the saved mesh again with `meshom write` instead of a new run.
 
 ## Check the result
 
@@ -119,7 +124,7 @@ ocean-connected water kept (B170).
 ## Config keys used
 
 - `[mesh]`: `method`, `format`, `fesom3_ini`, `optimize`
-- `[mesh.opts]` `m16_orca`: `orca`, `lat_south`, `lat_north`, `region`, `fine_orca`, `fine_lat`, `transition`, `ladder_lat`, `nest`, `mask`, `ref_dir`, `levels_dir`, `gebco`, `keep_seas`, `cap_method`, `cap_opts`, `size_tolerance`
+- `[mesh.opts]` `m16_orca`: `orca`, `lat_south`, `lat_north`, `region`, `fine_orca`, `fine_lat`, `transition`, `ladder_lat`, `nest`, `mask`, `depth`, `ref_dir`, `levels_dir`, `gebco`, `keep_seas`, `cap_method`, `cap_opts`, `size_tolerance`
 - `[mesh.opts]` `m14_blocks_rep`: `place_region`, `max_blocks`, `b_cap`, `auto_blocks`, `strait_blocks`
 - `[coast]`: `treatment`, `min_area_km2`, `passage_min_cells`, `straits`, `strait_profile`
 - `[[size.layers]]` `latitude`: `h_m`, `h_min_m`

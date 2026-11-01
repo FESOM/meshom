@@ -74,6 +74,8 @@ DEFAULTS = dict(
                               # the box mean per node (no smoothing, no strait floor), with depth_channel ("near",
                               # "cells") and sill_level ("grid", "shallower") as an insert's (nest_depth)
     mask="nemo",              # B82: NEMO's mask ("nemo"), FESOM3's rules ("fesom3", B94), or "all" (every cell)
+    depth="nemo",             # B221: "nemo" = the ORCA nodes FESOM3's depth with mask "fesom3" (B94, run.py
+                              # _method_node_depth); "gebco" = every node the run's [bathymetry] rules
     ref_dir=None,             # the reference npz (scripts/grids/orca_refs_npz.py); None: $MESHOM_ORCA_REFS
     levels_dir=None,          # B91: NEMO's levels npz (orca_levels_npz.py, nemo_inputs_npz.py); $MESHOM_ORCA_LEVELS
     gebco=None,               # B83: the depth rule's grid (None: the rule cannot run)
@@ -235,7 +237,7 @@ def node_depth(run_dir: Path, mesh: Mesh) -> tuple[np.ndarray, np.ndarray] | Non
     """FESOM3's node depth on the ORCA nodes of a run's final mesh (B94, rule 6: the deepest of the four T cells' NEMO
     levels, as the layer bottom z_k): (mesh node ids, depth m). None when the run's ORCA part has no levels (mask not
     "fesom3"). The run's bathymetry stage gives these nodes this depth in place of the GEBCO one (meshom.run
-    mesh_depth's hook; the nodes match the ORCA part's by position, JOINT_TOL)."""
+    mesh_depth's hook; the nodes match the ORCA part's by position, JOINT_TOL); not with `depth = "gebco"` (B221)."""
     f = Path(run_dir) / "orca_belt.npz"
     if not f.exists():
         return None

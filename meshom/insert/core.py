@@ -911,7 +911,10 @@ def rule_depth(sub: Mesh, ins: np.ndarray, base: np.ndarray, cfg, fmt: str, stra
     rec = {}
     floor = runmod.depth_floor_m(cfg, fmt)
     at = depth_at or b.depth_at
-    d, info = (cells_deepest_depth if at == "cells_deepest" else node_depth)(sub, Path(b.source), b.variable, floor)
+    if at == "cells_deepest":
+        d, info = cells_deepest_depth(sub, Path(b.source), b.variable, floor)
+    else:                                                     # the run's box factor (B222)
+        d, info = node_depth(sub, Path(b.source), b.variable, floor, box_factor=b.box_factor)
     grid = None
     grid_like = sill_level in ("grid", "nearest")         # B249: "nearest", the dam at the nearest level
     if depth_quantile > 0 or depth_channel or grid_like:

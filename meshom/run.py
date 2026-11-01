@@ -468,8 +468,9 @@ def _worker(spec_json: str) -> None:
 
 def _method_node_depth(cfg: Config, run_dir: Path, mesh: Mesh, depth: np.ndarray) -> np.ndarray:
     """The depth with the method's own node depths where it has them: m16_orca with mask "fesom3" gives its ORCA
-    nodes FESOM3's depth (the deepest of the four cells' NEMO levels, B94), in place of the GEBCO one."""
-    if cfg.mesh.method != "m16_orca":
+    nodes FESOM3's depth (the deepest of the four cells' NEMO levels, B94), in place of the GEBCO one; with
+    `[mesh.opts] depth = "gebco"` (B221) it does not, and every node keeps the run's [bathymetry] depth."""
+    if cfg.mesh.method != "m16_orca" or cfg.mesh.opts.get("depth", "nemo") == "gebco":
         return depth
     from meshom.methods.m16_orca import node_depth
 
@@ -515,8 +516,10 @@ def mesh_depth(mesh: Mesh, cfg: Config, fmt: str, straits: list, meta: dict | No
         return np.full(mesh.n_nodes, PLACEHOLDER_DEPTH_M)
     meta = {} if meta is None else meta
     floor = depth_floor_m(cfg, fmt)
-    rule = cells_deepest_depth if b.depth_at == "cells_deepest" else node_depth       # B103
-    depth, info = rule(mesh, Path(b.source), b.variable, floor, cache=cache)
+    if b.depth_at == "cells_deepest":                                                # B103
+        depth, info = cells_deepest_depth(mesh, Path(b.source), b.variable, floor, cache=cache)
+    else:                                                                             # O16; box_factor: B222
+        depth, info = node_depth(mesh, Path(b.source), b.variable, floor, cache=cache, box_factor=b.box_factor)
     meta.update(info)
     depth, meta["policy"] = depth_policy(mesh, depth, floor, b.smooth_passes, b.max_slope, straits, b.carve_taper)
     return depth
@@ -525,9 +528,10 @@ def mesh_depth(mesh: Mesh, cfg: Config, fmt: str, straits: list, meta: dict | No
 def model_depth(mesh: Mesh, cfg: Config, fmt: str, straits: list, run_dir: Path, meta: dict | None = None,
                 cache: Path | None = None) -> np.ndarray:
     """The node depth of the model files before any node edit (decisions O35): mesh_depth (box mean or
-    cells_deepest, depth_policy), the method's own node depths (_method_node_depth and _nest_depth, B216, with a
-    source), then the [[bathymetry.regions]] rules in file order at the run's floor (bathymetry.apply_regions;
-    `meta["regions"]`: one record per region). The run's bathymetry stage and write_mesh both use it."""
+    cells_deepest, depth_policy), the method's own node depths (_method_node_depth, off with m16_orca's
+    `depth = "gebco"`, B221; _nest_depth, B216; with a source), then the [[bathymetry.regions]] rules in file order
+    at the run's floor (bathymetry.apply_regions; `meta["regions"]`: one record per region). The run's bathymetry
+    stage and write_mesh both use it."""
     from meshom.bathymetry import apply_regions
 
     meta = {} if meta is None else meta

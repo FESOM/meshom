@@ -44,7 +44,9 @@ docs/config.md has the full description and an example. Tables (units: metres, k
               bank_sigma_h, width_km and band_km (strip, corridor), ljoins, cells_a / cells_b, growth_a / growth_b,
               bank_land_cells (B200-B202), fill, fill_rows (B204), corner_steps (B206), add_columns (B207),
               corner_split (B208), join_margin (B209), fix_rings (B210), depth_at, depth_smooth, strait_floor
-              (B211), sill_level (B212, B215), depth_channel (B213), depth_quantile (B214), depth_area (B250)
+              (B211), sill_level (B212, B215), depth_channel (B213), depth_quantile (B214), depth_area
+              (B250); kind "depth": a depth region, the mesh unchanged (width_km round the path, or
+              polygon; B223)
               (meshom.config.InsertCfg)
     [size]    grad_max (|grad h| limit of the gradient limiter, default 0.1; inf = no limiting), h_min_m / h_max_m
               (optional global clip), preview_deg (UI preview grid), limiter_max_nodes (grid size cap), from (an h
@@ -242,8 +244,9 @@ class InsertCfg:
                                                        # bay, B166) | false (none: all bridged)
     kind: str = "strait"                               # "strait" | "strip" (a coastal strip: path along the coast)
                                                        # | "corridor" (open water: path = the axis) (B181, B182;
-                                                       # both experimental)
-    width_km: float | None = None                      # strip: coast to the offshore join; corridor: full width
+                                                       # both experimental) | "depth" (a depth region: the host nodes
+                                                       # take the GEBCO rule, the mesh unchanged; B223)
+    width_km: float | None = None                      # strip: coast to the offshore join; corridor, depth: full width
     band_km: float | None = None                       # strip / corridor: width of the fine band (default: what the
                                                        # room left after the growth to the host size, B181)
     ljoins: bool = True                                # L-shaped joins round a cape when no straight join passes
@@ -300,6 +303,8 @@ class InsertCfg:
     depth_area: bool = False                           # the insert's nodes scaled so that each section across
                                                        # the strait has the grid's wet area in FESOM3's element
                                                        # bottoms (after the other own rules; the dam kept, B250)
+    polygon: list = field(default_factory=list)       # kind "depth": the region [[lon, lat], ...] (great-circle
+                                                       # edges) instead of width_km round the path (B223)
 
 
 @dataclass

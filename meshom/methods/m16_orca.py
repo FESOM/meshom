@@ -270,58 +270,27 @@ def nest_box_nodes(run_dir: Path, mesh: Mesh) -> np.ndarray | None:
     return polygon_inside(mesh.points, loop) & ~np.isfinite(d)
 
 
-def _canonical(e: np.ndarray) -> np.ndarray:
-    """Elements in an order of their own: each turned to start at its smallest node id (orientation kept), the rows
-    sorted."""
-    if not len(e):
-        return e
-    k = e.shape[1]
-    e = np.take_along_axis(e, (np.argmin(e, axis=1)[:, None] + np.arange(k)) % k, axis=1)
-    return e[np.lexsort(e.T[::-1])]
-
-
 def nest_depth(run_dir: Path, mesh: Mesh, depth: np.ndarray, cfg, fmt: str, log=print) -> tuple[np.ndarray, dict]:
     """B216, `nest.depth = "gebco"`: the nodes strictly inside the nest's coarse box (nest_box_nodes) take meshom's
-    grid rule as an insert's own nodes do (meshom.insert.core.rule_depth, B211): the box mean per node, no smoothing,
+    grid rule as an insert's own nodes do (meshom.insert.core.region_depth, B211): the box mean per node, no smoothing,
     no strait depth floor, the run's slope limiter, the depth floor and the regions; with `nest.depth_channel` the
     channel raise (B213; the line's ends: the deepest node of each of the two largest wet pieces of the box's edge;
     box means at the median spacing of the box's nodes) and with `nest.sill_level` the sill (B212 / B215). Computed on
     the box's cells and one cell ring round them, nodes ordered by position and cells by their nodes, so the depth is
     the same in every mesh that holds the box's cells (an insert elsewhere recomputes it exactly). Every other node
     keeps `depth`. Returns (depth, record)."""
-    from meshom.insert.core import rule_depth
+    from meshom.insert.core import region_depth
 
     o = cfg.mesh.opts.get("nest") or {}
     inside = nest_box_nodes(run_dir, mesh)
     if inside is None or not inside.any():
         return depth, {"nodes": 0}
-    T = mesh.n_tris
-
-    def cells_of(nodes):
-        return np.r_[nodes[mesh.tris].any(1) if T else np.zeros(0, bool), nodes[mesh.quads].any(1)]
-
-    near = np.zeros(mesh.n_nodes, bool)
-    c = cells_of(inside)
-    near[mesh.tris[c[:T]].ravel()] = True
-    near[mesh.quads[c[T:]].ravel()] = True
-    c = cells_of(near)                                        # the box's cells and one ring round them
-    wid = np.unique(np.r_[mesh.tris[c[:T]].ravel(), mesh.quads[c[T:]].ravel()])
-    wid = wid[np.lexsort(mesh.points[wid].T[::-1])]
-    loc = np.full(mesh.n_nodes, -1, np.int64)
-    loc[wid] = np.arange(len(wid))
-    sub = Mesh(mesh.points[wid], _canonical(loc[mesh.tris[c[:T]]].reshape(-1, 3)),
-               _canonical(loc[mesh.quads[c[T:]]].reshape(-1, 4)), np.zeros(len(wid), np.int8))
-    ins = inside[wid]
-    d, rec = rule_depth(sub, ins, depth[wid], cfg, fmt, None, depth_at="node", depth_smooth=0, strait_floor=False,
-                        sill_level=str(o.get("sill_level") or ""), depth_channel=str(o.get("depth_channel") or ""),
-                        tag="[nest]", log=log)
-    out = np.array(depth, dtype=np.float64)
-    out[wid[ins]] = d[ins]
-    rec["change_m"] = {"min": float((d - depth[wid])[ins].min()), "max": float((d - depth[wid])[ins].max())}
-    log(f"[nest] depth of the {int(ins.sum())} nodes inside the coarse box: the box mean per node, no smoothing, no "
+    out, rec = region_depth(mesh, inside, depth, cfg, fmt, str(o.get("depth_channel") or ""),
+                            str(o.get("sill_level") or ""), "[nest]", log)
+    log(f"[nest] depth of the {int(inside.sum())} nodes inside the coarse box: the box mean per node, no smoothing, no "
         f"strait floor{', channel ' + o['depth_channel'] if o.get('depth_channel') else ''}"
-        f"{', sill ' + o['sill_level'] if o.get('sill_level') else ''}: {d[ins].min():.0f}-{d[ins].max():.0f} m "
-        f"(before: {depth[wid][ins].min():.0f}-{depth[wid][ins].max():.0f} m)", flush=True)
+        f"{', sill ' + o['sill_level'] if o.get('sill_level') else ''}: {out[inside].min():.0f}-{out[inside].max():.0f} m "
+        f"(before: {np.asarray(depth)[inside].min():.0f}-{np.asarray(depth)[inside].max():.0f} m)", flush=True)
     return out, rec
 
 

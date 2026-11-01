@@ -44,8 +44,8 @@ class Spec:
     coast_source: str = ""                   # B164: another coast shapefile for the banks ("" = the run's)
     bank_sigma_cells: float = 1.5            # B164: real-bank smoothing in local insert cells
     bays: bool | str = "auto"                # B166 / B190: bays as blocks of their own: "auto" (large), True, False
-    kind: str = "strait"                     # B181 / B182: "strait", "strip" or "corridor"
-    width_m: float | None = None             # strip: coast to offshore join; corridor: full width
+    kind: str = "strait"                     # B181 / B182: "strait", "strip" or "corridor"; B223: "depth"
+    width_m: float | None = None             # strip: coast to offshore join; corridor, depth: full width
     band_m: float | None = None              # strip / corridor: the fine band's width (None: what the room leaves)
     ljoins: bool = True                      # B183: L-joins round a cape when no straight join passes
     rows: str = "harmonic"                   # B195-B198: a strip's rows: "harmonic" (a harmonic map) | "offset" (B181)
@@ -70,6 +70,7 @@ class Spec:
     depth_channel: str = ""                  # B213: "cells" | "near": the grid's deepest channel raises the insert
     depth_quantile: float = 0.0              # B214: the node box's quantile instead of its mean (0: the mean)
     depth_area: bool = False                 # B250: the sections' areas scaled to the grid's
+    polygon: np.ndarray | None = None        # B223: kind "depth": the region (K,3) instead of width_m round the path
 
 
 @dataclass
@@ -105,9 +106,14 @@ def spec_from(cfg_entry, cfg=None) -> Spec:
 
     e = cfg_entry
     path = _ll(e.path)
-    if e.kind != "strait":
+    if e.kind not in ("strait", "depth"):
         if path is None or e.width_km is None:
             raise InsertError(f"an insert of kind {e.kind!r} needs a path and width_km")
+    if e.kind == "depth" and e.width_km is None and not e.polygon:
+        raise InsertError("an insert of kind 'depth' needs width_km (the region's full width round its path) or a "
+                          "polygon")
+    if e.kind == "depth" and path is None and not e.strait and e.polygon:
+        path = _ll(e.polygon)                                # the record's path: the polygon's outline
     if path is None and e.strait:
         own = [s for s in (cfg.straits if cfg is not None else []) if s.name == e.strait and s.path]
         lists = [cfg.coast.straits] if cfg is not None and cfg.coast.straits != "none" else []
@@ -130,7 +136,7 @@ def spec_from(cfg_entry, cfg=None) -> Spec:
                 e.coast_shift_cells, e.cells_a, e.cells_b, e.growth_a, e.growth_b, e.bank_land_cells,
                 [_ll(f) for f in e.fill], e.fill_rows, e.corner_steps, e.add_columns, e.corner_split, e.join_margin,
                 e.fix_rings, e.depth_at, e.depth_smooth, e.strait_floor, e.sill_level, e.depth_channel,
-                e.depth_quantile, e.depth_area)
+                e.depth_quantile, e.depth_area, _ll(e.polygon))
 
 
 def _path_frame(path: np.ndarray):
@@ -1053,6 +1059,120 @@ def sill_shallower(sub: Mesh, depth: np.ndarray, ins: np.ndarray, zbar: np.ndarr
                  "cut_max_m": float((depth - out).max()), "nodes_star": int(nb.sum())}
 
 
+REGION_STEP_M = 1000.0       # B223: a depth region's path is densified to this spacing for the distance to it
+
+
+def _canonical(e: np.ndarray) -> np.ndarray:
+    """Elements in an order of their own: each turned to start at its smallest node id (orientation kept), the rows
+    sorted."""
+    if not len(e):
+        return e
+    k = e.shape[1]
+    e = np.take_along_axis(e, (np.argmin(e, axis=1)[:, None] + np.arange(k)) % k, axis=1)
+    return e[np.lexsort(e.T[::-1])]
+
+
+def region_depth(mesh: Mesh, inside: np.ndarray, depth: np.ndarray, cfg, fmt: str, depth_channel: str = "",
+                 sill_level: str = "", tag: str = "", log=print) -> tuple[np.ndarray, dict]:
+    """B216, B223: the nodes `inside` take an insert's own grid rule (rule_depth, B211): the box mean per node, no
+    smoothing, no strait depth floor, the run's slope limiter, the depth floor and the regions; with `depth_channel`
+    the channel raise (B213) and with `sill_level` the sill (B215 / B212), the channel line between the two largest
+    pieces of the other nodes of their cells (B218). Computed on their cells and one cell ring round them, nodes
+    ordered by position and cells by their nodes, so the depth is the same in every mesh that holds those cells.
+    Every other node keeps `depth`. Returns (depth, record)."""
+    T = mesh.n_tris
+
+    def cells_of(nodes):
+        return np.r_[nodes[mesh.tris].any(1) if T else np.zeros(0, bool), nodes[mesh.quads].any(1)]
+
+    near = np.zeros(mesh.n_nodes, bool)
+    c = cells_of(inside)
+    near[mesh.tris[c[:T]].ravel()] = True
+    near[mesh.quads[c[T:]].ravel()] = True
+    c = cells_of(near)                                        # the cells of `inside` and one ring round them
+    wid = np.unique(np.r_[mesh.tris[c[:T]].ravel(), mesh.quads[c[T:]].ravel()])
+    wid = wid[np.lexsort(mesh.points[wid].T[::-1])]
+    loc = np.full(mesh.n_nodes, -1, np.int64)
+    loc[wid] = np.arange(len(wid))
+    sub = Mesh(mesh.points[wid], _canonical(loc[mesh.tris[c[:T]]].reshape(-1, 3)),
+               _canonical(loc[mesh.quads[c[T:]]].reshape(-1, 4)), np.zeros(len(wid), np.int8))
+    ins = inside[wid]
+    d, rec = rule_depth(sub, ins, depth[wid], cfg, fmt, None, depth_at="node", depth_smooth=0, strait_floor=False,
+                        sill_level=sill_level, depth_channel=depth_channel, tag=tag, log=log)
+    out = np.array(depth, dtype=np.float64)
+    out[wid[ins]] = d[ins]
+    rec["change_m"] = {"min": float((d - depth[wid])[ins].min()), "max": float((d - depth[wid])[ins].max())}
+    return out, rec
+
+
+def depth_region_nodes(mesh: Mesh, path: np.ndarray, width_m: float | None,
+                       polygon: np.ndarray | None = None) -> np.ndarray:
+    """B223: (N,) bool, the nodes of `mesh` inside the polygon (great-circle edges, meshom.size.polygon_inside), else
+    those within width_m / 2 of the path (the great-circle distance to its points densified every REGION_STEP_M)."""
+    from meshom import straits as stm
+
+    if polygon is not None:
+        from meshom.size import polygon_inside
+
+        return polygon_inside(mesh.points, polygon)
+    p = stm.densify(path, REGION_STEP_M)
+    d, _ = cKDTree(p).query(mesh.points, distance_upper_bound=2.0 * np.sin(0.25 * width_m / R_EARTH_M) + 1e-12)
+    return np.isfinite(d)
+
+
+def depth_run(run_dir: Path, spec: Spec, cfg, mesh: Mesh, src: Path, straits: list, out_dir: Path, write: bool,
+              log=print) -> dict:
+    """B223, kind = "depth": no mesh change; the host nodes inside the polygon or within width_m / 2 of the path
+    (depth_region_nodes) take the nest's grid rule (region_depth: B211's box mean per node, no smoothing, no strait floor; the entry's
+    depth_channel, B213, and sill_level, B215 / B212), every other node keeps the host's depth (the run's rules,
+    meshom.run.model_depth, or the host mesh's own saved depth when it is an insert's result, B217). Writes
+    insert_<name>.npz (the host mesh), .host_to_new.npy (every node kept), .collar_moved.npy (none), .json (the
+    record: `region`, `depth`) and fesom-insert_<name>/depth.npy, with model files when the run wrote them."""
+    from meshom import compete
+    from meshom import run as runmod
+
+    fmt = cfg.mesh.format
+    stem = out_dir / f"insert_{spec.name}"
+    inside = depth_region_nodes(mesh, spec.path, spec.width_m, spec.polygon)
+    where = "inside the polygon" if spec.polygon is not None else f"{spec.width_m / 1e3:.0f} km wide round the path"
+    rec = {"run": str(run_dir), "mesh": str(src), "config": str(run_dir / "config.resolved.toml"), "kind": "depth",
+           "spec": {k: (v.tolist() if isinstance(v, np.ndarray) else v) for k, v in dataclasses.asdict(spec).items()
+                    if k not in ("path", "polygon")} | {"path_lonlat": np.c_[xyz_to_lonlat(spec.path)].T.tolist()},
+           "region": {"nodes": int(inside.sum()), "where": where,
+                      "width_km": spec.width_m / 1e3 if spec.polygon is None else None,
+                      "polygon": None if spec.polygon is None else np.c_[xyz_to_lonlat(spec.polygon)].round(4).tolist()}}
+    if not inside.any():
+        rec.update(status="refused", reason=f"no host node {where}")
+        stem.with_suffix(".json").write_text(json.dumps(_jsonable(rec), indent=1))
+        log(f"[insert {spec.name}] REFUSED: {rec['reason']}", flush=True)
+        return rec
+    depth = runmod.model_depth(mesh, cfg, fmt, straits, run_dir)
+    host = host_depth_of(src, mesh.n_nodes)
+    if host is not None:                                   # B217: a chain keeps the host mesh's own depth
+        depth = np.array(host, dtype=np.float64)
+        rec["host_depth"] = {"source": "the host mesh's own (an insert's result)", "nodes": int(mesh.n_nodes)}
+    out, rec["depth"] = region_depth(mesh, inside, depth, cfg, fmt, spec.depth_channel, spec.sill_level,
+                                     f"[insert {spec.name}]", log)
+    log(f"[insert {spec.name}] depth region {where}: {int(inside.sum())} "
+        f"host nodes by the grid rule{', channel ' + spec.depth_channel if spec.depth_channel else ''}"
+        f"{', sill ' + spec.sill_level if spec.sill_level else ''}: {out[inside].min():.0f}-{out[inside].max():.0f} m "
+        f"(before: {depth[inside].min():.0f}-{depth[inside].max():.0f} m); the mesh unchanged", flush=True)
+    compete._save(mesh, stem.with_suffix(".npz"))
+    np.save(stem.parent / (stem.name + ".host_to_new.npy"), np.arange(mesh.n_nodes, dtype=np.int64))
+    np.save(stem.parent / (stem.name + ".collar_moved.npy"), np.zeros((2, 0), np.int64))
+    fdir = out_dir / f"fesom-insert_{spec.name}"
+    fdir.mkdir(exist_ok=True)
+    np.save(fdir / "depth.npy", out)                       # after the mesh: B217's chain reads it
+    rec["status"] = "ok"
+    if write and (run_dir / "fesom").exists():
+        checks = runmod.write_files(mesh, fmt, fdir, out, cfg.bathymetry.levels)
+        rec["write"] = {"format": fmt, "dir": str(fdir), "depth_min_m": float(out.min()),
+                        "depth_max_m": float(out.max()), **checks}
+        log(f"[insert {spec.name}] wrote {fmt} files to {fdir}: {checks}", flush=True)
+    stem.with_suffix(".json").write_text(json.dumps(_jsonable(rec), indent=1, default=str))
+    return rec
+
+
 def run(run_dir: Path, spec: Spec, out_dir: Path | None = None, mesh_name: str | None = None,
         write: bool = True, log=print) -> dict:
     """The insert in a finished run (module docstring): writes <out>/insert_<name>.npz, .json (the record),
@@ -1076,6 +1196,8 @@ def run(run_dir: Path, spec: Spec, out_dir: Path | None = None, mesh_name: str |
     mesh = compete._load(src)
     log(f"[insert {spec.name}] host {src} ({mesh.n_nodes} nodes)", flush=True)
     straits, h_run = run_inputs(run_dir, cfg, out_dir / "cache")
+    if spec.kind == "depth":                                 # B223: a depth region, the mesh unchanged
+        return depth_run(run_dir, spec, cfg, mesh, src, straits, out_dir, write, log)
     h_min, h_min_src = spec.h_min_m, "spec"
     if h_min is None:
         h_min, h_min_src = host_min_cell(mesh, src, out_dir / "cache"), "the host mesh's smallest cell"

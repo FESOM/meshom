@@ -16,6 +16,8 @@ none is made by default.
   grow back to the host's. Bays of the real coast inside the region get blocks of their own when large enough.
 - `kind = "strip"` (experimental): a band along a coast, from the coast out to an offshore host chain.
 - `kind = "corridor"` (experimental): a band along an axis in open water (a current).
+- `kind = "depth"`: no mesh change; the host's nodes in a region round a strait take the insert's GEBCO depth rule
+  ([Depth only](#depth-only-a-depth-region-on-the-plain-host)).
 
 ## Run one
 
@@ -56,7 +58,7 @@ h_min_m = 1000.0                   # the size floor (default: the host mesh's sm
 
 | key | default | meaning |
 |---|---|---|
-| `kind` | `"strait"` | `"strait"`, `"strip"`, `"corridor"` |
+| `kind` | `"strait"` | `"strait"`, `"strip"`, `"corridor"`, `"depth"` (B223) |
 | `strait` / `path` | | a listed strait, or the centreline (strait), coast line (strip), axis (corridor) |
 | `cells` / `h_fine_m` | 10 cells | cells across the neck, or the fine size (cells = round(W / h_fine_m)) (B159) |
 | `h_min_m` | the host's smallest cell | size floor: the insert never makes cells below it (B165) |
@@ -66,7 +68,8 @@ h_min_m = 1000.0                   # the size floor (default: the host mesh's sm
 | `bays` | `"auto"` | a bay with a mouth of at least 3 insert cells, reaching inland at least its mouth's width, gets its own block; smaller ones are bridged; `true`: every bay with a 2-cell mouth; `false`: none (B166, B190) |
 | `collar_rings` | 10 on meshom's meshes and triangle hosts, 0 on ORCA | host cells within this many element rings of the joins are cleaned with the insert's edge rows; 0 keeps every host node and cell (B192, B193) |
 | `coast`, `coast_source`, `bank_sigma_cells` | `"real"`, the run's coast, 1.5 | the banks follow the real coastline (never the host's staircase), smoothed over 1.5 fine cells (B164); a bank whose ends lie nearest to different coast pieces takes the piece that fits both ends and the host's bank; a bank still on the host's coast is listed in `bank_fallback` (B219) |
-| `width_km`, `band_km` | | strip: coast to the host chain; corridor: the full width; the fine band's width |
+| `width_km`, `band_km` | | strip: coast to the host chain; corridor: the full width; the fine band's width; depth: the region's full width round the path |
+| `polygon` | | depth: the region `[[lon, lat], ...]` (great-circle edges) instead of `width_km` round the path (B223) |
 | `rows` | `"harmonic"` | strip rows from a harmonic map of the band: they cannot cross (B195-B197); `"offset"` can fold and is then invalid |
 | `coast_rounds`, `coast_shift_cells` | 3, 1 | harmonic strips: extra coast smoothing round quads above 125°, moving the coast at most 1 fine cell (B198) |
 | `cells_a`, `cells_b` | any | strait: the join of side A / B has exactly this many host edges, the counts run monotonically from the neck to it (B200) |
@@ -212,9 +215,56 @@ basins 280 m (GEBCO 300 m), the element bottom 580 m at 5.60 W and 910 m at 5.45
 - a node's depth is shared by every cell round it, so a deepened channel one or two cells wide deepens its flank cells
   too: the section areas grow (B213).
 
+## Depth only: a depth region on the plain host
+
+Where the host already has enough cells across a strait but its depth is wrong there (sills a level too deep, section
+areas too large: an ORCA host's nodes take the deepest of their four NEMO cells' levels), `kind = "depth"` changes the
+depth only (B223): the host's nodes in a region round the strait take the grid rule of an insert's own nodes, as the
+nest's depth does inside its box (B216): the box mean per node, no smoothing, no strait depth floor, the run's slope
+limiter, the depth floor and the run's regions; with `depth_channel` the channel raise on the narrows (B213) and with
+`sill_level` the sill (B215, B212). Every other node keeps the host's depth (the run's rules, or on another insert's
+result its saved depth, B217). The mesh is not changed.
+
+```toml
+[[inserts]]
+name = "lancaster_depth"
+kind = "depth"
+strait = "Lancaster_Barrow"        # or path = [[lon, lat], ...]
+width_km = 160.0                   # the region: the nodes within width_km / 2 of the path
+
+[[inserts]]
+name = "nares_depth"
+kind = "depth"
+strait = "Nares"
+polygon = [[-77.4, 79.05], [-73.6, 80.1], [-68.0, 82.4], [-57.0, 81.35], [-62.5, 80.2], [-63.5, 79.3], [-69.3, 77.85]]
+depth_channel = "near"             # optional: the channel raise on the narrows
+```
+
+- **The region.** `width_km` round the path (ends included: round caps), or `polygon` (great-circle edges). The
+  channel line of `depth_channel` / `sill_level` runs between the two largest pieces of host nodes just outside the
+  region on its cells, so the region must cover the strait from coast to coast and leave it across the channel at
+  both ends: a polygon whose long sides lie on land and whose two short sides cross the channel. A wide buffer's caps
+  reach other water (Nares with 220 km: the north cap ended in a Greenland fjord, 827 m, whose 15 km mouth became the
+  narrows); check `depth.channel.ends` and `depth.channel.narrows` in the record. The box mean alone (no
+  `depth_channel`, no `sill_level`) does not depend on the region's shape.
+- **The sill.** `sill_level = "grid"` holds the grid's saddle at the deepest level not below its depth: at Nares
+  (saddle 224 m, levels 190 and 230 m) that is 190 m, a level shallower than the nearest level (230 m) the box mean
+  gives without it.
+- **Outputs.** `insert_<name>.npz` (the host mesh), `.host_to_new.npy` (every node kept), `.collar_moved.npy` (none),
+  `insert_<name>.json` (`region`: the nodes and the width or the polygon; `depth`: the rule's record) and
+  `fesom-insert_<name>/depth.npy`, with model files when the run wrote them.
+
+Nares and Lancaster Sound on ORCA025 v5 (its ORCA12 part, 6 and 10 cells across the narrowest sections; areas in
+FESOM3's element bottoms against GEBCO 2024 in FESOM3's levels on the same sections): Nares (the box mean, a 220 km
+buffer or a polygon like the one above: its two short sides cross Smith Sound and Robeson Channel) at Kennedy Channel 10.91 -> 7.79 km^2 (GEBCO 7.08), at the Kane Basin sill section
+29.56 -> 24.76 km^2 (25.52), the deepest connection 230 m before and after (GEBCO 225 m, level 230 m); Lancaster
+(the box mean, 160 km round the list's path) at the narrowest section 4.28 -> 3.27 km^2 (2.97), at the sill section
+41.84 -> 39.14 km^2 (35.59), the deepest connection 135 -> 115 m (GEBCO 120 m, level 115 m).
+
 ## Config keys used
 
 - `[[inserts]]`: `name`, `kind`, `strait`, `path`, `cells`, `h_fine_m`, `h_min_m`, `reach_km`, `mouth_a`, `mouth_b`, `ljoins`, `bays`, `collar_rings`, `coast`, `coast_source`, `bank_sigma_cells`, `width_km`, `band_km`, `rows`, `coast_rounds`, `coast_shift_cells`, `cells_a`, `cells_b`, `growth_a`, `growth_b`, `bank_land_cells`, `fill`, `fill_rows`, `corner_steps`, `corner_split`, `join_margin`, `add_columns`, `fix_rings`, `depth_at`, `depth_smooth`, `strait_floor`, `sill_level`, `depth_channel`, `depth_quantile`, `depth_area`, `stages`, `force`
+- `[[inserts]]`: `name`, `kind`, `strait`, `path`, `cells`, `h_fine_m`, `h_min_m`, `reach_km`, `mouth_a`, `mouth_b`, `ljoins`, `bays`, `collar_rings`, `coast`, `coast_source`, `bank_sigma_cells`, `width_km`, `band_km`, `rows`, `coast_rounds`, `coast_shift_cells`, `cells_a`, `cells_b`, `growth_a`, `growth_b`, `bank_land_cells`, `fill`, `fill_rows`, `corner_steps`, `corner_split`, `join_margin`, `add_columns`, `fix_rings`, `depth_at`, `depth_smooth`, `strait_floor`, `sill_level`, `depth_channel`, `depth_quantile`, `polygon`, `stages`, `force`
 
 ## Sources
 
@@ -225,3 +275,4 @@ basins 280 m (GEBCO 300 m), the element bottom 580 m at 5.60 W and 910 m at 5.45
 - Docs: [`docs/config.md` "`[[inserts]]`"](../config.md#inserts-python--m-meshominsert), `docs/examples/inserts.toml`,
   `docs/examples/inserts_gulf_stream.toml`.
 - Decisions: B158-B169, B180-B186, B190, B192-B220, B250.
+- Decisions: B158-B169, B180-B186, B190, B192-B223.

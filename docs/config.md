@@ -664,7 +664,7 @@ B91).
 ### `[[inserts]]` (`python -m meshom.insert`)
 
 Curvilinear inserts are fitted into a finished run afterwards (`python -m meshom.insert --run RUN_DIR --config
-FILE.toml`), not by `meshom run` (decisions B158-B169, B180-B186, B190-B212). `kind = "strait"` (default): a strait
+FILE.toml`), not by `meshom run` (decisions B158-B169, B180-B186, B190-B223). `kind = "strait"` (default): a strait
 (`strait` or `path`, `cells` or `h_fine_m`, `reach_km`, join hints `mouth_a` / `mouth_b`, `ljoins`); refused inserts say
 which rule fails and which cell counts both sides accept. The banks follow the real coast (`coast = "real"`, default);
 when a bank's two ends lie nearest to different pieces of it (an island near one end), the piece is chosen for both
@@ -728,8 +728,14 @@ them; `rows = "offset"` keeps the earlier offset curves for comparison (they can
 such a result is invalid: no model files). The strip's coast is the real coast smoothed at `bank_sigma_cells` fine
 cells; where quads next to it keep a corner above 125 deg the coast is smoothed more there and the band rebuilt, at
 most `coast_rounds` times (default 3), moving the coast at most `coast_shift_cells` fine cells (default 1). Corridors
-use the offset rows. The general recipe with examples of each kind: `docs/examples/inserts.toml`; bands:
-`docs/examples/inserts_gulf_stream.toml`.
+use the offset rows. `kind = "depth"` changes no cell (B223): the host's nodes within `width_km` / 2 of the path
+(`strait` or `path`), or inside `polygon = [[lon, lat], ...]` (great-circle edges), take the grid rule of an insert's
+own nodes as the nest's depth does (B216: the box mean per node, no smoothing, no strait depth floor, with
+`depth_channel` and `sill_level` as above, the channel line between the two largest pieces of host nodes just outside
+the region on its cells); every other node keeps the host's depth (the run's rules, or an insert's saved depth, B217);
+written: `insert_<name>.npz` (the host mesh), `insert_<name>.json` (`region`, `depth`) and
+`fesom-insert_<name>/depth.npy`, with model files when the run wrote them. The general recipe with examples of each
+kind: `docs/examples/inserts.toml`; bands: `docs/examples/inserts_gulf_stream.toml`.
 
 ### `[gates]`
 

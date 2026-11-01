@@ -950,3 +950,80 @@ def test_depth_area_skipped_without_an_axis_and_read_from_the_config(strait):
     ax = insert_axis(res)
     assert np.allclose(ax, ch.inv(xy[2:8]))
     assert insert_axis(SimpleNamespace(profile=None, chart=ch, joins=[])) is None
+# ------------------------------------------------------------------------------------------------ B223
+
+@pytest.fixture(scope="module")
+def depth_run_dir(strait, nest_run, tmp_path_factory):
+    """A run folder of the nest_run's lattice mesh (raw.npz; config.resolved.toml on the strait's grid, 4 smoothing
+    passes, a constant size layer, no model files)."""
+    from meshom import compete, config
+
+    d = tmp_path_factory.mktemp("depth_run")
+    m = nest_run[1]
+    compete._save(m, d / "raw.npz")
+    cfg = _cfg(strait[0], smooth_passes=4)
+    cfg = dataclasses.replace(cfg, size=dataclasses.replace(cfg.size, layers=[config.ConstantLayer(h_m=2800.0)]))
+    config.save(cfg, d / "config.resolved.toml")
+    return d, m
+
+
+def _depth_entry(**kw):
+    from meshom.config import InsertCfg, _build
+
+    return _build(InsertCfg, {"name": "dep", "kind": "depth", "path": [[-0.6, 0.0], [0.6, 0.0]], "width_km": 20.0}
+                  | kw, "insert")
+
+
+def test_depth_region_on_the_plain_host(strait, depth_run_dir, tmp_path):
+    """B223: kind = "depth" leaves the mesh as it is; the host nodes within width_km / 2 of the path (or inside the
+    polygon) take the nest's grid rule (the box mean per node, no smoothing, no strait floor, at least the floor; with
+    depth_channel the raise on the narrows and with sill_level the dam at the grid's saddle), every other node keeps
+    the run's depth (on an insert's result its saved depth); insert_<name>.npz is the host mesh,
+    fesom-insert_<name>/depth.npy the depth."""
+    from meshom import compete
+    from meshom.bathymetry import node_depth
+    from meshom.config import load
+    from meshom.insert.core import region_depth, run, spec_from
+    from meshom.run import model_depth
+
+    nc = strait[0]
+    d, m = depth_run_dir
+    cfg = load(d / "config.resolved.toml")
+    lo, la = xyz_to_lonlat(m.points)
+    off = np.maximum(np.abs(lo) - 0.6, 0.0)                     # the distance to the path (on the equator), deg
+    inside = np.hypot(off, la) * np.radians(1.0) * R_EARTH_M <= 10e3
+    assert 0 < inside.sum() < m.n_nodes
+    run_d = model_depth(m, cfg, "fesom2", [], d)
+    box, _ = node_depth(m, nc, "elevation", 50.0)
+
+    rec = run(d, spec_from(_depth_entry(), cfg), tmp_path / "plain", log=QUIET)
+    assert rec["status"] == "ok" and rec["region"]["nodes"] == inside.sum()
+    out = compete._load(tmp_path / "plain" / "insert_dep.npz")
+    assert np.array_equal(out.points, m.points) and np.array_equal(out.quads, m.quads)
+    assert np.array_equal(np.load(tmp_path / "plain" / "insert_dep.host_to_new.npy"), np.arange(m.n_nodes))
+    dep = np.load(tmp_path / "plain" / "fesom-insert_dep" / "depth.npy")
+    assert np.array_equal(dep[~inside], run_d[~inside])
+    assert np.array_equal(dep[inside], np.maximum(box[inside], 50.0)) and not np.allclose(dep[inside], run_d[inside])
+    assert rec["depth"]["rule"]["smooth_passes"] == 0 and rec["depth"]["rule"]["strait_floor"] is False
+
+    rec = run(d, spec_from(_depth_entry(depth_channel="near", sill_level="grid"), cfg), tmp_path / "chan", log=QUIET)
+    dep = np.load(tmp_path / "chan" / "fesom-insert_dep" / "depth.npy")
+    exp, _ = region_depth(m, inside, run_d, cfg, "fesom2", "near", "grid", log=QUIET)
+    assert np.array_equal(dep, exp) and np.array_equal(dep[~inside], run_d[~inside])
+    assert rec["depth"]["channel"]["raise"]["nodes_raised"] > 0 and rec["depth"]["sill"]["capped"] > 0
+
+    poly = [[-0.71, -0.09], [0.71, -0.09], [0.71, 0.09], [-0.71, 0.09]]      # a polygon instead of the path's width
+    rec = run(d, spec_from(_depth_entry(path=[], width_km=None, polygon=poly), cfg), tmp_path / "poly", log=QUIET)
+    dep = np.load(tmp_path / "poly" / "fesom-insert_dep" / "depth.npy")
+    inp = (np.abs(lo) < 0.71) & (np.abs(la) < 0.09)
+    assert rec["status"] == "ok" and rec["region"]["nodes"] == inp.sum() and rec["region"]["width_km"] is None
+    assert np.array_equal(dep[~inp], run_d[~inp]) and np.array_equal(dep[inp], np.maximum(box[inp], 50.0))
+
+    host = tmp_path / "chain"                                   # B217: on an insert's result its saved depth stays
+    (host / "fesom-insert_prev").mkdir(parents=True)
+    compete._save(m, host / "insert_prev.npz")
+    np.save(host / "fesom-insert_prev" / "depth.npy", np.full(m.n_nodes, 777.0))
+    rec = run(d, spec_from(_depth_entry(), cfg), host, str(host / "insert_prev.npz"), log=QUIET)
+    dep = np.load(host / "fesom-insert_dep" / "depth.npy")
+    assert rec["host_depth"]["nodes"] == m.n_nodes
+    assert (dep[~inside] == 777.0).all() and np.array_equal(dep[inside], np.maximum(box[inside], 50.0))

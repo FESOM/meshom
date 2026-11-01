@@ -7,6 +7,7 @@ size, a cleaned collar round the joins on irregular hosts and ORCA hosts kept as
     python -m meshom.insert --run RUN_DIR --config FILE.toml        (every [[inserts]] entry of FILE)
     python -m meshom.insert --run RUN_DIR --insert 'kind="strip"; path=[[lon, lat], ...]; width_km=60; h_fine_m=2000'
     python -m meshom.insert --run RUN_DIR --insert 'kind="corridor"; path=[[lon, lat], ...]; width_km=200; h_fine_m=5000'
+    python -m meshom.insert --run RUN_DIR --insert 'kind="depth"; strait="Lancaster_Barrow"; width_km=160'   (B223)
 
 In a region of interest a logically rectangular quad grid that zooms in (a "banana" grid) replaces the host's
 cells; on the two joins its nodes are the host's nodes, fixed, so the result conforms without hanging nodes. Any host

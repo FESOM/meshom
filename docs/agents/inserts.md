@@ -82,6 +82,7 @@ h_min_m = 1000.0                   # the size floor (default: the host mesh's sm
 | `sill_level` | `""` | `"shallower"`: the insert's sill gets the shallower of the two model levels round its depth (B212); `"grid"`: the grid's own saddle between the joins is held at the deepest level not below its depth by a dam of the insert's nodes (B215) |
 | `depth_channel` | `""` | the grid's deepest channel between the joins (box means at the fine size; its ends the deepest box means along the joins, or the deeper basin beyond a join too shallow for the strait, kept inside the insert, B218): `"cells"`: the insert's nodes of every cell it crosses take at least its box-mean depth there; `"near"`: the insert's nodes within one spacing of it take at least the box mean of their own box centred on it; both only on the strait's narrows (B213) |
 | `depth_quantile` | 0 | the insert's nodes take this quantile of the grid's ocean cells in their node box instead of the mean (B214) |
+| `depth_area` | false | after the other depth rules, the insert's nodes are scaled so that each section across the strait has the grid's wet area in FESOM3's element bottoms (the dam of `sill_level` kept; B250) |
 | `stages` | `"d,b,e,a"` | the clean-up stages on the join ring ([`cleanup.md`](cleanup.md); B162) |
 | `force` | false | build with the least-violating joins when none passes |
 
@@ -159,6 +160,18 @@ grid lines as they are. Choose in this order; the worked examples are the `gibra
    GEBCO). `depth_channel = "cells"` raises every node of the cells the channel crosses: deeper at the narrows (5.60 W
    680 m) with larger sections (+48 % at 5.75 W, +34 % at 5.60 W). `depth_quantile` (a quantile of the node box, B214)
    deepens the shelves as much as the channel; it is not part of the recipe.
+10. **The section areas.** A climate model needs each strait's cross-section about the real one's; the box means on
+   cells about as wide as the strait, banks moved into land (step 4) and the channel raise leave the sections larger
+   or smaller than the bathymetry's. `depth_area = true` scales the insert's own nodes after steps 8-9 so that every
+   section across the strait (every half fine cell along its centreline, on the strait's narrows, not in the open
+   basins) has the grid's raw wet area in FESOM3's element bottoms (fesom_ini's levels); the dam of
+   `sill_level = "grid"` and the cells along the channel line keep the sill and the deepest route, so use it with
+   steps 8-9. It changes depth only: the mesh is the same. It cannot make a section smaller than the depth floor
+   allows (FESOM3's minimum, 30 m with 4 CORE2 layers, times the mesh's width), nor than the channel's cells hold: a
+   shallow strait whose banks moved into land (Dover) and a strait with 3-4 cells across and its capes cut (Bab el
+   Mandeb: the channel's cells fill most of the section) stay larger than the bathymetry's (B250). Gibraltar: the
+   sections on its narrows off by 13 % on average -> 6.5 %, the section at 5.53 W 1.13 -> 0.95 x GEBCO, the deepest
+   connection 280 m before and after.
 
 Gibraltar with this recipe (the `gibraltar` entry): neck 14.7 km, smallest cell 2.51 km, worst quad 106 deg, 0 above
 110 deg, the insert's cells at most 0.93 x the host cell next to them; at 5.75 W 29 km wide (GEBCO 30 km), 5.0 km^2 in
@@ -201,13 +214,14 @@ basins 280 m (GEBCO 300 m), the element bottom 580 m at 5.60 W and 910 m at 5.45
 
 ## Config keys used
 
-- `[[inserts]]`: `name`, `kind`, `strait`, `path`, `cells`, `h_fine_m`, `h_min_m`, `reach_km`, `mouth_a`, `mouth_b`, `ljoins`, `bays`, `collar_rings`, `coast`, `coast_source`, `bank_sigma_cells`, `width_km`, `band_km`, `rows`, `coast_rounds`, `coast_shift_cells`, `cells_a`, `cells_b`, `growth_a`, `growth_b`, `bank_land_cells`, `fill`, `fill_rows`, `corner_steps`, `corner_split`, `join_margin`, `add_columns`, `fix_rings`, `depth_at`, `depth_smooth`, `strait_floor`, `sill_level`, `depth_channel`, `depth_quantile`, `stages`, `force`
+- `[[inserts]]`: `name`, `kind`, `strait`, `path`, `cells`, `h_fine_m`, `h_min_m`, `reach_km`, `mouth_a`, `mouth_b`, `ljoins`, `bays`, `collar_rings`, `coast`, `coast_source`, `bank_sigma_cells`, `width_km`, `band_km`, `rows`, `coast_rounds`, `coast_shift_cells`, `cells_a`, `cells_b`, `growth_a`, `growth_b`, `bank_land_cells`, `fill`, `fill_rows`, `corner_steps`, `corner_split`, `join_margin`, `add_columns`, `fix_rings`, `depth_at`, `depth_smooth`, `strait_floor`, `sill_level`, `depth_channel`, `depth_quantile`, `depth_area`, `stages`, `force`
 
 ## Sources
 
 - Code: `meshom/insert/` (`__main__.py` the command, `core.py`, `region.py` the rules, `block.py`, `band.py`,
   `harmonic.py`, `realcoast.py`, `network.py` the bays, `assemble.py` the collar, `measure.py`, `channel.py` the
-  channel depth rules), `meshom/config.py` (`InsertCfg`).
+  channel depth rules, `area.py` the section areas), `meshom/io/fesom.py` (`model_levels`: FESOM3's levels),
+  `meshom/config.py` (`InsertCfg`).
 - Docs: [`docs/config.md` "`[[inserts]]`"](../config.md#inserts-python--m-meshominsert), `docs/examples/inserts.toml`,
   `docs/examples/inserts_gulf_stream.toml`.
-- Decisions: B158-B169, B180-B186, B190, B192-B212.
+- Decisions: B158-B169, B180-B186, B190, B192-B220, B250.

@@ -69,6 +69,7 @@ class Spec:
     sill_level: str = ""                     # B212: "shallower": the sill's level rounded up; B215: "grid"
     depth_channel: str = ""                  # B213: "cells" | "near": the grid's deepest channel raises the insert
     depth_quantile: float = 0.0              # B214: the node box's quantile instead of its mean (0: the mean)
+    depth_area: bool = False                 # B250: the sections' areas scaled to the grid's
 
 
 @dataclass
@@ -129,7 +130,7 @@ def spec_from(cfg_entry, cfg=None) -> Spec:
                 e.coast_shift_cells, e.cells_a, e.cells_b, e.growth_a, e.growth_b, e.bank_land_cells,
                 [_ll(f) for f in e.fill], e.fill_rows, e.corner_steps, e.add_columns, e.corner_split, e.join_margin,
                 e.fix_rings, e.depth_at, e.depth_smooth, e.strait_floor, e.sill_level, e.depth_channel,
-                e.depth_quantile)
+                e.depth_quantile, e.depth_area)
 
 
 def _path_frame(path: np.ndarray):
@@ -801,7 +802,7 @@ def insert_depth(depth: np.ndarray, mesh: Mesh, win: Window, res: Result, full: 
         rec["host_moved_change_m"] = float(np.abs(depth[fid] - hd).max())
         depth[fid] = hd
     own = (bool(spec.depth_at) or spec.depth_smooth is not None or not spec.strait_floor or bool(spec.sill_level)
-           or bool(spec.depth_channel) or spec.depth_quantile > 0)
+           or bool(spec.depth_channel) or spec.depth_quantile > 0 or spec.depth_area)
     if b.source == "none" or not own:
         return depth, rec
     part = _part(full, res.window)
@@ -814,7 +815,8 @@ def insert_depth(depth: np.ndarray, mesh: Mesh, win: Window, res: Result, full: 
     ins = (wid >= full.n_nodes - sinfo["appended_nodes"]) & ~cm[wid]   # the insert's own nodes (appended last)
     d, r = rule_depth(sub, ins, depth[wid], cfg, fmt, straits, spec.depth_at, spec.depth_smooth, spec.strait_floor,
                       spec.sill_level, spec.depth_channel, spec.depth_quantile,
-                      res.profile.h_fine if res.profile is not None else None, f"[insert {spec.name}]", log)
+                      res.profile.h_fine if res.profile is not None else None, f"[insert {spec.name}]", log,
+                      spec.depth_area, insert_axis(res) if spec.depth_area else None)
     r["insert_nodes"], r["insert_m"] = r.pop("nodes"), r.pop("nodes_m")
     rec.update(r)
     depth[wid[ins]] = d[ins]
@@ -826,10 +828,22 @@ def insert_depth(depth: np.ndarray, mesh: Mesh, win: Window, res: Result, full: 
     return depth, rec
 
 
+def insert_axis(res: Result) -> np.ndarray | None:
+    """B250: the strait's axis between its two joins on the sphere ((K,3): the profile's centreline points whose
+    arc length lies between the joins'), None for an insert without a profile (a strip, a corridor)."""
+    pr = res.profile
+    if pr is None or res.chart is None:
+        return None
+    sj = [j.s_m for j in res.joins if j is not None]
+    lo, hi = (min(sj), max(sj)) if len(sj) >= 2 else (float(pr.s[0]), float(pr.s[-1]))
+    keep = (pr.s >= lo) & (pr.s <= hi)
+    return res.chart.inv(pr.xy[keep]) if keep.sum() >= 2 else None
+
+
 def rule_depth(sub: Mesh, ins: np.ndarray, base: np.ndarray, cfg, fmt: str, straits: list | None, depth_at: str = "",
                depth_smooth: int | None = None, strait_floor: bool = True, sill_level: str = "",
                depth_channel: str = "", depth_quantile: float = 0.0, h_fine: float | None = None, tag: str = "",
-               log=print) -> tuple[np.ndarray, dict]:
+               log=print, depth_area: bool = False, axis: np.ndarray | None = None) -> tuple[np.ndarray, dict]:
     """An own depth rule (B211-B215) on the nodes `ins` of `sub`, a part of a mesh that holds every cell round them
     (insert_depth: the insert's own nodes; meshom.methods.m16_orca.nest_depth: the nodes inside a nest's coarse box,
     B216); `base`: the depth of `sub`'s nodes by the run's rules (for the record only: every calculation here takes
@@ -840,8 +854,10 @@ def rule_depth(sub: Mesh, ins: np.ndarray, base: np.ndarray, cfg, fmt: str, stra
     largest pieces of the other nodes of the cells of `ins` (the joins; its ends from the grid's box means along
     them, B218), box means at h_fine, None: the median spacing of `ins`) and sill_level ("shallower", B212:
     sill_shallower; "grid", B215: meshom.insert.channel.grid_sill), both on the grid rule's node depths of `sub`
-    (host nodes included). `tag` heads the log lines. Returns (the depth on `sub`, the rule's values on `ins`; the
-    record)."""
+    (host nodes included); then depth_area (B250: meshom.insert.area.area_depth along `axis` (K,3), the strait's
+    centreline from one join to the other, the dam of sill_level kept, the cells the channel line crosses never made
+    shallower). `tag` heads the log lines. Returns (the
+    depth on `sub`, the rule's values on `ins`; the record)."""
     from meshom import run as runmod
     from meshom.bathymetry import (apply_regions, cells_deepest_depth, depth_policy, levels, node_area_m2,
                                    node_depth, node_spacing_m, smooth_depth)
@@ -873,7 +889,8 @@ def rule_depth(sub: Mesh, ins: np.ndarray, base: np.ndarray, cfg, fmt: str, stra
         d, _ = apply_regions(sub, d, b.regions, floor)
     rec.update(rule={"depth_at": at, "smooth_passes": passes, "smooth_among": "run" if depth_smooth is None
                      else "insert", "strait_floor": bool(strait_floor), "sill_level": sill_level or None,
-                     "depth_channel": depth_channel or None, "depth_quantile": depth_quantile or None},
+                     "depth_channel": depth_channel or None, "depth_quantile": depth_quantile or None,
+                     "depth_area": bool(depth_area)},
                nodes=int(ins.sum()), grid=info.get("depth_m"),
                strait_depth_floor=pol.get("strait_depth_floor"),
                run_rule_m={"min": float(base[ins].min()), "max": float(base[ins].max())})
@@ -917,6 +934,27 @@ def rule_depth(sub: Mesh, ins: np.ndarray, base: np.ndarray, cfg, fmt: str, stra
                 f"capped at {s['cap_m']:.1f} m (largest cut {s['cut_max_m']:.0f} m)", flush=True)
         else:
             log(f"{tag} sill_level grid: {s}", flush=True)
+    held = rec["sill"].pop("held", None) if "sill" in rec else None
+    if depth_area:
+        if axis is None:
+            rec["area"] = {"applied": False, "skipped": "no axis (an insert without a profile)"}
+            log(f"{tag} depth_area: skipped, no axis", flush=True)
+        else:
+            from meshom.insert.area import area_depth
+
+            h_f = h_fine if h_fine is not None else float(np.median(node_spacing_m(sub)[0][ins]))
+            route = None
+            if line is not None:                           # the nodes of the cells the channel line crosses
+                from meshom.straits import locate
+
+                el = locate(sub, lonlat_to_xyz(line.lon, line.lat))
+                el = np.unique(el[el >= 0])
+                route = np.zeros(sub.n_nodes, bool)
+                T_ = sub.n_tris
+                route[sub.tris[el[el < T_]].ravel()] = True
+                route[sub.quads[el[el >= T_] - T_].ravel()] = True
+            d, rec["area"] = area_depth(sub, d, ins, axis, levels(b.levels), floor, Path(b.source), b.variable, h_f,
+                                        held, route, tag, log)
     rec["nodes_m"] = {"min": float(d[ins].min()), "max": float(d[ins].max())}
     return d, rec
 
@@ -1008,7 +1046,8 @@ def sill_shallower(sub: Mesh, depth: np.ndarray, ins: np.ndarray, zbar: np.ndarr
     low = nb & (out > cap)
     out[low] = cap
     top = chain[int(np.argmax(depth[chain]))]
-    return out, {"barrier_m": B, "level_m": L, "next_level_m": Ln, "cap_m": cap, "chain_nodes": int(len(chain)),
+    return out, {"held": (np.flatnonzero(nb), cap),
+                 "barrier_m": B, "level_m": L, "next_level_m": Ln, "cap_m": cap, "chain_nodes": int(len(chain)),
                  "at": [round(float(v[0]), 4) for v in xyz_to_lonlat(sub.points[top][None])],
                  "capped": int(low.sum()), "capped_host_nodes": int((low & ~ins).sum()),
                  "cut_max_m": float((depth - out).max()), "nodes_star": int(nb.sum())}

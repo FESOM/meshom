@@ -630,8 +630,9 @@ def banks(sub: Mesh, ins: np.ndarray):
     return g, on & (lab == a), on & (lab == b)
 
 
-def cap_star(sub: Mesh, depth: np.ndarray, chain: np.ndarray, cap: float) -> tuple[np.ndarray, np.ndarray]:
-    """every node of the chain and of every cell holding one capped at `cap`; returns (depth, capped mask)."""
+def cap_star(sub: Mesh, depth: np.ndarray, chain: np.ndarray, cap: float) -> tuple:
+    """every node of the chain and of every cell holding one capped at `cap`; returns (depth, capped mask, the mask of
+    those nodes: the dam)."""
     T = sub.n_tris
     n = sub.n_nodes
     hit = np.zeros(n, bool)
@@ -643,12 +644,12 @@ def cap_star(sub: Mesh, depth: np.ndarray, chain: np.ndarray, cap: float) -> tup
     out = depth.copy()
     low = nb & (out > cap)
     out[low] = cap
-    return out, low
+    return out, low, nb
 
 
 def grid_sill(sub: Mesh, depth: np.ndarray, ins: np.ndarray, line: Line, zbar: np.ndarray) -> tuple:
     """B215 (module docstring): the grid's saddle held at its level by a dam of the insert's nodes. Returns (depth,
-    record)."""
+    record; its `held`: (the dam's node ids, the cap), which depth_area keeps, B250)."""
     from scipy.sparse.csgraph import dijkstra
 
     from meshom.straits import locate
@@ -686,9 +687,10 @@ def grid_sill(sub: Mesh, depth: np.ndarray, ins: np.ndarray, line: Line, zbar: n
     k = int(np.searchsorted(z, sd, side="right")) - 1
     L, Ln = float(z[max(k, 0)]), float(z[min(k + 1, len(z) - 1)])
     cap = 0.5 * (L + Ln) - SILL_MARGIN_M
-    out, low = cap_star(sub, depth, chain, cap)
+    out, low, nb = cap_star(sub, depth, chain, cap)
     lon, lat = xyz_to_lonlat(sub.points[via][None])
-    return out, {"rule": "grid", "saddle_m": sd, "saddle_at": [round(slon, 4), round(slat, 4)], "level_m": L,
+    return out, {"held": (np.flatnonzero(nb), cap),
+                 "rule": "grid", "saddle_m": sd, "saddle_at": [round(slon, 4), round(slat, 4)], "level_m": L,
                  "next_level_m": Ln, "cap_m": cap, "via": [round(float(lon[0]), 4), round(float(lat[0]), 4)],
                  "chain_nodes": int(len(chain)), "capped": int(low.sum()), "capped_host_nodes": int((low & ~ins).sum()),
                  "cut_max_m": float((depth - out).max())}

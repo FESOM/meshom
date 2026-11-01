@@ -130,6 +130,46 @@ def read_aux3d(path: Path) -> tuple[np.ndarray, np.ndarray]:
     return np.abs(v[1:1 + nl]), np.abs(v[1 + nl:])
 
 
+def model_levels(mesh: Mesh, depth_m: np.ndarray, zbar_m: np.ndarray, thers_zbar_lev: int = 5):
+    """FESOM3's levels of a mesh with node depths, as its partitioner fesom_ini finds them from aux3d.out (no cavity,
+    the element's depth the mean of its nodes', FESOM3: github.com/koldunovn/fesom_F), and the element bottom the model
+    uses. Every node's depth is raised to zbar[thers_zbar_lev - 1] at least; an element's level is the first layer
+    whose mid-depth lies below the mean of its nodes' depths (the level surface nearest the mean), nl when none, at
+    least thers_zbar_lev; then for each deeper level, the elements at that level or deeper with fewer than two edge
+    neighbours there drop to the level above, until none (the 2-core of that layer, whatever the order); a node's
+    level is the deepest of its elements'; an element's bottom is zbar at the shallowest of its nodes' levels.
+    depth_m, zbar_m: metres, positive down. Returns (element levels (E,), node levels (N,), element bottom (E,) m),
+    levels 1-based, elements in the mesh's order (triangles, then quads)."""
+    zb = np.abs(np.asarray(zbar_m, dtype=np.float64))
+    nl = len(zb)
+    mid = 0.5 * (zb[:-1] + zb[1:])
+    x = np.maximum(np.abs(np.asarray(depth_m, dtype=np.float64)), zb[thers_zbar_lev - 1])
+    dm = np.r_[x[mesh.tris].mean(1) if mesh.n_tris else np.zeros(0), x[mesh.quads].mean(1)]
+    k = np.searchsorted(mid, dm, side="right")           # mid-depths not below the mean: the first below is k (0-based)
+    lev = np.maximum(np.where(k < nl - 1, k + 1, nl), thers_zbar_lev)
+    ee = build_topology(mesh).edge_elems
+    ee = ee[ee[:, 1] >= 0]
+    E = len(dm)
+    for nz in range(thers_zbar_lev + 1, nl + 1):
+        while True:
+            on = lev >= nz
+            if not on.any():
+                break
+            both = on[ee[:, 0]] & on[ee[:, 1]]
+            cnt = np.bincount(ee[both, 0], minlength=E) + np.bincount(ee[both, 1], minlength=E)
+            iso = on & (cnt < 2)
+            if not iso.any():
+                break
+            lev[iso] = nz - 1
+    nlv = np.zeros(mesh.n_nodes, np.int64)
+    T = mesh.n_tris
+    for c, le in ((mesh.tris, lev[:T]), (mesh.quads, lev[T:])):
+        for j in range(c.shape[1]):
+            np.maximum.at(nlv, c[:, j], le)
+    low = np.r_[nlv[mesh.tris].min(1) if T else np.zeros(0, np.int64), nlv[mesh.quads].min(1)]
+    return lev, nlv, zb[low - 1]
+
+
 def fesom2_checks(path: Path, euler_deg: tuple = (50.0, 15.0, -90.0), thers_zbar_lev: int = 5) -> dict:
     """The checks FESOM2's partitioner and model perform on a mesh directory (nod2d.out, elem2d.out, aux3d.out),
     recomputed from the files. `stop` lists the checks that make FESOM2 stop with the default namelist

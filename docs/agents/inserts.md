@@ -84,7 +84,7 @@ h_min_m = 1000.0                   # the size floor (default: the host mesh's sm
 | `add_columns` | false | strait: where a block cell is above 1.1 x the host cell the size target is lowered (more columns and rows); on a side with `cells_a` / `cells_b` the counts may then rise above the neck's and the join's and come back to the join's count before the join (B207); it helps where the block fans out at a bank's turn, not at a staircase join's diagonal steps |
 | `fix_rings` | 0 | after the splice, meshom's mesh fixer stage a on the insert's cells and this many element rings round them (the host's coast and every other node held, the banks sliding); host nodes in the rings move less than a host cell and keep their host depth (B210); its result is kept only when it is not worse by the insert's objectives (validity and floor, the angle excess above 120° summed over the quads, the worst corner, then the sizes), else nothing moves (`fix_rings.kept`, B220) |
 | `depth_at`, `depth_smooth`, `strait_floor` | the run's | the insert's own nodes: `"node"` (box mean per node) or `"cells_deepest"`; smoothing passes among the insert's nodes only; whether the run's strait depth floors carve them (B211) |
-| `sill_level` | `""` | `"shallower"`: the insert's sill gets the shallower of the two model levels round its depth (B212); `"grid"`: the grid's own saddle between the joins is held at the deepest level not below its depth by a dam of the insert's nodes (B215) |
+| `sill_level` | `""` | `"shallower"`: the insert's sill gets the shallower of the two model levels round its depth (B212); `"grid"`: the grid's own saddle between the joins is held at the deepest level not below its depth by a dam of the insert's nodes (B215); `"nearest"`: the same dam at the level nearest the saddle's depth (B249) |
 | `depth_channel` | `""` | the grid's deepest channel between the joins (box means at the fine size; its ends the deepest box means along the joins, or the deeper basin beyond a join too shallow for the strait, kept inside the insert, B218): `"cells"`: the insert's nodes of every cell it crosses take at least its box-mean depth there; `"near"`: the insert's nodes within one spacing of it take at least the box mean of their own box centred on it; both only on the strait's narrows (B213) |
 | `depth_quantile` | 0 | the insert's nodes take this quantile of the grid's ocean cells in their node box instead of the mean (B214) |
 | `depth_area` | false | after the other depth rules, the insert's nodes are scaled so that each section across the strait has the grid's wet area in FESOM3's element bottoms (the dam of `sill_level` kept; B250) |
@@ -94,6 +94,9 @@ h_min_m = 1000.0                   # the size floor (default: the host mesh's sm
 | `gap_km`, `island_km2` | 5 x `h_min_m`, 10 | group: an island closer than `gap_km` to other land joins it; one smaller than `island_km2` is dropped (B241) |
 | `gap_cells`, `growth` | 3, 0.12 | group: the least fill cells across any passage; the size slope of the fill (B243) |
 | `bank_smooth_cells` | 0 | group: each block bank smoothed over this many block cells, ends held: capes cut (B245) |
+| `routes` | | group: `[[inserts.routes]]` tables `name`, `a`, `b` (points in the basins at the strait's ends), optional `via`, `corridor_km`: the channel raise, the dam (across islands, every passage) and the section areas act along each route's line over blocks and patches (B246) |
+| `blend_cells` | 2 | group: the real coast blends onto a join's end node over this many join cells; 1 keeps the real coast on short coast runs (B247) |
+| `split_deg` | | group: after fix_rings, patch quads with a corner above this become two triangles (B243) |
 | `force` | false | build with the least-violating joins when none passes |
 
 ## Rules and refusals
@@ -330,18 +333,24 @@ Choose in this order:
    passage open; `island_km2` drops the small ones.
 4. **Capes.** A block wrapping round a thin cape folds; `bank_smooth_cells = 1-2` cuts the cape (the block covers
    it). `bank_sigma_cells = 0.5` keeps islands near a coast from overlapping it after the smoothing.
-5. **`fix_rings = 3`** relaxes the angles of the patches and of the host rings round them (B210, B220).
+5. **`fix_rings = 3`** relaxes the angles of the patches and of the host rings round them (B210, B220);
+   `split_deg = 120` then turns the patch quads still above 120 deg into triangle pairs (B243).
+6. **Routes.** One `[[inserts.routes]]` per strait through the group (`a`, `b` in its two basins, in or next to the
+   envelope's cells; `corridor_km` for a strait beside a deeper one, as Alas beside Lombok) with `depth_channel =
+   "near"`, `sill_level = "grid"` or `"nearest"` and `depth_area = true`: the raise, the dam and the section areas
+   then act along the strait's own line across blocks and patches (B246, B249). `blend_cells = 1` keeps the real coast
+   where the host's coast at a join's end is far off it (B247).
 
 Judge it as a strait (above), per channel: cells across at its narrowest and sill sections, the section areas against
-the bathymetry in the model's levels, the sills (record `depth.branches`), and over the group: the worst quad and the
+the bathymetry in the model's levels, the sills (records `depth.branches`, `depth.routes`), and over the group: the worst quad and the
 quads above 120 deg, the smallest cell, the largest cell against the host and the neighbour size ratio. Known limits:
 the patch cells next to the joins stay finer than the host when the envelope is small (an area ratio of 1.6-2 in
-the first ring); a sill in a patch gets no dam; on three or four cells across, FESOM3's element bottom (the shallowest
+the first ring); without routes a sill in a patch gets no dam; on three or four cells across, FESOM3's element bottom (the shallowest
 of its nodes' levels) leaves a channel one or two levels shallower than its dam.
 
 ## Config keys used
 
-- `[[inserts]]` (group): `envelope`, `channels`, `gap_km`, `island_km2`, `gap_cells`, `growth`, `bank_smooth_cells`
+- `[[inserts]]` (group): `envelope`, `channels`, `gap_km`, `island_km2`, `gap_cells`, `growth`, `bank_smooth_cells`, `routes`, `blend_cells`, `split_deg`
 - `[[inserts]]`: `name`, `kind`, `strait`, `path`, `cells`, `h_fine_m`, `h_min_m`, `reach_km`, `mouth_a`, `mouth_b`, `ljoins`, `bays`, `collar_rings`, `coast`, `coast_source`, `bank_sigma_cells`, `width_km`, `band_km`, `rows`, `coast_rounds`, `coast_shift_cells`, `cells_a`, `cells_b`, `growth_a`, `growth_b`, `bank_land_cells`, `fill`, `fill_rows`, `corner_steps`, `corner_split`, `join_margin`, `add_columns`, `fix_rings`, `depth_at`, `depth_smooth`, `strait_floor`, `sill_level`, `depth_channel`, `depth_quantile`, `stages`, `force`
 
 ## Sources
@@ -354,4 +363,4 @@ of its nodes' levels) leaves a channel one or two levels shallower than its dam.
   `docs/examples/inserts_gulf_stream.toml`.
 - Decisions: B158-B169, B180-B186, B190, B192-B220, B250.
 - Decisions: B158-B169, B180-B186, B190, B192-B223.
-- Decisions: B158-B169, B180-B186, B190, B192-B212, B240-B245.
+- Decisions: B158-B169, B180-B186, B190, B192-B212, B240-B249.

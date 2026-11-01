@@ -47,7 +47,8 @@ docs/config.md has the full description and an example. Tables (units: metres, k
               (B211), sill_level (B212, B215), depth_channel (B213), depth_quantile (B214), depth_area
               (B250); kind "depth": a depth region, the mesh unchanged (width_km round the path, or
               polygon; B223); group: envelope,
-              channels (B240, B242), gap_km, island_km2 (B241), growth, gap_cells (B243), bank_smooth_cells (B245)
+              channels (B240, B242), gap_km, island_km2 (B241), growth, gap_cells (B243), bank_smooth_cells (B245),
+              routes (B246), blend_cells (B247)
               (meshom.config.InsertCfg)
     [size]    grad_max (|grad h| limit of the gradient limiter, default 0.1; inf = no limiting), h_min_m / h_max_m
               (optional global clip), preview_deg (UI preview grid), limiter_max_nodes (grid size cap), from (an h
@@ -297,6 +298,8 @@ class InsertCfg:
                                                        # two levels round its depth in the model's levels (B212) |
                                                        # "grid": the grid's saddle between the joins held at the
                                                        # deepest level not below its depth by a dam of nodes (B215)
+                                                       # | "nearest": the same dam at the level nearest its depth
+                                                       # (the level GEBCO's saddle falls on, B249)
     depth_channel: str = ""                            # "" | "cells" | "near": the grid's deepest channel between
                                                        # the joins (box means at the fine size) raises the insert's
                                                        # nodes of the cells it crosses / within one spacing of it to
@@ -318,8 +321,20 @@ class InsertCfg:
     island_km2: float = 10.0                           # group: an island smaller than this is dropped (water, B241)
     growth: float | None = None                        # group: the size slope of the patches and blocks (0.12, B243)
     gap_cells: int = 3                                 # group: the least fill cells across any passage (B243)
+    split_deg: float | None = None                     # group: after fix_rings, each patch quad (an own cell, not a
+                                                       # block's) whose largest corner exceeds this (deg) becomes
+                                                       # two triangles along the diagonal from that corner (B243)
     bank_smooth_cells: float = 0.0                     # group: each block's banks smoothed by a Gaussian of this many
                                                        # of its cells, ends held: capes cut, pockets filled (B245)
+    routes: list = field(default_factory=list)        # group: [{name, a = [lon, lat], b = [lon, lat], via =
+                                                       # [[lon, lat], ...], corridor_km}, ...]: the straits through
+                                                       # the group, a and b in the basins at their ends; with
+                                                       # corridor_km the line stays within corridor_km / 2 of the
+                                                       # polyline a, via..., b (a strait beside a deeper one); the
+                                                       # channel raise, the dam and the section areas act along each
+                                                       # route's line across blocks and patches (B246)
+    blend_cells: float | None = None                   # group: the real coast blends onto a join's end node over this
+                                                       # many join cells (None: 2, as a strait's banks, B164; B247)
 
 
 @dataclass

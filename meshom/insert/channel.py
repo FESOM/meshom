@@ -647,9 +647,13 @@ def cap_star(sub: Mesh, depth: np.ndarray, chain: np.ndarray, cap: float) -> tup
     return out, low, nb
 
 
-def grid_sill(sub: Mesh, depth: np.ndarray, ins: np.ndarray, line: Line, zbar: np.ndarray) -> tuple:
-    """B215 (module docstring): the grid's saddle held at its level by a dam of the insert's nodes. Returns (depth,
-    record; its `held`: (the dam's node ids, the cap), which depth_area keeps, B250)."""
+def grid_sill(sub: Mesh, depth: np.ndarray, ins: np.ndarray, line: Line, zbar: np.ndarray,
+              sides: tuple | None = None, nearest: bool = False) -> tuple:
+    """B215 (module docstring): the grid's saddle held at its level by a dam of the insert's nodes. sides: (graph,
+    bank A mask, bank B mask) in place of `banks` (a group's route, meshom.insert.group.route_banks, B246). nearest
+    (sill_level = "nearest", B249): L is the level surface nearest the saddle's grid depth (the level GEBCO's saddle
+    falls on in FESOM3's levels), not the deepest one above it. Returns (depth, record; its `held`: (the dam's node
+    ids, the cap), which depth_area keeps, B250)."""
     from scipy.sparse.csgraph import dijkstra
 
     from meshom.straits import locate
@@ -665,7 +669,7 @@ def grid_sill(sub: Mesh, depth: np.ndarray, ins: np.ndarray, line: Line, zbar: n
     nd = sub.tris[e] if e < T else sub.quads[e - T]
     if not ins[nd].any():
         return depth, {"skipped": "the grid's saddle lies outside the insert", "saddle_m": sd}
-    r = banks(sub, ins)
+    r = banks(sub, ins) if sides is None else sides
     if isinstance(r, str):
         return depth, {"skipped": r}
     g, src, dst = r
@@ -685,12 +689,15 @@ def grid_sill(sub: Mesh, depth: np.ndarray, ins: np.ndarray, line: Line, zbar: n
     chain = np.array(chain)
     z = np.asarray(zbar, dtype=np.float64)
     k = int(np.searchsorted(z, sd, side="right")) - 1
+    if nearest and k + 1 < len(z) and z[k + 1] - sd < sd - z[k]:       # B249: the nearest level surface
+        k += 1
     L, Ln = float(z[max(k, 0)]), float(z[min(k + 1, len(z) - 1)])
     cap = 0.5 * (L + Ln) - SILL_MARGIN_M
     out, low, nb = cap_star(sub, depth, chain, cap)
     lon, lat = xyz_to_lonlat(sub.points[via][None])
     return out, {"held": (np.flatnonzero(nb), cap),
-                 "rule": "grid", "saddle_m": sd, "saddle_at": [round(slon, 4), round(slat, 4)], "level_m": L,
+                 "rule": "nearest" if nearest else "grid", "saddle_m": sd,
+                 "saddle_at": [round(slon, 4), round(slat, 4)], "level_m": L,
                  "next_level_m": Ln, "cap_m": cap, "via": [round(float(lon[0]), 4), round(float(lat[0]), 4)],
                  "chain_nodes": int(len(chain)), "capped": int(low.sum()), "capped_host_nodes": int((low & ~ins).sum()),
                  "cut_max_m": float((depth - out).max())}

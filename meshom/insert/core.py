@@ -66,7 +66,7 @@ class Spec:
     depth_at: str = ""                       # B211: the insert's own nodes' depth rule ("": the run's)
     depth_smooth: int | None = None          # B211: smoothing passes over the insert's nodes (None: the run's)
     strait_floor: bool = True                # B211: the run's strait depth floors on the insert's nodes
-    sill_level: str = ""                     # B212: "shallower": the sill's level rounded up; B215: "grid"
+    sill_level: str = ""                     # B212: "shallower" (rounded up); B215: "grid"; B249: "nearest"
     depth_channel: str = ""                  # B213: "cells" | "near": the grid's deepest channel raises the insert
     depth_quantile: float = 0.0              # B214: the node box's quantile instead of its mean (0: the mean)
     depth_area: bool = False                 # B250: the sections' areas scaled to the grid's
@@ -76,7 +76,10 @@ class Spec:
     island_km2: float = 10.0                 # B241: a group's smallest island
     growth: float | None = None              # B243: a group's size slope (None: 0.12)
     gap_cells: int = 3                       # B243: a group's least fill cells across any passage
+    split_deg: float | None = None           # B243: a group's patch quads with a corner above this: two triangles
     bank_smooth_cells: float = 0.0           # B245: a group's block banks smoothed over this many block cells
+    routes: list = field(default_factory=list)    # B246: a group's routes: (name, a (3,), b (3,), via, corridor m)
+    blend_cells: float | None = None         # B247: a group's coast blend onto the join ends (None: BLEND_H)
 
 
 @dataclass
@@ -126,7 +129,10 @@ def spec_from(cfg_entry, cfg=None) -> Spec:
                     depth_channel=e.depth_channel, depth_quantile=e.depth_quantile, depth_area=e.depth_area,
                     channels=chans,
                     gap_km=e.gap_km, island_km2=e.island_km2, growth=e.growth, bank_land_cells=e.bank_land_cells,
-                    gap_cells=e.gap_cells, bank_smooth_cells=e.bank_smooth_cells)
+                    gap_cells=e.gap_cells, bank_smooth_cells=e.bank_smooth_cells,
+                    routes=[(str(r.get("name", f"route{k}")), _ll([r["a"]])[0], _ll([r["b"]])[0],
+                             _ll(r.get("via")), float(r["corridor_km"]) * 1e3 if r.get("corridor_km") else None)
+                            for k, r in enumerate(e.routes)], blend_cells=e.blend_cells, split_deg=e.split_deg)
     if e.kind not in ("strait", "depth"):
         if path is None or e.width_km is None:
             raise InsertError(f"an insert of kind {e.kind!r} needs a path and width_km")
@@ -895,7 +901,8 @@ def rule_depth(sub: Mesh, ins: np.ndarray, base: np.ndarray, cfg, fmt: str, stra
     at = depth_at or b.depth_at
     d, info = (cells_deepest_depth if at == "cells_deepest" else node_depth)(sub, Path(b.source), b.variable, floor)
     grid = None
-    if depth_quantile > 0 or depth_channel or sill_level == "grid":
+    grid_like = sill_level in ("grid", "nearest")         # B249: "nearest", the dam at the nearest level
+    if depth_quantile > 0 or depth_channel or grid_like:
         from meshom.insert import channel as chan
         from meshom.mesh import signed_area
 
@@ -922,7 +929,7 @@ def rule_depth(sub: Mesh, ins: np.ndarray, base: np.ndarray, cfg, fmt: str, stra
                strait_depth_floor=pol.get("strait_depth_floor"),
                run_rule_m={"min": float(base[ins].min()), "max": float(base[ins].max())})
     line = None
-    if depth_channel or sill_level == "grid":
+    if depth_channel or grid_like:
         h_f = h_fine if h_fine is not None else float(np.median(node_spacing_m(sub)[0][ins]))
         line = chan.channel_line(sub, ins, grid, h_f)
         rec["channel"] = line.record if line is not None else {"skipped": "the insert has no two joins"}
@@ -951,8 +958,9 @@ def rule_depth(sub: Mesh, ins: np.ndarray, base: np.ndarray, cfg, fmt: str, stra
         if "barrier_m" in s:
             log(f"{tag} sill {s['barrier_m']:.1f} m at {s['at']}: level {s['level_m']:.0f} m, "
                 f"{s['capped']} nodes capped at {s['cap_m']:.1f} m (largest cut {s['cut_max_m']:.1f} m)", flush=True)
-    elif sill_level == "grid":
-        d, rec["sill"] = (chan.grid_sill(sub, d, ins, line, levels(b.levels)) if line is not None
+    elif grid_like:
+        d, rec["sill"] = (chan.grid_sill(sub, d, ins, line, levels(b.levels), nearest=sill_level == "nearest")
+                          if line is not None
                           else (d, {"skipped": "no channel line"}))
         s = rec["sill"]
         if "cap_m" in s:
@@ -1094,11 +1102,13 @@ def _canonical(e: np.ndarray) -> np.ndarray:
 
 
 def region_depth(mesh: Mesh, inside: np.ndarray, depth: np.ndarray, cfg, fmt: str, depth_channel: str = "",
-                 sill_level: str = "", tag: str = "", log=print) -> tuple[np.ndarray, dict]:
+                 sill_level: str = "", tag: str = "", log=print, depth_area: bool = False,
+                 axis: np.ndarray | None = None) -> tuple[np.ndarray, dict]:
     """B216, B223: the nodes `inside` take an insert's own grid rule (rule_depth, B211): the box mean per node, no
     smoothing, no strait depth floor, the run's slope limiter, the depth floor and the regions; with `depth_channel`
     the channel raise (B213) and with `sill_level` the sill (B215 / B212), the channel line between the two largest
-    pieces of the other nodes of their cells (B218). Computed on their cells and one cell ring round them, nodes
+    pieces of the other nodes of their cells (B218); with `depth_area` the section-area rule (B250) along `axis`
+    ((K,3): the region's path), the dam kept. Computed on their cells and one cell ring round them, nodes
     ordered by position and cells by their nodes, so the depth is the same in every mesh that holds those cells.
     Every other node keeps `depth`. Returns (depth, record)."""
     T = mesh.n_tris
@@ -1119,7 +1129,8 @@ def region_depth(mesh: Mesh, inside: np.ndarray, depth: np.ndarray, cfg, fmt: st
                _canonical(loc[mesh.quads[c[T:]]].reshape(-1, 4)), np.zeros(len(wid), np.int8))
     ins = inside[wid]
     d, rec = rule_depth(sub, ins, depth[wid], cfg, fmt, None, depth_at="node", depth_smooth=0, strait_floor=False,
-                        sill_level=sill_level, depth_channel=depth_channel, tag=tag, log=log)
+                        sill_level=sill_level, depth_channel=depth_channel, tag=tag, log=log,
+                        depth_area=depth_area, axis=axis)
     out = np.array(depth, dtype=np.float64)
     out[wid[ins]] = d[ins]
     rec["change_m"] = {"min": float((d - depth[wid])[ins].min()), "max": float((d - depth[wid])[ins].max())}
@@ -1144,11 +1155,12 @@ def depth_region_nodes(mesh: Mesh, path: np.ndarray, width_m: float | None,
 def depth_run(run_dir: Path, spec: Spec, cfg, mesh: Mesh, src: Path, straits: list, out_dir: Path, write: bool,
               log=print) -> dict:
     """B223, kind = "depth": no mesh change; the host nodes inside the polygon or within width_m / 2 of the path
-    (depth_region_nodes) take the nest's grid rule (region_depth: B211's box mean per node, no smoothing, no strait floor; the entry's
-    depth_channel, B213, and sill_level, B215 / B212), every other node keeps the host's depth (the run's rules,
-    meshom.run.model_depth, or the host mesh's own saved depth when it is an insert's result, B217). Writes
-    insert_<name>.npz (the host mesh), .host_to_new.npy (every node kept), .collar_moved.npy (none), .json (the
-    record: `region`, `depth`) and fesom-insert_<name>/depth.npy, with model files when the run wrote them."""
+    (depth_region_nodes) take the nest's grid rule (region_depth: B211's box mean per node, no smoothing, no strait
+    floor; the entry's depth_channel, B213, sill_level, B215 / B212, and depth_area along the path, B250), every
+    other node keeps the host's depth (the run's rules, meshom.run.model_depth, or the host mesh's own saved depth
+    when it is an insert's result, B217). Writes insert_<name>.npz (the host mesh), .host_to_new.npy (every node
+    kept), .collar_moved.npy (none), .json (the record: `region`, `depth`) and fesom-insert_<name>/depth.npy, with
+    model files when the run wrote them."""
     from meshom import compete
     from meshom import run as runmod
 
@@ -1173,7 +1185,8 @@ def depth_run(run_dir: Path, spec: Spec, cfg, mesh: Mesh, src: Path, straits: li
         depth = np.array(host, dtype=np.float64)
         rec["host_depth"] = {"source": "the host mesh's own (an insert's result)", "nodes": int(mesh.n_nodes)}
     out, rec["depth"] = region_depth(mesh, inside, depth, cfg, fmt, spec.depth_channel, spec.sill_level,
-                                     f"[insert {spec.name}]", log)
+                                     f"[insert {spec.name}]", log, spec.depth_area,
+                                     spec.path if spec.depth_area else None)
     log(f"[insert {spec.name}] depth region {where}: {int(inside.sum())} "
         f"host nodes by the grid rule{', channel ' + spec.depth_channel if spec.depth_channel else ''}"
         f"{', sill ' + spec.sill_level if spec.sill_level else ''}: {out[inside].min():.0f}-{out[inside].max():.0f} m "
@@ -1275,6 +1288,16 @@ def run(run_dir: Path, spec: Spec, out_dir: Path | None = None, mesh_name: str |
                      **{f"{w}{k}": v for k, (b, x) in enumerate(res.group_ids) for w, v in (("block", b), ("cross", x))})
         if spec.fix_rings > 0 and res.record.get("valid"):           # B210: stage a on the insert and its rings
             full, rec["fix_rings"], moved, res.window = fix_spliced(mesh, win, res, full, sinfo, spec, h_min, log)
+        if spec.kind == "group" and spec.split_deg and res.record.get("valid"):   # B243: obtuse patch quads split
+            from meshom.insert.group import split_obtuse
+
+            own = np.zeros(full.n_nodes, bool)
+            own[full.n_nodes - sinfo["appended_nodes"]:] = True
+            own[np.asarray(cfid, np.int64)] = False
+            full, res.window, rec["split_obtuse"] = split_obtuse(full, res.window, own, res.group_ids,
+                                                                 spec.split_deg)
+            log(f"[insert {spec.name}] split_deg {spec.split_deg:g}: {rec['split_obtuse']['split']} patch quads "
+                f"split into two triangles (worst corner {rec['split_obtuse']['worst_deg']:.1f} deg)", flush=True)
     seg = res.chart.fwd(win.mesh.points)[win.coast_edges]
     real_seg = res.real.segments("raw") if res.real is not None else None
     if res.profile is not None:
@@ -1308,9 +1331,21 @@ def run(run_dir: Path, spec: Spec, out_dir: Path | None = None, mesh_name: str |
         meta = {}
         depth = runmod.model_depth(full, cfg, fmt, straits, run_dir, meta)
         spec_d = dataclasses.replace(spec, sill_level="", depth_channel="") if spec.kind == "group" else spec
+        if spec.kind == "group" and spec.routes:                       # B246: the section areas along the routes
+            spec_d = dataclasses.replace(spec_d, depth_area=False)
         depth, rec["depth"] = insert_depth(depth, mesh, win, res, full, sinfo, h2n, moved, spec_d, cfg, fmt, straits,
                                            run_dir, log, host=host_depth_of(src, mesh.n_nodes), collar=(cfid, chid))
-        if spec.kind == "group" and (spec.sill_level or spec.depth_channel) and cfg.bathymetry.source != "none":
+        if (spec.kind == "group" and spec.routes and (spec.sill_level or spec.depth_channel or spec.depth_area)
+                and cfg.bathymetry.source != "none"):
+            from meshom.insert.group import route_depth                    # B246: per route, across the patches
+
+            own = np.zeros(full.n_nodes, bool)
+            own[full.n_nodes - sinfo["appended_nodes"]:] = True
+            own[np.asarray(cfid, np.int64)] = False                        # the collar's moved host nodes
+            depth, rec["depth"]["routes"] = route_depth(
+                full, depth, own, spec.routes, cfg, spec.sill_level, spec.depth_channel, spec.depth_area,
+                res.band["h_fine"], log, f"[insert {spec.name}]")
+        elif spec.kind == "group" and (spec.sill_level or spec.depth_channel) and cfg.bathymetry.source != "none":
             from meshom.insert.group import branch_depth                   # B244: each channel's own sill
 
             depth, rec["depth"]["branches"] = branch_depth(

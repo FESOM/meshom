@@ -13,8 +13,10 @@ area across the same line:
 - the mesh's run: the samples in the mesh's cells, contiguous through the axis point; its area: the sum over the
   samples of their element's bottom times the spacing;
 - the grid's crossing: the grid's wet samples (the raw cell under the sample, elevation < 0; land counts 0) within
-  the mesh's run widened by AREA_BANK_H local cells on each side (the real banks lie within a cell of the mesh's);
-  its area: the sum of their depths times the spacing;
+  the mesh's run widened by AREA_BANK_H local cells on each side (the real banks lie within a cell of the mesh's),
+  of the grid's wet runs along the line that the mesh's run itself meets (B248: a wet run met only in the widening
+  lies beyond land past the mesh's bank, behind an island or a cape the mesh cut short, and is other water); its
+  area: the sum of their depths times the spacing;
 - a section counts when its axis point lies in the mesh's water, at least AREA_SHARE of its run lies in the
   insert's cells, the run ends on the mesh's coast within the samples, the grid has water there (at least the depth
   floor over one sample), the grid's water across it ends within AREA_OPEN_H local cells beyond the mesh's banks
@@ -137,20 +139,22 @@ def sections(sub: Mesh, ins: np.ndarray, grid, st, p, u, reach_m: float, floor_m
         dep = np.where(wet & ~outside, -z, 0.0)
         lo, hi = M - m, len(wet) - 1 - (M - m)               # the crossing: the mesh's run +- m samples
         lab = np.cumsum(np.r_[True, wet[1:] != wet[:-1]])    # runs of equal wetness
-        cross = np.unique(lab[lo:hi + 1][wet[lo:hi + 1]])
+        core = slice(M, len(wet) - M)                        # the mesh's run itself
+        cross = np.unique(lab[core][wet[core]])              # B248: only the grid's water runs the mesh's run meets
         if np.isin(cross, [lab[0], lab[-1]]).any():
             out.append(rec | {"why": "the grid's water runs on past a mesh bank"})
             continue
         if outside[lo:hi + 1].any():
             out.append(rec | {"why": "the crossing leaves the grid's window"})
             continue
-        A = float(dep[lo:hi + 1].sum() * ds)
+        inx = np.isin(lab[lo:hi + 1], cross) & wet[lo:hi + 1]
+        A = float(dep[lo:hi + 1][inx].sum() * ds)
         if A < floor_m * ds:
             out.append(rec | {"why": "the grid is dry across the mesh's run"})
             continue
         el, cnt = np.unique(run, return_counts=True)
         out.append(rec | {"ok": True, "why": "", "elem": el, "w": cnt * ds, "gebco_m2": A,
-                          "gebco_width_m": float(wet[lo:hi + 1].sum() * ds), "h_m": h})
+                          "gebco_width_m": float(inx.sum() * ds), "h_m": h})
     return out
 
 

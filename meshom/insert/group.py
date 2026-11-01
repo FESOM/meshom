@@ -23,7 +23,8 @@ step works in the stereographic chart at the envelope's centre:
    nodes keep their host ids, every host cell outside R stays).
 
 The depth of a group: the insert's own rule on its nodes (meshom.insert.core.insert_depth), then each channel's own
-sill (branch_depth, B244).
+sill (branch_depth, B244), or, when the group names its routes (the straits through it, from basin to basin), the
+channel raise, the dam and the section areas along each route across blocks and patches (route_depth, B246).
 """
 from dataclasses import dataclass, field
 
@@ -44,6 +45,7 @@ BRIDGE_REACH = 1.5           # B241: the coast cut off by a joined island: its p
                              # + half gap_km of it, at most this x gap_km
 ISLAND_SIGMA = 0.03          # B241: an island's coast is smoothed by at most this fraction of its perimeter (the bank
                              # smoothing of the local cell size shrank a 198 km^2 island to 67 km^2)
+ROUTE_END_H = 2.0            # B246: a route's end: the deepest box mean within this many h_fine of the given point
 MERGE_CHORD = 1e-9           # the parts' shared nodes are matched within this chord (unit sphere; ~6 mm)
 FILL_OPTS = {"price": 1.0 / 3.0, "recombine": "exact", "size_iters": 30, "angle_iters": 3}   # B243: m02 on patches
 
@@ -444,7 +446,7 @@ def join_raw(rc, env_xy: np.ndarray, gap_m: float, island_km2: float, chart: Cha
 def build(win, chart: Chart, env_xy: np.ndarray, channels: list, real, h_min: float, gap_m: float,
           island_km2: float, growth: float, bank_sigma_cells: float = 1.5, log=print, name: str = "group",
           fill_opts: dict | None = None, land_cells: float = 0.0, gap_cells: int = GAP_CELLS,
-          bank_smooth: float = 0.0, state: dict | None = None) -> GroupResult:
+          bank_smooth: float = 0.0, state: dict | None = None, blend_cells: float | None = None) -> GroupResult:
     """The group insert in the host window `win` (module docstring). real: the run's coast loops ((K,3), water on the
     left; None: the host's coast). Returns a GroupResult (window: the window mesh with the group in place of R).
     state: a dict that receives the real coast, the outline and the holes as they are built (for the maps of a
@@ -532,7 +534,8 @@ def build(win, chart: Chart, env_xy: np.ndarray, channels: list, real, h_min: fl
             pieces.append(Piece("join", xy[ids], ids=ids, start=("h", int(ids[0])), end=("h", int(ids[-1]))))
             ji += 1
             continue
-        la, lb = BLEND_H * hj[(ji - 1) % len(hj)], BLEND_H * hj[ji % len(hj)]
+        bl = BLEND_H if blend_cells is None else float(blend_cells)    # B247: the blend's length in join cells
+        la, lb = bl * hj[(ji - 1) % len(hj)], bl * hj[ji % len(hj)]
         arc, why, kp = (None, "no real coast", -1) if rc is None else coast_arc(rc, xy[ids[0]], xy[ids[-1]], xy[ids], env_xy,
                                                                       centre_h * sc_c)
         log(f"[insert {name}] coast run {k}: {why}", flush=True)
@@ -968,8 +971,8 @@ def branch_depth(full: Mesh, depth: np.ndarray, blocks: list, cfg, sill_level: s
         d = out[wid]
         if depth_channel:
             d, r["raise"] = chan.line_raise(sub, d, ins, grid, line, depth_channel)
-        if sill_level == "grid":
-            d, r["sill"] = chan.grid_sill(sub, d, ins, line, levels(b.levels))
+        if sill_level in ("grid", "nearest"):
+            d, r["sill"] = chan.grid_sill(sub, d, ins, line, levels(b.levels), nearest=sill_level == "nearest")
         out[wid[ins]] = d[ins]
         s = r.get("sill", {})
         log(f"{tag} channel {k}: line {line.record['km']:.0f} km, deepest connection "
@@ -997,7 +1000,8 @@ def insert_group(win, spec, log=print, real=None, h_min: float | None = None):
     try:
         g = build(win, chart, env_xy, spec.channels, real if spec.coast == "real" else None, h_min, gap_m,
                   spec.island_km2, growth, spec.bank_sigma_cells, log, spec.name, land_cells=spec.bank_land_cells,
-                  gap_cells=spec.gap_cells, bank_smooth=spec.bank_smooth_cells, state=state)
+                  gap_cells=spec.gap_cells, bank_smooth=spec.bank_smooth_cells, state=state,
+                  blend_cells=spec.blend_cells)
     except InsertError as ex:
         log(f"[insert {spec.name}] REFUSED {ex}", flush=True)
         res = Result(False, {"name": spec.name, "refused": [str(ex)]}, host_window=win, chart=chart,
@@ -1034,3 +1038,238 @@ def ids_in(full: Mesh, g: GroupResult) -> list:
         assert d.max() < MERGE_CHORD and dx.max() < MERGE_CHORD
         out.append((np.unique(b), np.unique(x)))
     return out
+
+
+def route_banks(sub: Mesh, ins: np.ndarray, line):
+    """B246: the two banks of a route through a group, for the dam (meshom.insert.channel.grid_sill's `sides`): the
+    graph of the nodes of the group's cells (neighbours: nodes of one cell) and the coast nodes of the group's cells
+    on each side of the route's line (the side of the line's local direction over CHANNEL_DIR_M at the nearest line
+    point; coast nodes nearest the line's two end points belong to neither). Only the open coast pieces (the outer
+    boundary between the joins) are banks: an island's closed coast lies between the passages, and a chain from bank
+    to bank that crosses it cuts every passage beside it. Returns (graph, bank A mask, bank B mask) or a reason
+    (str)."""
+    from scipy.sparse import coo_matrix
+    from scipy.sparse.csgraph import connected_components
+
+    from meshom.geo import lonlat_to_xyz
+    from meshom.insert.channel import CHANNEL_DIR_M
+
+    n = sub.n_nodes
+    T = sub.n_tris
+    cells = [c[ins[c].any(1)] for c in (sub.tris, sub.quads) if len(c)]
+    pairs = np.vstack([np.c_[c[:, i], c[:, j]] for c in cells for i in range(c.shape[1])
+                       for j in range(i + 1, c.shape[1])])
+    g = coo_matrix((np.ones(len(pairs)), (pairs[:, 0], pairs[:, 1])), shape=(n, n)).tocsr()
+    g = ((g + g.T) > 0).tocsr()
+    topo = build_topology(sub)
+    bnd = topo.edge_elems[:, 1] < 0
+    elem_ins = np.r_[ins[sub.tris].any(1) if T else np.zeros(0, bool), ins[sub.quads].any(1)]
+    ce = topo.edges[bnd][elem_ins[topo.edge_elems[bnd, 0]]]
+    if not len(ce):
+        return "the group has no coast edges"
+    nc, lab = connected_components(coo_matrix((np.ones(len(ce)), (ce[:, 0], ce[:, 1])), shape=(n, n)),
+                                   directed=False)
+    on = np.zeros(n, bool)
+    on[ce.ravel()] = True
+    deg = np.bincount(ce.ravel(), minlength=n)
+    open_ = np.zeros(nc, bool)
+    open_[lab[on & (deg != 2)]] = True                       # a piece with an end: not a closed island loop
+    bank = on & open_[lab]
+    P = lonlat_to_xyz(line.lon, line.lat)
+    s = np.r_[0.0, np.cumsum(np.linalg.norm(np.diff(P, axis=0), axis=1))] * R_EARTH_M
+    _, j = cKDTree(P).query(sub.points)
+    ia = np.clip(np.searchsorted(s, s[j] - CHANNEL_DIR_M, side="left"), 0, len(P) - 1)
+    ib = np.clip(np.searchsorted(s, s[j] + CHANNEL_DIR_M, side="right") - 1, 0, len(P) - 1)
+    side = np.einsum("ij,ij->i", np.cross(P[j], P[ib] - P[ia]), sub.points - P[j])
+    inner = (j > 0) & (j < len(P) - 1)
+    left, right = bank & inner & (side > 0), bank & inner & (side < 0)
+    if not left.any() or not right.any():
+        return "the route's line has open coast on one side only"
+    return g, left, right
+
+
+def route_depth(full: Mesh, depth: np.ndarray, own: np.ndarray, routes: list, cfg, sill_level: str,
+                depth_channel: str, depth_area: bool, h_fine: float, log=print, tag: str = "") -> tuple:
+    """B246: the depth rules along each route through the group (routes: (name, end a (3,), end b (3,)), the ends in
+    the basins), on the group's own nodes `own` (of `full`), computed on the group's cells and one cell ring round
+    them. Per route, on the grid's box means at h_fine (half-width h_fine / 2): the route's line, the deepest path
+    from the wet cell nearest end a to the one nearest end b (as the channel line, B213: cost per km (D_ref /
+    D)^CHANNEL_POWER) in the corridor of the group's cells and the ring widened by h_fine (the whole window when the
+    corridor does not join them), the grid's saddle between the ends (on the grid's cells) and the line's narrows
+    round its narrowest point in the group's cells; then with depth_channel the channel raise on the group's nodes
+    along the narrows (meshom.insert.channel.line_raise), across blocks and patches alike; with sill_level = "grid"
+    the dam (channel.grid_sill) from bank to bank through the saddle, its banks the open coast on each side of the
+    line (route_banks), so that it cuts every passage of the group beside islands; with depth_area the section-area
+    rule (meshom.insert.area.area_depth, B250) along the route's line, its dam kept, the nodes of the cells any
+    route's line crosses never made shallower and the other routes' dam nodes left alone. Each end is the deepest box
+    mean within ROUTE_END_H x h_fine of the given point (in the corridor when it has one there). A route with a
+    corridor width keeps its line, saddle and narrows within half that width of the polyline a, via..., b (a strait
+    beside a deeper one would otherwise take the deeper one's path). Returns (depth, records)."""
+    from pathlib import Path
+
+    from scipy import ndimage
+
+    from meshom import run as runmod
+    from meshom.bathymetry import levels
+    from meshom.geo import lonlat_to_xyz
+    from meshom.insert import channel as chan
+    from meshom.insert.area import area_depth
+    from meshom.straits import locate
+
+    b = cfg.bathymetry
+    T = full.n_tris
+
+    def cells_of(m):
+        return np.r_[m[full.tris].any(1) if T else np.zeros(0, bool), m[full.quads].any(1)]
+
+    near = np.zeros(full.n_nodes, bool)
+    c = cells_of(own)
+    near[full.tris[c[:T]].ravel()] = True
+    near[full.quads[c[T:]].ravel()] = True
+    c = cells_of(near)
+    wid = np.unique(np.r_[full.tris[c[:T]].ravel(), full.quads[c[T:]].ravel()])
+    loc = np.full(full.n_nodes, -1, np.int64)
+    loc[wid] = np.arange(len(wid))
+    sub = Mesh(full.points[wid], loc[full.tris[c[:T]]].reshape(-1, 3), loc[full.quads[c[T:]]].reshape(-1, 4),
+               np.zeros(len(wid), np.int8))
+    ins = own[wid]
+    zbar = levels(b.levels)
+    floor = runmod.depth_floor_m(cfg, cfg.mesh.format)
+    ends = np.array([p for _, pa, pb, *_ in routes for p in (pa, pb)])
+    lo_, la_ = xyz_to_lonlat(np.vstack([sub.points, ends]))
+    r_max = float(np.sqrt(np.abs(signed_area(sub)).max()))
+    grid = chan.read_window(Path(b.source), b.variable, lo_, la_, 2.0 * r_max)
+    D = grid.smoothed(0.5 * h_fine)
+    fp_own = chan.footprint(sub, ins, grid)
+    fp_all = chan.footprint(sub, np.ones(sub.n_nodes, bool), grid)
+    dy = R_EARTH_M * np.radians(abs(grid.dlat))
+    dx = R_EARTH_M * np.radians(abs(grid.dlon)) * max(np.cos(np.radians(float(np.mean(grid.lat)))), 1e-6)
+    ki, kj = int(np.ceil(h_fine / dy)), int(np.ceil(h_fine / dx))
+    corr0 = ndimage.maximum_filter(fp_all, size=(2 * ki + 1, 2 * kj + 1))
+    sq = np.ones((3, 3), bool)
+    d = np.asarray(depth, dtype=np.float64)[wid].copy()
+    lines, recs = [], []
+    II, JJ = np.meshgrid(np.arange(len(grid.lat)), np.arange(len(grid.lon)), indexing="ij")
+
+    def end_cell(p, cm):                                   # the deepest box mean near the given end
+        lo, la = xyz_to_lonlat(p[None])
+        i, j = chan._wet_cell(grid, D, float(lo[0]), float(la[0]))
+        r = ROUTE_END_H * h_fine
+        m = np.isfinite(D) & (((II - i) * dy) ** 2 + ((JJ - j) * dx) ** 2 <= r * r)
+        if (m & cm).any():
+            m &= cm
+        k = int(np.argmax(np.where(m, D, -1.0)))
+        return int(II.ravel()[k]), int(JJ.ravel()[k])
+
+    for name, pa, pb, via, width in routes:
+        corr = corr0.copy()
+        if width:                                          # the route's own corridor round a, via..., b
+            from meshom import straits as stm
+
+            pl = stm.densify(np.vstack([pa[None], via, pb[None]]) if via is not None else np.vstack([pa, pb]),
+                             0.25 * h_fine)
+            cell = lonlat_to_xyz(grid.lon[JJ.ravel()], grid.lat[II.ravel()])
+            dd, _ = cKDTree(pl).query(cell, distance_upper_bound=2.0 * np.sin(0.25 * width / R_EARTH_M))
+            corr &= np.isfinite(dd).reshape(corr.shape)
+        ea, eb = end_cell(pa, corr), end_cell(pb, corr)
+        corr[ea] = corr[eb] = True
+        Dc = np.where(corr, D, np.nan)
+        lab, _ = ndimage.label(np.isfinite(Dc), structure=sq)
+        if not lab[ea] or lab[ea] != lab[eb]:
+            Dc, corr = D, None
+        d_ref, _ = chan._maximin(Dc, ea, eb, sq)
+        ii, jj = chan._path(grid, Dc, ea, eb, d_ref)
+        k = int(np.argmin(D[ii, jj]))
+        sd = chan._saddle(grid, ea, eb, corr, near=(int(ii[k]), int(jj[k])))
+        plon, plat = grid.lon[jj], grid.lat[ii]
+        narrow, nrec = chan.narrows(grid, plon, plat, fp_own[ii, jj])
+        xyz = lonlat_to_xyz(plon, plat)
+        km = float(R_EARTH_M / 1e3 * np.arccos(np.clip(np.sum(xyz[1:] * xyz[:-1], 1), -1, 1)).sum())
+        pt = lambda cc: [round(float(grid.lon[cc[1]]), 4), round(float(grid.lat[cc[0]]), 4)]   # noqa: E731
+        lrec = {"ends": [pt(ea), pt(eb)], "end_box_m": [float(D[ea]), float(D[eb])], "corridor": corr is not None,
+                "box_half_width_m": 0.5 * h_fine, "cells": int(len(ii)), "km": km,
+                "deepest_connection_box_m": float(d_ref),
+                "shallowest_on_line": {"m": float(D[ii[k], jj[k]]),
+                                       "at": [round(float(plon[k]), 4), round(float(plat[k]), 4)]},
+                "grid_saddle": {"m": sd[0], "at": [round(sd[1], 4), round(sd[2], 4)]}, "narrows": nrec}
+        line = chan.Line(plon, plat, D[ii, jj], sd, lrec, narrow)
+        r = {"route": name, "line": lrec}
+        if depth_channel:
+            d, r["raise"] = chan.line_raise(sub, d, ins, grid, line, depth_channel)
+        lines.append(line)
+        recs.append(r)
+    held = [None] * len(routes)
+    if sill_level in ("grid", "nearest"):
+        for i, (line, r) in enumerate(zip(lines, recs)):
+            sides = route_banks(sub, ins, line)
+            d, r["sill"] = (chan.grid_sill(sub, d, ins, line, zbar, sides=sides, nearest=sill_level == "nearest")
+                            if not isinstance(sides, str) else (d, {"skipped": sides}))
+            held[i] = r["sill"].pop("held", None)
+    if depth_area:
+        on_line = np.zeros(sub.n_nodes, bool)
+        Ts = sub.n_tris
+        for line in lines:
+            el = locate(sub, lonlat_to_xyz(line.lon, line.lat))
+            el = np.unique(el[el >= 0])
+            on_line[sub.tris[el[el < Ts]].ravel()] = True
+            on_line[sub.quads[el[el >= Ts] - Ts].ravel()] = True
+        for i, (line, r) in enumerate(zip(lines, recs)):
+            other = np.zeros(sub.n_nodes, bool)
+            for j_, h in enumerate(held):
+                if h is not None and j_ != i:
+                    other[np.asarray(h[0], np.int64)] = True
+            d, r["area"] = area_depth(sub, d, ins & ~other, lonlat_to_xyz(line.lon, line.lat), zbar, floor,
+                                      Path(b.source), b.variable, h_fine, held[i], on_line,
+                                      f"{tag} route {r['route']}", log)
+    for line, r in zip(lines, recs):
+        s, lr = r.get("sill", {}), r["line"]
+        raise_ = f"; raise {r['raise']['nodes_raised']} nodes" if "raise" in r else ""
+        dam = (f"; dam {s.get('chain_nodes')} nodes at {s['cap_m']:.1f} m" if "cap_m" in s
+               else (f"; {s}" if s else ""))
+        log(f"{tag} route {r['route']}: line {lr['km']:.0f} km, deepest connection "
+            f"{lr['deepest_connection_box_m']:.0f} m, grid saddle {line.saddle[0]:.0f} m at {lr['grid_saddle']['at']};"
+            f" narrows {lr['narrows']['from']} - {lr['narrows']['to']}{raise_}{dam}", flush=True)
+    out = np.asarray(depth, dtype=np.float64).copy()
+    out[wid[ins]] = d[ins]
+    return out, recs
+
+
+def split_obtuse(full: Mesh, window: Mesh, own: np.ndarray, blocks: list, deg: float) -> tuple:
+    """B243 (`split_deg`): every patch quad of the spliced mesh (a quad of the insert's window part, meshom.insert.core
+    ._part, with a node of `own`, not a block's cell: blocks as ids_in) whose largest corner (tangent plane) exceeds
+    `deg` becomes two triangles along the diagonal from that corner (orientation kept; no node added or moved, so the
+    node ids and the depth bookkeeping stay). The triangles go to the end of the triangle list and the window's part
+    stays the tail of both lists. Returns (mesh, the window part as a mesh on the same points, record)."""
+    from meshom.quality.kernel import element_geometry
+
+    T, Q = full.n_tris, full.n_quads
+    q0 = Q - window.n_quads
+    isb = np.zeros(full.n_nodes, bool)
+    for b, _ in blocks:
+        isb[b] = True
+    cand = np.arange(q0, Q)
+    cq = full.quads[cand]
+    cand = cand[own[cq].any(1) & ~isb[cq].all(1)]
+    rec = {"deg": float(deg), "split": 0, "worst_deg": 0.0}
+    if not len(cand):
+        return full, window, rec
+    sub = Mesh(full.points, np.zeros((0, 3), np.int64), full.quads[cand], full.node_flag)
+    qa = element_geometry(sub).quad_angles
+    worst = np.degrees(qa.max(1))
+    bad = worst > deg
+    rec["worst_deg"] = float(worst.max())
+    if not bad.any():
+        return full, window, rec
+    q = full.quads[cand[bad]]
+    r = np.argmax(qa[bad], axis=1)
+    i = np.arange(len(q))
+    a, b, c, d = q[i, r], q[i, (r + 1) % 4], q[i, (r + 2) % 4], q[i, (r + 3) % 4]
+    keep = np.ones(Q, bool)
+    keep[cand[bad]] = False
+    tris = np.vstack([full.tris, np.c_[a, b, c], np.c_[a, c, d]]).astype(np.int64)
+    tz = None if full.tri_zone is None else np.r_[full.tri_zone, np.zeros(2 * len(q), bool)]
+    out = Mesh(full.points, tris, full.quads[keep], full.node_flag, tz)
+    nt, nq = window.n_tris + 2 * len(q), window.n_quads - len(q)
+    win = Mesh(full.points, out.tris[out.n_tris - nt:], out.quads[out.n_quads - nq:], full.node_flag)
+    rec.update(split=int(len(q)), worst_after_deg=float(worst[~bad].max()) if (~bad).any() else 0.0)
+    return out, win, rec

@@ -1027,3 +1027,75 @@ def test_depth_region_on_the_plain_host(strait, depth_run_dir, tmp_path):
     dep = np.load(host / "fesom-insert_dep" / "depth.npy")
     assert rec["host_depth"]["nodes"] == m.n_nodes
     assert (dep[~inside] == 777.0).all() and np.array_equal(dep[inside], np.maximum(box[inside], 50.0))
+
+
+# ------------------------------------------------------------------------------------------------ B248, B249
+
+def test_depth_area_crossing_leaves_out_water_beyond_land_past_the_bank(tmp_path_factory):
+    """B248: the strait (13.3 km) with a land strip 1.1 km wide on its north bank and open water (100 m) beyond it;
+    the 5-row mesh (14 km) reaches past the north bank onto the strip. The grid's crossing takes only the wet runs
+    the mesh's run itself meets: the water beyond the strip, met only in the widening by one cell, is other water.
+    The strait's sections count (before: skipped, the grid's water running on past the bank), with the strait's
+    own area (150 m over the strait and 600 m over its channel on the grid's cells: 3.61 km^2, off the sill)."""
+    from meshom.insert.area import area_depth
+
+    def strip(z, LO, LA):
+        z[(LA >= 0.07) & (np.abs(LO) < 0.45)] = -100.0
+
+    nc = _variant(tmp_path_factory, "strip", strip)
+    m, ins, cfg, base = _wide_strait(nc, 5)
+    axis = lonlat_to_xyz(np.linspace(-0.8, 0.8, 33), np.zeros(33))
+    _, a = area_depth(m, base, ins, axis, np.array(ZFINE), 40.0, nc, "elevation", DX, log=QUIET)
+    ok = [c for c in a["curve"] if c["ok"]]
+    mid = [c for c in a["curve"] if abs(c["lonlat"][0]) < 0.35]
+    assert a["counted"] >= 40 and all(c["ok"] for c in mid)
+    far = [c["gebco_km2"] for c in ok if abs(c["lonlat"][0]) < 0.35 and not 0.09 < c["lonlat"][0] < 0.13]
+    assert len(far) > 40 and all(3.4 < g < 3.7 for g in far)       # the water beyond the strip: + 0.24 km^2
+    assert a["skipped"].get("the grid's water runs on past a mesh bank", 0) < 0.5 * a["counted"]
+
+
+def test_grid_sill_nearest_takes_the_level_nearest_the_saddle(strait, line):
+    """B249: sill_level = "nearest": the dam holds the level surface nearest the grid's saddle (a saddle of 330 m
+    lies nearer 340 m than 280 m: L = 340 m, the cap the midpoint to 400 m less 1 m); "grid" keeps the deepest level
+    not below it (280 m); a saddle of 300 m takes 280 m either way; rule_depth reads "nearest" as a dam of its own."""
+    import dataclasses as dc
+
+    from meshom.insert import channel as chan
+    from meshom.insert.core import rule_depth
+
+    _, _, _, m, ins = strait
+    base, grid, ln = line
+    dep = np.where(ins, 600.0, base)
+    l330 = dc.replace(ln, saddle=(330.0, ln.saddle[1], ln.saddle[2]))
+    _, g = chan.grid_sill(m, dep, ins, l330, np.array(ZBAR))
+    _, n = chan.grid_sill(m, dep, ins, l330, np.array(ZBAR), nearest=True)
+    _, n300 = chan.grid_sill(m, dep, ins, ln, np.array(ZBAR), nearest=True)
+    assert (g["level_m"], g["rule"]) == (280.0, "grid") and (n["level_m"], n["rule"]) == (340.0, "nearest")
+    assert n["cap_m"] == 0.5 * (340.0 + 400.0) - chan.SILL_MARGIN_M and n300["level_m"] == 280.0
+    nc = strait[0]
+    _, r = rule_depth(m, ins, base, _cfg(nc), "fesom2", None, depth_at="node", depth_smooth=0, strait_floor=False,
+                      sill_level="nearest", h_fine=DX, log=QUIET)
+    assert r["sill"]["rule"] == "nearest" and r["sill"]["level_m"] == 280.0 and r["sill"]["capped"] > 0
+
+
+def test_depth_region_with_depth_area(strait, depth_run_dir, tmp_path):
+    """B223, B250: kind = "depth" with depth_area: the region's nodes take the section-area rule along the region's
+    path (its axis) after the grid rule and the dam; region_depth gives the same depth; host nodes outside the
+    region keep the run's depth."""
+    from meshom.config import load
+    from meshom.insert.core import region_depth, run, spec_from
+    from meshom.run import model_depth
+
+    d, m = depth_run_dir
+    cfg = load(d / "config.resolved.toml")
+    lo, la = xyz_to_lonlat(m.points)
+    off = np.maximum(np.abs(lo) - 0.6, 0.0)
+    inside = np.hypot(off, la) * np.radians(1.0) * R_EARTH_M <= 10e3
+    run_d = model_depth(m, cfg, "fesom2", [], d)
+    spec = spec_from(_depth_entry(depth_area=True, sill_level="grid"), cfg)
+    rec = run(d, spec, tmp_path / "area", log=QUIET)
+    a = rec["depth"]["area"]
+    assert rec["status"] == "ok" and a["applied"] and a["counted"] > 0
+    dep = np.load(tmp_path / "area" / "fesom-insert_dep" / "depth.npy")
+    exp, _ = region_depth(m, inside, run_d, cfg, "fesom2", "", "grid", log=QUIET, depth_area=True, axis=spec.path)
+    assert np.array_equal(dep, exp) and np.array_equal(dep[~inside], run_d[~inside])

@@ -143,7 +143,7 @@ class RealCoast:
 
     # ------------------------------------------------------------------------------------- smoothing and bays
     def prepare(self, h_loc, w_loc, h_floor: float, sigma_cells: float = SIGMA_CELLS, bays="auto",
-                bridge: str = "all", sigma_mult=None, land_cells: float = 0.0, fill=None):
+                bridge: str = "all", sigma_mult=None, land_cells: float = 0.0, fill=None, chord_ok=None):
         """Smooth every piece at sigma_cells x h_loc and find its bays (module docstring). h_loc, w_loc: callables
         (K,2) -> (K,) of the local cell size and the local channel width (inf where not in a channel). bays: which
         pockets are meshed as bays (`bay_meshed`): "auto" (large ones, B190), True (every one with a mouth of
@@ -152,7 +152,9 @@ class RealCoast:
         B181). sigma_mult: a callable (K,2) -> (K,) multiplying the smoothing width only (a strip's extra smoothing
         round bad cells, B198). land_cells: the main coast may move into land by up to this many local cells where
         that makes it smoother, never into the water beyond it (B202; `into_land`). fill: polylines (chart) that
-        replace the main coast between their end points where they lie on its water side (B204; `_fill`)."""
+        replace the main coast between their end points where they lie on its water side (B204; `_fill`).
+        chord_ok: a callable (piece index, a, b) -> bool; a pocket whose mouth chord a -> b it rejects is neither a bay
+        nor bridged (B256: a group's chord across another piece)."""
         self.smooth, self.main, self.bays, self.base, self.land, self._open = [], [], [], [], {}, []
         step = max(STEP_CELLS * h_floor, 1.0)
         for ip, (p, cl) in enumerate(zip(self.pieces, self.closed)):
@@ -183,6 +185,8 @@ class RealCoast:
                 extra = []
                 for _, i, j in sorted(cand, reverse=True):       # deepest for their mouth first, no overlaps
                     if taken[i:j + 1].any():
+                        continue
+                    if chord_ok is not None and not chord_ok(ip, q[i], q[j]):
                         continue
                     L = float(np.linalg.norm(q[j] - q[i]))
                     h_m = float(0.5 * (hq[i] + hq[j]))

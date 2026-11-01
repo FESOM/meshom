@@ -124,7 +124,8 @@ coast shift against the real coast), `insert_<name>.score.json`, `insert_<name>.
 `insert_<name>.profile.png`, `insert_<name>.collar.png`, and `fesom-insert_<name>/` (model files of the whole mesh,
 depth by the run's rules) when the run wrote model files.
 
-- Exit code 0 when every entry was built, 2 when one was refused.
+- Exit code 0 when every entry was built, 2 when one was refused (also when a rule fails after the joins were
+  chosen, forced ones included: B254).
 - `status`: `ok` (valid), `refused` (a rule failed: no mesh), `invalid` (built but failed the validity gate, e.g.
   overlapping cells or a flipped edge: no model files; B186).
 - Open the map figure. Check the insert's quad angles and size ratios in the record and the cells of the collar
@@ -355,7 +356,12 @@ Choose in this order:
    the count at the narrowest; 3 is enough where 5 would force cells near the floor. Put the controlling sill inside
    the block, not in a patch, so its dam holds.
 3. **Islands.** `gap_km` closes passages narrower than about 5 floor cells; lower it to keep an island inside a
-   passage open; `island_km2` drops the small ones.
+   passage open; `island_km2` drops the small ones. The two banks of a channel are never joined, however narrow
+   the channel (B255): a channel keeps a passage open that `gap_km` would close (the Oresund between Zealand and
+   Sweden, 4 km), while the other islands still join the land. An island's narrow inlets (fjords) are bridged by
+   the bay search as on the mainland coast, and no pocket chord crosses another coast piece (an island, a
+   channel's other bank; B256). To drop the islands a host does not have, set `island_km2` above their area (the
+   Danish straits on ORCA025 v5: 125 km^2 keeps only the islands that join the land or Zealand and Funen).
 4. **Capes.** A block wrapping round a thin cape folds; `bank_smooth_cells = 1-2` cuts the cape (the block covers
    it). `bank_sigma_cells = 0.5` keeps islands near a coast from overlapping it after the smoothing.
 5. **`fix_rings = 3`** relaxes the angles of the patches and of the host rings round them (B210, B220);
@@ -393,3 +399,4 @@ of its nodes' levels) leaves a channel one or two levels shallower than its dam.
 - Decisions: B158-B169, B180-B186, B190, B192-B220, B250.
 - Decisions: B158-B169, B180-B186, B190, B192-B223.
 - Decisions: B158-B169, B180-B186, B190, B192-B212, B240-B249, B252.
+- Decisions: B254 (a refusal after the joins is a record, exit code 2), B255, B256 (group inserts).

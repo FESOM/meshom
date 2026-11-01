@@ -2,6 +2,7 @@
 bathymetry grid of two deep basins (with a trench along the axis) joined by a strait of 13 km with a deep channel of
 3.7 km and a 300 m sill, and a structured mesh along it whose middle part plays the insert."""
 import dataclasses
+import json
 
 import numpy as np
 import pytest
@@ -1053,6 +1054,31 @@ def _depth_entry(**kw):
 
     return _build(InsertCfg, {"name": "dep", "kind": "depth", "path": [[-0.6, 0.0], [0.6, 0.0]], "width_km": 20.0}
                   | kw, "insert")
+
+
+def test_a_rule_failing_after_the_joins_is_a_refusal_record(depth_run_dir, tmp_path, monkeypatch):
+    """B254: an InsertError raised while an insert is built (the joins do not close the strait: a second channel
+    round a forced join) is written as a refused record and the command exits with 2, not with the exception."""
+    from meshom.config import InsertCfg, _build, load
+    from meshom.insert import core
+    from meshom.insert.__main__ import main
+    from meshom.insert.region import InsertError
+
+    d, m = depth_run_dir
+
+    def fails(*a, **k):
+        raise InsertError("the joins do not close the strait: the host cells between them reach the window's edge "
+                          "(a coast gap or a second channel around the joins)")
+    monkeypatch.setattr(core, "insert_window", fails)
+    e = _build(InsertCfg, {"name": "two", "path": [[-0.6, 0.0], [0.6, 0.0]], "cells": 5, "force": True,
+                           "coast": "host"}, "insert")
+    rec = core.run(d, core.spec_from(e, load(d / "config.resolved.toml")), tmp_path / "a", log=QUIET)
+    assert rec["status"] == "refused" and "do not close" in rec["refused"][0]
+    assert json.loads((tmp_path / "a" / "insert_two.json").read_text())["status"] == "refused"
+    assert not (tmp_path / "a" / "insert_two.npz").exists()
+    code = main(["--run", str(d), "--insert", "name=two; path=[[-0.6, 0.0], [0.6, 0.0]]; cells=5; force=true; "
+                 "coast='host'", "--out", str(tmp_path / "b")])
+    assert code == 2
 
 
 def test_depth_region_on_the_plain_host(strait, depth_run_dir, tmp_path):

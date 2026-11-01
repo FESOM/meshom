@@ -52,6 +52,9 @@ ISLAND_SIGMA = 0.03          # B241: an island's coast is smoothed by at most th
 ROUTE_END_H = 2.0            # B246: a route's end: the deepest box mean within this many h_fine of the given point
 MERGE_CHORD = 1e-9           # the parts' shared nodes are matched within this chord (unit sphere; ~6 mm)
 FILL_OPTS = {"price": 1.0 / 3.0, "recombine": "exact", "size_iters": 30, "angle_iters": 3}   # B243: m02 on patches
+FILL_FLOOR = 1.2             # B256: the patches' size floor in h_min (m02's cells come out up to ~10 % below their
+                             # target where the water is narrow, fix_rings shrinks some by a few %; the floor check
+                             # stays at h_min)
 
 
 @dataclass
@@ -341,6 +344,30 @@ def join_slopes(pts: np.ndarray, hk: np.ndarray, fine: np.ndarray, join_pts: np.
     return gk
 
 
+def chord_test(pieces: list, closed: list):
+    """B256: the bay search's chord test for a group (meshom.insert.realcoast.RealCoast.prepare's chord_ok): a pocket
+    of piece k whose mouth chord a -> b crosses another piece (an island, the other bank of a channel) is no bay and
+    is not bridged (the chord would cut through the land beside it and close the passage between)."""
+    segs, own = [], []
+    for k, (p, cl) in enumerate(zip(pieces, closed)):
+        q = np.vstack([p, p[:1]]) if cl else p
+        if len(q) >= 2:
+            segs.append(np.stack([q[:-1], q[1:]], axis=1))
+            own.append(np.full(len(q) - 1, k))
+    S, own = np.concatenate(segs), np.concatenate(own)
+    mid = S.mean(1)
+    half = float(0.5 * np.linalg.norm(S[:, 1] - S[:, 0], axis=1).max())
+    tree = cKDTree(mid)
+
+    def ok(k, a, b):
+        c = 0.5 * (a + b)
+        for i in tree.query_ball_point(c, 0.5 * float(np.linalg.norm(b - a)) + half + 1.0):
+            if own[i] != k and _seg_cross(a, b, S[i, 0], S[i, 1]):
+                return False
+        return True
+    return ok
+
+
 class GroupH:
     """B243: the group's size field (sphere metres): h(x) = max(h_min, min(cap(x), min_k h_k + g_k |x - p_k|)), the
     cone over the samples p_k (the cross lines' nodes at their spacing, the joins' nodes at their host edge length, the
@@ -464,12 +491,30 @@ def coast_arc(rc, xa: np.ndarray, xb: np.ndarray, guide: np.ndarray, env_xy: np.
                f"{da / 1e3:.1f} / {db / 1e3:.1f} km off"), k
 
 
-def join_raw(rc, env_xy: np.ndarray, gap_m: float, island_km2: float, chart: Chart) -> dict:
+def bank_sides(c_xy: list) -> list:
+    """B255: per channel, the chart points of its two banks' ends: (S ends (2,2), N ends (2,2)); bank S is the end on
+    the right looking from cross line a to b (as build's blocks take them)."""
+    out = []
+    for A, B in c_xy:
+        t = B.mean(0) - A.mean(0)
+        s, n = [], []
+        for line in (A, B):
+            cr = [t[0] * (p[1] - line.mean(0)[1]) - t[1] * (p[0] - line.mean(0)[0]) for p in line]
+            iS = int(np.argmin(cr))
+            s.append(line[iS])
+            n.append(line[1 - iS])
+        out.append((np.array(s), np.array(n)))
+    return out
+
+
+def join_raw(rc, env_xy: np.ndarray, gap_m: float, island_km2: float, chart: Chart, apart: list = ()) -> dict:
     """B241, on the raw coast pieces before the smoothing (an island narrower than the smoothing's width would vanish
     in it): the islands (closed pieces inside the envelope) smaller than island_km2 are removed; then, closest pair
     first, an island closer than gap_m (sphere metres) to another piece is joined to it (join_island; to an island:
-    the two become one island; to any other piece: the island becomes part of that coast). Changes rc.pieces /
-    rc.closed in place; returns the record (joined, dropped)."""
+    the two become one island; to any other piece: the island becomes part of that coast). B255: apart = per channel
+    (its bank S ends, its bank N ends) in chart metres (bank_sides): the pieces nearest to a channel's S ends and those
+    nearest to its N ends are never joined to each other, nor are the pieces joined into them (a channel narrower than
+    gap_m stays open). Changes rc.pieces / rc.closed in place; returns the record (joined, dropped, apart)."""
     sc = float(np.mean(chart.scale(env_xy)))
     gap, reach = gap_m * sc, BRIDGE_REACH * gap_m * sc
 
@@ -490,6 +535,17 @@ def join_raw(rc, env_xy: np.ndarray, gap_m: float, island_km2: float, chart: Cha
         keep.append(k)
     pcs, cls, isl = [pcs[k] for k in keep], [cls[k] for k in keep], [isl[k] for k in keep]
     trees = [cKDTree(p) for p in pcs]
+    tags = [set() for _ in pcs]                            # B255: (channel, side) of the banks each piece holds
+    for ci, sides in enumerate(apart):
+        for side, ends in zip("SN", sides):
+            for q in np.atleast_2d(ends):
+                tags[int(np.argmin([tr.query(q)[0] for tr in trees]))].add((ci, side))
+    other = {"S": "N", "N": "S"}
+
+    def opposite(k, t):
+        return any((ci, other[sd]) in tags[t] for ci, sd in tags[k])
+
+    kept_apart = set()
     while True:
         best = None
         for k in range(len(pcs)):
@@ -499,6 +555,9 @@ def join_raw(rc, env_xy: np.ndarray, gap_m: float, island_km2: float, chart: Cha
                 if t == k:
                     continue
                 d = float(trees[k].query(pcs[t], distance_upper_bound=gap)[0].min())
+                if d < gap and opposite(k, t):             # B255: two banks of one channel
+                    kept_apart |= {ci for ci, sd in tags[k] if (ci, other[sd]) in tags[t]}
+                    continue
                 if d < gap and (best is None or d < best[0]):
                     best = (d, k, t)
         if best is None:
@@ -511,9 +570,10 @@ def join_raw(rc, env_xy: np.ndarray, gap_m: float, island_km2: float, chart: Cha
                                       "to_lonlat": info(pcs[t])["lonlat"]})
         pcs[t] = new
         trees[t] = cKDTree(new)
-        del pcs[k], cls[k], isl[k], trees[k]
+        tags[t] |= tags[k]
+        del pcs[k], cls[k], isl[k], trees[k], tags[k]
     rc.pieces, rc.closed = pcs, cls
-    return {"joined": joined, "dropped": dropped}
+    return {"joined": joined, "dropped": dropped, "apart": sorted(kept_apart)}
 
 
 def build(win, chart: Chart, env_xy: np.ndarray, channels: list, real, h_min: float, gap_m: float,
@@ -577,18 +637,29 @@ def build(win, chart: Chart, env_xy: np.ndarray, channels: list, real, h_min: fl
         return np.maximum(h, h_min * chart.scale(q))
 
     pre = {"joined": [], "dropped": []}
+    inlets = []
     if rc is not None:
-        pre = join_raw(rc, env_xy, gap_m, island_km2, chart)
+        pre = join_raw(rc, env_xy, gap_m, island_km2, chart, apart=bank_sides(c_xy))     # B255: banks kept apart
         def sig_mult(q):                                   # B241: an island keeps its size
             per = float(np.linalg.norm(np.diff(np.vstack([q, q[:1]]), axis=0), axis=1).sum())
             sig = bank_sigma_cells * float(np.median(h0_xy(q)))
             return np.full(len(q), min(1.0, ISLAND_SIGMA * per / max(sig, 1.0)))
 
+        sc_e = float(np.mean(chart.scale(env_xy)))
         rc.prepare(h0_xy, lambda q: np.full(len(np.atleast_2d(q)), np.inf), h_min, bank_sigma_cells, bays=True,
-                   bridge="narrow", sigma_mult=sig_mult, land_cells=land_cells)   # B245: capes cut when asked
+                   bridge="narrow", sigma_mult=sig_mult, land_cells=land_cells,    # B245: capes cut when asked
+                   chord_ok=chord_test(rc.pieces, rc.closed))                     # B256: no chord across land
         for k, (m, cl) in enumerate(zip(rc.smooth, rc.closed)):   # B241: an island inside the envelope keeps its
             if cl and len(m) >= 3 and point_in_polygon(m, env_xy).all():   # smoothed loop: the bay search treats a
-                rc.main[k] = m                                         # loop as open and bridged a whole island
+                b = rc.main[k]                                         # loop as open and bridged a whole island
+                if len(b) >= 3 and abs(_shoelace(b)) > abs(_shoelace(m)) and not crossings([b]):
+                    lo, la = xyz_to_lonlat(chart.inv(b.mean(0)[None]))     # B256: unless the search only bridged
+                                                                           # its inlets (the island grows, simple)
+                    inlets.append({"lonlat": [round(float(lo[0]), 4), round(float(la[0]), 4)],
+                                   "area_km2": round(abs(_shoelace(b)) / sc_e ** 2 / 1e6, 1),
+                                   "inlets_km2": round((abs(_shoelace(b)) - abs(_shoelace(m))) / sc_e ** 2 / 1e6, 1)})
+                    continue
+                rc.main[k] = m
                 rc._pl[k] = Polyline(np.vstack([m, m[:1]]))
                 if rc.base:
                     rc.base[k] = m
@@ -660,9 +731,12 @@ def build(win, chart: Chart, env_xy: np.ndarray, channels: list, real, h_min: fl
             hole_info.append(info)
     state.update(holes=holes)
     rec["islands"] = {"holes": hole_info, "joined": pre["joined"], "dropped": dropped,
+                      "banks_apart": [channels[ci].name for ci in pre.get("apart", [])], "inlets_closed": inlets,
                       "gap_km": gap_m / 1e3, "island_km2": island_km2}
     log(f"[insert {name}] islands: {len(holes)} hole(s), {len(pre['joined'])} joined to land or to each other "
         f"(gap < {gap_m / 1e3:.1f} km), {len(dropped)} dropped (< {island_km2} km^2)", flush=True)
+    if rec["islands"]["banks_apart"]:
+        log(f"[insert {name}]   banks kept apart (B255): {rec['islands']['banks_apart']}", flush=True)
     for hi in hole_info:
         log(f"[insert {name}]   hole {hi['area_km2']} km^2 at {hi['lonlat']}", flush=True)
     for dr in dropped:
@@ -823,8 +897,8 @@ def build(win, chart: Chart, env_xy: np.ndarray, channels: list, real, h_min: fl
     sp_x.append(chart.inv(gp[keep]))
     sp_h.append(gh[keep])
     sp_j.append(np.zeros(int(keep.sum()), bool))
-    H = GroupH(capH, np.vstack(sp_x), np.concatenate(sp_h), growth, h_min, join=np.concatenate(sp_j),
-               g_max=growth_max)
+    H = GroupH(capH, np.vstack(sp_x), np.concatenate(sp_h), growth, FILL_FLOOR * h_min,     # B256: floor margin
+               join=np.concatenate(sp_j), g_max=growth_max)
     fine = ~np.concatenate(sp_j)
     rec["size"] = {"growth": growth, "gap_samples": int(keep.sum()),
                    "gap_h_min_km": float(gh[keep].min() / 1e3) if keep.any() else None,

@@ -128,6 +128,83 @@ def test_join_island_to_a_closed_loop_touching_at_one_point():
     assert abs(group._shoelace(new)) > abs(group._shoelace(A))               # both kept, not the small one alone
 
 
+
+class _Coast:
+    def __init__(self, pieces, closed):
+        self.pieces, self.closed = list(pieces), list(closed)
+
+
+def test_a_channels_two_banks_are_never_joined_across_it():
+    """B255: an island 4 km off the coast, a channel between them (gap_km 9.9 km): without the rule the island joins
+    the coast and the channel closes; with it the island stays, and another island 3 km off the coast still joins."""
+    from meshom.insert.geom import Chart
+    ch = Chart(lonlat_to_xyz(np.array([10.0]), np.array([55.0]))[0])
+    coast = np.c_[np.linspace(-200e3, 200e3, 801), np.zeros(801)]           # the water on its left (north)
+    big = _ellipse(0.0, 14e3, 40e3, 10e3, 240)                               # 4 km off the coast at x = 0
+    small = _ellipse(150e3, 8e3, 5e3, 5e3, 60)                               # 3 km off it
+    env = np.array([[-300e3, -100e3], [300e3, -100e3], [300e3, 100e3], [-300e3, 100e3]])
+    A = np.array([[-20e3, 0.0], [-20e3, 5.3e3]])                             # the channel's cross lines
+    B = np.array([[20e3, 0.0], [20e3, 5.3e3]])
+    old = group.join_raw(_Coast([coast, big, small], [False, True, True]), env, 9.9e3, 10.0, ch)
+    assert len(old["joined"]) == 2                                           # the channel closed
+    rc = _Coast([coast, big, small], [False, True, True])
+    rec = group.join_raw(rc, env, 9.9e3, 10.0, ch, apart=group.bank_sides([(A, B)]))
+    assert rec["apart"] == [0]
+    assert len(rec["joined"]) == 1 and abs(rec["joined"][0]["area_km2"] - np.pi * 25) < 2.0   # the small one
+    kept = [p for p, cl in zip(rc.pieces, rc.closed) if cl]
+    assert len(kept) == 1 and abs(abs(group._shoelace(kept[0])) / 1e6 - np.pi * 400) < 15.0  # the big one stays
+
+
+# ------------------------------------------------------------------------------------------------ B256
+
+SLOT = (65e3, 2e3)                     # an inlet into the island's east end: from x = 65 km out, half-width 2 km
+
+
+def _slotted_island():
+    """The separating island (ISLAND) with a narrow inlet cut into its east end (SLOT), clockwise (water left)."""
+    a, b = ISLAND
+    x0, hw = SLOT
+    t0 = np.arcsin(hw / b)
+    t = np.linspace(t0, 2 * np.pi - t0, 400)
+    ell = np.c_[a * np.cos(t), b * np.sin(t)]                                # counter-clockwise, round the west
+    slot = np.vstack([np.c_[np.linspace(ell[-1, 0], x0, 30), np.full(30, -hw)][1:],
+                      np.c_[np.full(4, x0), np.linspace(-hw, hw, 4)][1:-1],
+                      np.c_[np.linspace(x0, ell[0, 0], 30), np.full(30, hw)][:-1]])
+    return np.vstack([ell, slot])[::-1]
+
+
+def test_an_islands_narrow_inlet_is_bridged_and_no_cell_lies_in_it():
+    """B256: the island's 4 km wide, 40 km deep inlet is bridged by the bay search (the island grows, stays simple):
+    no cell inside it, the record lists the island; every new cell at least the floor (patch floor 1.2 h_min)."""
+    win, ch, loops = _two_channels()
+    loops[2] = ch.inv(_slotted_island())
+    env = np.array([[-330e3, -110e3], [330e3, -110e3], [330e3, 110e3], [-330e3, 110e3]])
+    chans = [group.Channel("north", ch.inv(np.array([[-80e3, 15e3], [-80e3, 95e3]])),
+                           ch.inv(np.array([[80e3, 15e3], [80e3, 95e3]])), 5),
+             group.Channel("south", ch.inv(np.array([[-80e3, -95e3], [-80e3, -15e3]])),
+                           ch.inv(np.array([[80e3, -95e3], [80e3, -15e3]])), 5)]
+    res = group.build(win, ch, env, chans, loops, h_min=2e3, gap_m=9.9e3, island_km2=10.0, growth=0.12,
+                      bank_sigma_cells=0.3, log=lambda *a, **k: None, fill_opts={"verbose": False})
+    assert res.ok, res.record.get("refused") or res.record.get("invalid")
+    assert len(res.record["islands"]["inlets_closed"]) == 1
+    out = res.window
+    xy = ch.fwd(out.points)
+    cen = np.r_[xy[out.tris].mean(1) if out.n_tris else np.zeros((0, 2)), xy[out.quads].mean(1)]
+    inside = (cen[:, 0] > SLOT[0] + 2e3) & (cen[:, 0] < ISLAND[0] - 3e3) & (np.abs(cen[:, 1]) < SLOT[1])
+    assert not inside.any()
+    assert res.record["floor"]["below"] == 0
+
+
+def test_the_chord_test_rejects_chords_across_other_land():
+    """B256: a pocket chord of piece 0 across piece 1 (an island) is rejected; one in open water, or crossing only its
+    own piece, is taken."""
+    coast = np.c_[np.linspace(-50e3, 50e3, 101), np.zeros(101)]
+    island = _ellipse(0.0, 10e3, 5e3, 3e3, 40)
+    ok = group.chord_test([coast, island], [False, True])
+    assert not ok(0, np.array([-20e3, 10.5e3]), np.array([20e3, 10.5e3]))    # through the island
+    assert ok(0, np.array([-20e3, 1e3]), np.array([20e3, 1e3]))              # below it, in the water
+    assert ok(1, np.array([-6e3, 10.5e3]), np.array([6e3, 10.5e3]))          # the island's own chord
+
 # ------------------------------------------------------------------------------------------------ B246, B247
 
 LEVELS = [0.0, 10.0, 20.0, 30.0, 50.0, 100.0, 150.0, 200.0, 250.0, 300.0, 350.0, 400.0, 500.0, 600.0, 800.0,

@@ -1293,23 +1293,30 @@ def run(run_dir: Path, spec: Spec, out_dir: Path | None = None, mesh_name: str |
     log(f"[insert {spec.name}] window {radius / 1e3:.0f} km: {win.mesh.n_nodes} nodes, {win.mesh.n_elems} elems",
         flush=True)
     orca = "orca" in cfg.mesh.method                       # B193: an ORCA run (its windows may still be meshom's)
-    if spec.kind == "strait":
-        res = insert_window(win, spec, h_run, cfg.size_tolerance() or 0.20, cfg.gates_all(), log, real=real,
-                            h_min=h_min, orca=orca)
-    elif spec.kind == "group":                               # B240: channels, patches and islands in one envelope
-        from meshom.insert.group import insert_group
-
-        res = insert_group(win, spec, log, real=real, h_min=h_min)
-    else:                                                    # B181 / B182: a coastal strip or a current corridor
-        from meshom.insert.band import insert_band
-
-        res = insert_band(win, spec, h_run, cfg.size_tolerance() or 0.20, cfg.gates_all(), log, real=real,
-                          h_min=h_min, orca=orca)
-    rec = {"run": str(run_dir), "mesh": str(src), "config": str(run_dir / "config.resolved.toml"),
-           "spec": {k: (v.tolist() if isinstance(v, np.ndarray) else v) for k, v in dataclasses.asdict(spec).items()
-                    if k != "path"} | {"path_lonlat": np.c_[xyz_to_lonlat(spec.path)].T.tolist()},
-           "window_km": radius / 1e3, "h_min_m": h_min, "h_min_source": h_min_src, **res.record}
+    head = {"run": str(run_dir), "mesh": str(src), "config": str(run_dir / "config.resolved.toml"),
+            "spec": {k: (v.tolist() if isinstance(v, np.ndarray) else v) for k, v in dataclasses.asdict(spec).items()
+                     if k != "path"} | {"path_lonlat": np.c_[xyz_to_lonlat(spec.path)].T.tolist()},
+            "window_km": radius / 1e3, "h_min_m": h_min, "h_min_source": h_min_src}
     stem = out_dir / f"insert_{spec.name}"
+    try:
+        if spec.kind == "strait":
+            res = insert_window(win, spec, h_run, cfg.size_tolerance() or 0.20, cfg.gates_all(), log, real=real,
+                                h_min=h_min, orca=orca)
+        elif spec.kind == "group":                           # B240: channels, patches and islands in one envelope
+            from meshom.insert.group import insert_group
+
+            res = insert_group(win, spec, log, real=real, h_min=h_min)
+        else:                                                # B181 / B182: a coastal strip or a current corridor
+            from meshom.insert.band import insert_band
+
+            res = insert_band(win, spec, h_run, cfg.size_tolerance() or 0.20, cfg.gates_all(), log, real=real,
+                              h_min=h_min, orca=orca)
+    except InsertError as ex:                                # B254: a rule that fails after the joins (forced ones
+        log(f"[insert {spec.name}] REFUSED {ex}", flush=True)   # too) is a refusal, not the end of the command
+        rec = head | {"status": "refused", "refused": [str(ex)]}
+        stem.with_suffix(".json").write_text(json.dumps(_jsonable(rec), indent=1))
+        return rec
+    rec = head | res.record
     if res.profile is not None:
         figures.profile(stem.with_suffix(".profile.png"), res.profile, res.joins, res.candidates)
     if not res.ok and (res.window is None or res.profile is not None):

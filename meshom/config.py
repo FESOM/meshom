@@ -39,14 +39,15 @@ docs/config.md has the full description and an example. Tables (units: metres, k
               [west, east, south, north] or polygon = [[lon, lat], ...]; the first region holding a strait's middle
               point wins; with any region, a strait in none is not opened
     [[inserts]]  curvilinear inserts fitted into the finished run by `python -m meshom.insert` (not by
-              `meshom run`; decisions B158-B169, B180-B185): kind ("strait" | "strip" | "corridor"), name, strait or
+              `meshom run`; decisions B158-B169, B180-B185): kind ("strait" | "strip" | "corridor" | "group"), name, strait or
               path, mouth_a / mouth_b (join hints), cells or h_fine_m, reach_km, force, stages, ring_rows,
               bank_sigma_h, width_km and band_km (strip, corridor), ljoins, cells_a / cells_b, growth_a / growth_b,
               bank_land_cells (B200-B202), fill, fill_rows (B204), corner_steps (B206), add_columns (B207),
               corner_split (B208), join_margin (B209), fix_rings (B210), depth_at, depth_smooth, strait_floor
               (B211), sill_level (B212, B215), depth_channel (B213), depth_quantile (B214), depth_area
               (B250); kind "depth": a depth region, the mesh unchanged (width_km round the path, or
-              polygon; B223)
+              polygon; B223); group: envelope,
+              channels (B240, B242), gap_km, island_km2 (B241), growth, gap_cells (B243), bank_smooth_cells (B245)
               (meshom.config.InsertCfg)
     [size]    grad_max (|grad h| limit of the gradient limiter, default 0.1; inf = no limiting), h_min_m / h_max_m
               (optional global clip), preview_deg (UI preview grid), limiter_max_nodes (grid size cap), from (an h
@@ -245,7 +246,9 @@ class InsertCfg:
     kind: str = "strait"                               # "strait" | "strip" (a coastal strip: path along the coast)
                                                        # | "corridor" (open water: path = the axis) (B181, B182;
                                                        # both experimental) | "depth" (a depth region: the host nodes
-                                                       # take the GEBCO rule, the mesh unchanged; B223)
+                                                       # take the GEBCO rule, the mesh unchanged; B223) | "group"
+                                                       # (channels, patches and islands in one envelope, B240;
+                                                       # experimental)
     width_km: float | None = None                      # strip: coast to the offshore join; corridor, depth: full width
     band_km: float | None = None                       # strip / corridor: width of the fine band (default: what the
                                                        # room left after the growth to the host size, B181)
@@ -305,6 +308,18 @@ class InsertCfg:
                                                        # bottoms (after the other own rules; the dam kept, B250)
     polygon: list = field(default_factory=list)       # kind "depth": the region [[lon, lat], ...] (great-circle
                                                        # edges) instead of width_km round the path (B223)
+    envelope: list = field(default_factory=list)      # group: [[lon, lat], ...] polygon: the host cells whose
+                                                       # centroid lies inside are replaced as a whole (B240)
+    channels: list = field(default_factory=list)      # group: [{name, a, b, cells}, ...]: a channel block between the
+                                                       # cross lines a and b ([[lon, lat], [lon, lat]], bank to bank),
+                                                       # `cells` across from a to b (B242)
+    gap_km: float | None = None                        # group: an island closer than this to other land joins it
+                                                       # (default 5 x h_min_m, B241)
+    island_km2: float = 10.0                           # group: an island smaller than this is dropped (water, B241)
+    growth: float | None = None                        # group: the size slope of the patches and blocks (0.12, B243)
+    gap_cells: int = 3                                 # group: the least fill cells across any passage (B243)
+    bank_smooth_cells: float = 0.0                     # group: each block's banks smoothed by a Gaussian of this many
+                                                       # of its cells, ends held: capes cut, pockets filled (B245)
 
 
 @dataclass

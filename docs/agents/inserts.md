@@ -18,6 +18,8 @@ none is made by default.
 - `kind = "corridor"` (experimental): a band along an axis in open water (a current).
 - `kind = "depth"`: no mesh change; the host's nodes in a region round a strait take the insert's GEBCO depth rule
   ([Depth only](#depth-only-a-depth-region-on-the-plain-host)).
+- `kind = "group"` (experimental): several channels, the basins and junctions between them and their islands in one
+  envelope of host cells (a strait system: parallel channels round islands, passages the host closes).
 
 ## Run one
 
@@ -87,6 +89,11 @@ h_min_m = 1000.0                   # the size floor (default: the host mesh's sm
 | `depth_quantile` | 0 | the insert's nodes take this quantile of the grid's ocean cells in their node box instead of the mean (B214) |
 | `depth_area` | false | after the other depth rules, the insert's nodes are scaled so that each section across the strait has the grid's wet area in FESOM3's element bottoms (the dam of `sill_level` kept; B250) |
 | `stages` | `"d,b,e,a"` | the clean-up stages on the join ring ([`cleanup.md`](cleanup.md); B162) |
+| `envelope` | | group: `[[lon, lat], ...]`, the host cells whose centroid lies inside are replaced as a whole (B240) |
+| `channels` | | group: `[[inserts.channels]]` tables `name`, `a`, `b` (cross lines bank to bank), `cells` (default 5, held from `a` to `b`) (B242) |
+| `gap_km`, `island_km2` | 5 x `h_min_m`, 10 | group: an island closer than `gap_km` to other land joins it; one smaller than `island_km2` is dropped (B241) |
+| `gap_cells`, `growth` | 3, 0.12 | group: the least fill cells across any passage; the size slope of the fill (B243) |
+| `bank_smooth_cells` | 0 | group: each block bank smoothed over this many block cells, ends held: capes cut (B245) |
 | `force` | false | build with the least-violating joins when none passes |
 
 ## Rules and refusals
@@ -265,10 +272,81 @@ buffer or a polygon like the one above: its two short sides cross Smith Sound an
 
 - `[[inserts]]`: `name`, `kind`, `strait`, `path`, `cells`, `h_fine_m`, `h_min_m`, `reach_km`, `mouth_a`, `mouth_b`, `ljoins`, `bays`, `collar_rings`, `coast`, `coast_source`, `bank_sigma_cells`, `width_km`, `band_km`, `rows`, `coast_rounds`, `coast_shift_cells`, `cells_a`, `cells_b`, `growth_a`, `growth_b`, `bank_land_cells`, `fill`, `fill_rows`, `corner_steps`, `corner_split`, `join_margin`, `add_columns`, `fix_rings`, `depth_at`, `depth_smooth`, `strait_floor`, `sill_level`, `depth_channel`, `depth_quantile`, `depth_area`, `stages`, `force`
 - `[[inserts]]`: `name`, `kind`, `strait`, `path`, `cells`, `h_fine_m`, `h_min_m`, `reach_km`, `mouth_a`, `mouth_b`, `ljoins`, `bays`, `collar_rings`, `coast`, `coast_source`, `bank_sigma_cells`, `width_km`, `band_km`, `rows`, `coast_rounds`, `coast_shift_cells`, `cells_a`, `cells_b`, `growth_a`, `growth_b`, `bank_land_cells`, `fill`, `fill_rows`, `corner_steps`, `corner_split`, `join_margin`, `add_columns`, `fix_rings`, `depth_at`, `depth_smooth`, `strait_floor`, `sill_level`, `depth_channel`, `depth_quantile`, `polygon`, `stages`, `force`
+## Group inserts (`kind = "group"`, experimental)
+
+A group replaces every host cell whose centroid lies inside `envelope` by a new mesh of the real water there (B240):
+the joins are the host edges where the envelope's cells meet the host cells outside it (as many as there are, node
+for node); the host's coast between two joins is replaced by the real coast; the real islands inside are kept as
+holes, joined to nearby land (`gap_km`) or dropped (`island_km2`) (B241). Each `[[inserts.channels]]` entry is a
+structured quad block between its cross lines `a` and `b`, `cells` across from end to end, no triangle inside (B242);
+the rest of the water (basins, junctions, the passages round islands) is a quad-dominant fill whose size grows from
+the cross lines and the narrow gaps (at least `gap_cells` cells across) to the host's at the joins (B243). With
+`sill_level = "grid"` each channel holds its own saddle (B244).
+
+```toml
+[[inserts]]
+name = "lombok_alas"
+kind = "group"
+envelope = [[114.63, -7.38], [117.87, -7.38], [117.87, -9.87], [114.63, -9.87]]
+island_km2 = 5.0
+bank_sigma_cells = 0.5
+bank_smooth_cells = 1.0
+fix_rings = 3
+depth_at = "node"
+depth_smooth = 0
+strait_floor = false
+sill_level = "grid"
+
+[[inserts.channels]]
+name = "lombok_n"                  # Bali - Lombok
+a = [[115.66, -8.36], [116.10, -8.36]]
+b = [[115.55, -8.52], [116.10, -8.56]]
+cells = 4
+
+[[inserts.channels]]
+name = "lombok_s"                  # Nusa Penida - Lombok
+a = [[115.60, -8.68], [115.92, -8.72]]
+b = [[115.62, -8.84], [115.85, -8.86]]
+cells = 4
+
+[[inserts.channels]]
+name = "alas"                      # Lombok - Sumbawa (closed in the host)
+a = [[116.68, -8.42], [116.80, -8.42]]
+b = [[116.64, -8.62], [116.76, -8.62]]
+cells = 3
+```
+
+Choose in this order:
+
+1. **Envelope.** Wide enough that the size can grow from the finest channel back to the host's before the joins
+   (about (host cell - channel cell) / 0.12 on every side) and with its edges in open water: a join across real land
+   or an island crossing the edge is refused ("an island of the real coast crosses the group's boundary"); move the
+   edge off it.
+2. **Channels.** A cross line at each end of a channel, both ends on the same two pieces of land (a channel whose
+   bank changes island, as Lombok Strait at Nusa Penida, is two channels meeting in a junction patch). `cells` is
+   the count at the narrowest; 3 is enough where 5 would force cells near the floor. Put the controlling sill inside
+   the block, not in a patch, so its dam holds.
+3. **Islands.** `gap_km` closes passages narrower than about 5 floor cells; lower it to keep an island inside a
+   passage open; `island_km2` drops the small ones.
+4. **Capes.** A block wrapping round a thin cape folds; `bank_smooth_cells = 1-2` cuts the cape (the block covers
+   it). `bank_sigma_cells = 0.5` keeps islands near a coast from overlapping it after the smoothing.
+5. **`fix_rings = 3`** relaxes the angles of the patches and of the host rings round them (B210, B220).
+
+Judge it as a strait (above), per channel: cells across at its narrowest and sill sections, the section areas against
+the bathymetry in the model's levels, the sills (record `depth.branches`), and over the group: the worst quad and the
+quads above 120 deg, the smallest cell, the largest cell against the host and the neighbour size ratio. Known limits:
+the patch cells next to the joins stay finer than the host when the envelope is small (an area ratio of 1.6-2 in
+the first ring); a sill in a patch gets no dam; on three or four cells across, FESOM3's element bottom (the shallowest
+of its nodes' levels) leaves a channel one or two levels shallower than its dam.
+
+## Config keys used
+
+- `[[inserts]]` (group): `envelope`, `channels`, `gap_km`, `island_km2`, `gap_cells`, `growth`, `bank_smooth_cells`
+- `[[inserts]]`: `name`, `kind`, `strait`, `path`, `cells`, `h_fine_m`, `h_min_m`, `reach_km`, `mouth_a`, `mouth_b`, `ljoins`, `bays`, `collar_rings`, `coast`, `coast_source`, `bank_sigma_cells`, `width_km`, `band_km`, `rows`, `coast_rounds`, `coast_shift_cells`, `cells_a`, `cells_b`, `growth_a`, `growth_b`, `bank_land_cells`, `fill`, `fill_rows`, `corner_steps`, `corner_split`, `join_margin`, `add_columns`, `fix_rings`, `depth_at`, `depth_smooth`, `strait_floor`, `sill_level`, `depth_channel`, `depth_quantile`, `stages`, `force`
 
 ## Sources
 
-- Code: `meshom/insert/` (`__main__.py` the command, `core.py`, `region.py` the rules, `block.py`, `band.py`,
+- Code: `meshom/insert/` (`__main__.py` the command, `core.py`, `group.py` the group inserts, `region.py` the rules, `block.py`, `band.py`,
   `harmonic.py`, `realcoast.py`, `network.py` the bays, `assemble.py` the collar, `measure.py`, `channel.py` the
   channel depth rules, `area.py` the section areas), `meshom/io/fesom.py` (`model_levels`: FESOM3's levels),
   `meshom/config.py` (`InsertCfg`).
@@ -276,3 +354,4 @@ buffer or a polygon like the one above: its two short sides cross Smith Sound an
   `docs/examples/inserts_gulf_stream.toml`.
 - Decisions: B158-B169, B180-B186, B190, B192-B220, B250.
 - Decisions: B158-B169, B180-B186, B190, B192-B223.
+- Decisions: B158-B169, B180-B186, B190, B192-B212, B240-B245.

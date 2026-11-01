@@ -736,6 +736,15 @@ the region on its cells); every other node keeps the host's depth (the run's rul
 written: `insert_<name>.npz` (the host mesh), `insert_<name>.json` (`region`, `depth`) and
 `fesom-insert_<name>/depth.npy`, with model files when the run wrote them. The general recipe with examples of each
 kind: `docs/examples/inserts.toml`; bands: `docs/examples/inserts_gulf_stream.toml`.
+use the offset rows. `kind = "group"` (**experimental**, B240-B245) replaces every host cell whose centroid lies inside
+`envelope` (`[[lon, lat], ...]`) by a mesh of the real water there: the joins are the host edges round the envelope's
+cells, the host's coast between them becomes the real coast, the real islands inside are holes (an island closer than
+`gap_km`, default 5 x `h_min_m`, joins the land; one smaller than `island_km2`, default 10 km^2, is dropped); each
+`[[inserts.channels]]` table (`name`, cross lines `a` and `b` bank to bank, `cells` default 5) is a quad block with that
+count from `a` to `b`, and the rest is a quad-dominant fill (at least `gap_cells`, default 3, cells across any passage,
+size slope `growth`, default 0.12); `bank_smooth_cells` (default 0) smooths each block bank over that many block cells
+(capes cut); `sill_level` and `depth_channel` act per channel. The general recipe with examples of each kind:
+`docs/examples/inserts.toml`; bands: `docs/examples/inserts_gulf_stream.toml`.
 
 ### `[gates]`
 

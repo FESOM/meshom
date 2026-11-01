@@ -71,6 +71,12 @@ class Spec:
     depth_quantile: float = 0.0              # B214: the node box's quantile instead of its mean (0: the mean)
     depth_area: bool = False                 # B250: the sections' areas scaled to the grid's
     polygon: np.ndarray | None = None        # B223: kind "depth": the region (K,3) instead of width_m round the path
+    channels: list = field(default_factory=list)  # B240-B242: a group's channels (meshom.insert.group.Channel)
+    gap_km: float | None = None              # B241: a group's island gap (None: 5 x h_min)
+    island_km2: float = 10.0                 # B241: a group's smallest island
+    growth: float | None = None              # B243: a group's size slope (None: 0.12)
+    gap_cells: int = 3                       # B243: a group's least fill cells across any passage
+    bank_smooth_cells: float = 0.0           # B245: a group's block banks smoothed over this many block cells
 
 
 @dataclass
@@ -106,6 +112,21 @@ def spec_from(cfg_entry, cfg=None) -> Spec:
 
     e = cfg_entry
     path = _ll(e.path)
+    if e.kind == "group":                    # B240: the envelope is the path; the channels as Channel
+        from meshom.insert.group import Channel
+
+        env = _ll(e.envelope)
+        if env is None or len(env) < 3:
+            raise InsertError("a group insert needs an envelope polygon of at least 3 points")
+        chans = [Channel(str(c.get("name", f"channel{k}")), _ll(c["a"]), _ll(c["b"]), int(c.get("cells", 5)))
+                 for k, c in enumerate(e.channels)]
+        return Spec(e.name or "group", env, h_min_m=e.h_min_m, coast=e.coast, coast_source=e.coast_source,
+                    bank_sigma_cells=e.bank_sigma_cells, kind="group", fix_rings=e.fix_rings, depth_at=e.depth_at,
+                    depth_smooth=e.depth_smooth, strait_floor=e.strait_floor, sill_level=e.sill_level,
+                    depth_channel=e.depth_channel, depth_quantile=e.depth_quantile, depth_area=e.depth_area,
+                    channels=chans,
+                    gap_km=e.gap_km, island_km2=e.island_km2, growth=e.growth, bank_land_cells=e.bank_land_cells,
+                    gap_cells=e.gap_cells, bank_smooth_cells=e.bank_smooth_cells)
     if e.kind not in ("strait", "depth"):
         if path is None or e.width_km is None:
             raise InsertError(f"an insert of kind {e.kind!r} needs a path and width_km")
@@ -1211,6 +1232,8 @@ def run(run_dir: Path, spec: Spec, out_dir: Path | None = None, mesh_name: str |
     h_host = host_size(mesh, stm.densify(spec.path, 1000.0), max(half, 3000.0) + PROBE_KM * 1e3)
     reach = spec.reach_m or region.REACH_H * h_host
     radius = half + 1.5 * reach + WINDOW_PAD_H * h_host
+    if spec.kind == "group":                                 # B240: the envelope and WINDOW_PAD_H host cells round it
+        radius = half + WINDOW_PAD_H * h_host
     win = cut_window(mesh, c, radius)
     log(f"[insert {spec.name}] window {radius / 1e3:.0f} km: {win.mesh.n_nodes} nodes, {win.mesh.n_elems} elems",
         flush=True)
@@ -1218,6 +1241,10 @@ def run(run_dir: Path, spec: Spec, out_dir: Path | None = None, mesh_name: str |
     if spec.kind == "strait":
         res = insert_window(win, spec, h_run, cfg.size_tolerance() or 0.20, cfg.gates_all(), log, real=real,
                             h_min=h_min, orca=orca)
+    elif spec.kind == "group":                               # B240: channels, patches and islands in one envelope
+        from meshom.insert.group import insert_group
+
+        res = insert_group(win, spec, log, real=real, h_min=h_min)
     else:                                                    # B181 / B182: a coastal strip or a current corridor
         from meshom.insert.band import insert_band
 
@@ -1240,6 +1267,12 @@ def run(run_dir: Path, spec: Spec, out_dir: Path | None = None, mesh_name: str |
         full, sinfo = splice(mesh, win, res.window)
         rec["timing"]["splice_s"] = time.perf_counter() - t
         cfid, chid, rec["collar_moved"] = collar_moved(win, res, full, sinfo)      # B217, before any fixer move
+        if spec.kind == "group":                                     # B244: the blocks' nodes before any move
+            from meshom.insert.group import ids_in
+
+            res.group_ids = ids_in(full, res.group)
+            np.savez(stem.parent / (stem.name + ".group.npz"),     # per channel: its block's and cross lines' ids
+                     **{f"{w}{k}": v for k, (b, x) in enumerate(res.group_ids) for w, v in (("block", b), ("cross", x))})
         if spec.fix_rings > 0 and res.record.get("valid"):           # B210: stage a on the insert and its rings
             full, rec["fix_rings"], moved, res.window = fix_spliced(mesh, win, res, full, sinfo, spec, h_min, log)
     seg = res.chart.fwd(win.mesh.points)[win.coast_edges]
@@ -1274,8 +1307,15 @@ def run(run_dir: Path, spec: Spec, out_dir: Path | None = None, mesh_name: str |
         fmt = cfg.mesh.format
         meta = {}
         depth = runmod.model_depth(full, cfg, fmt, straits, run_dir, meta)
-        depth, rec["depth"] = insert_depth(depth, mesh, win, res, full, sinfo, h2n, moved, spec, cfg, fmt, straits,
+        spec_d = dataclasses.replace(spec, sill_level="", depth_channel="") if spec.kind == "group" else spec
+        depth, rec["depth"] = insert_depth(depth, mesh, win, res, full, sinfo, h2n, moved, spec_d, cfg, fmt, straits,
                                            run_dir, log, host=host_depth_of(src, mesh.n_nodes), collar=(cfid, chid))
+        if spec.kind == "group" and (spec.sill_level or spec.depth_channel) and cfg.bathymetry.source != "none":
+            from meshom.insert.group import branch_depth                   # B244: each channel's own sill
+
+            depth, rec["depth"]["branches"] = branch_depth(
+                full, depth, res.group_ids, cfg, spec.sill_level, spec.depth_channel,
+                [c["cell_min_km"] * 1e3 for c in res.record["channels"]], log, f"[insert {spec.name}]")
         fdir = out_dir / f"fesom-insert_{spec.name}"
         fdir.mkdir(exist_ok=True)
         np.save(fdir / "depth.npy", depth)

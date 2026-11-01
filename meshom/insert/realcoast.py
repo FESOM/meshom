@@ -31,6 +31,8 @@ from meshom.insert.geom import Polyline
 
 SIGMA_CELLS = 1.5            # B164: the bank smoothing's Gaussian, in local insert cells
 STEP_CELLS = 0.25            # B164: resampling step of the smoothed coast, in the smallest local cell
+JOINT_PIECES = 4             # B219: a bank whose ends lie nearest different coast pieces also tries this many pieces
+                             # nearest to both ends
 BLEND_H = 2.0                # B164: a bank blends from the join's host end node onto the real coast over this many
                              # join cells
 DEPTH_H = 1.0                # B166: a pocket is a bay when deeper than this many local cells ...
@@ -480,23 +482,58 @@ class RealCoast:
             which: str = "main") -> tuple[np.ndarray | None, str]:
         """The main coast from the point nearest to xa to the point nearest to xb (both on one piece; on a closed
         piece the way nearer to `guide`, the host's bank), blended at both ends onto xa and xb exactly (BLEND_H
-        join cells; the caller passes the join cell sizes through `blend`). Returns (polyline or None, why)."""
+        join cells; the caller passes the join cell sizes through `blend`). When the two ends' nearest pieces differ
+        (an island nearer one end than the main coast), the piece is chosen for both ends together (B219): of the
+        two nearest pieces and the JOINT_PIECES pieces nearest to both ends (the larger of the two distances), the
+        way closest to `guide` (the mean distance both ways; without a guide the least sum of the ends' distances).
+        Returns (polyline or None, why: the reason when None, a note when the piece was chosen jointly)."""
         ka, sa, _ = self.nearest(xa, which)
         kb, sb, _ = self.nearest(xb, which)
-        if ka < 0 or ka != kb:
-            return None, "the two ends lie on different coast pieces"
-        pl = self._pls(which)[ka]
-        if not self.closed[ka]:
-            ways = [_sub(pl, sa, sb)]
-        else:
-            L = pl.L
-            fwd = _sub(pl, sa, sb if sb >= sa else sb + L, wrap=L)
-            bwd = _sub(pl, sb, sa if sa >= sb else sa + L, wrap=L)[::-1]
-            ways = [fwd, bwd]
+        if ka < 0:
+            return None, "no coast piece near the bank's ends"
+        pls = self._pls(which)
+        note = ""
+        if ka != kb:
+            dist = np.full((len(pls), 2), np.inf)
+            proj = np.zeros((len(pls), 2))
+            for k, pl in enumerate(pls):
+                if pl.L <= 0:
+                    continue
+                for e, x in enumerate((xa, xb)):
+                    proj[k, e] = float(pl.project(x[None])[0])
+                    dist[k, e] = float(np.linalg.norm(pl.at(proj[k, e])[0] - x))
+            far = dist.max(1)
+            near = [int(k) for k in np.argsort(far)[:JOINT_PIECES] if np.isfinite(far[k])]
+            cand = list(dict.fromkeys([ka, kb] + near))
+            best = None
+            for k in cand:
+                for w in self._ways(k, proj[k, 0], proj[k, 1], which):
+                    if guide is not None:
+                        gp = Polyline(guide)
+                        c = float(np.mean(Polyline(w).distance(gp.xy))) + float(np.mean(gp.distance(w)))
+                    else:
+                        c = float(dist[k].sum())
+                    if best is None or c < best[0]:
+                        best = (c, k, w)
+            _, k, w = best
+            note = (f"the ends' nearest coast pieces differ ({ka}, {kb}); piece {k} chosen for both ends and the "
+                    f"guide (ends {dist[k, 0] / 1e3:.2f} / {dist[k, 1] / 1e3:.2f} km from it)")
+            return w, note
+        ways = self._ways(ka, sa, sb, which)
         if guide is not None and len(ways) > 1:
             gp = Polyline(guide)
             ways.sort(key=lambda w: float(np.mean(Polyline(w).distance(gp.xy))) + float(np.mean(gp.distance(w))))
-        return ways[0], ""
+        return ways[0], note
+
+    def _ways(self, k: int, sa: float, sb: float, which: str = "main") -> list:
+        """the coast of piece k from arc length sa to sb (a closed piece: both ways round)."""
+        pl = self._pls(which)[k]
+        if not self.closed[k]:
+            return [_sub(pl, sa, sb)]
+        L = pl.L
+        fwd = _sub(pl, sa, sb if sb >= sa else sb + L, wrap=L)
+        bwd = _sub(pl, sb, sa if sa >= sb else sa + L, wrap=L)[::-1]
+        return [fwd, bwd]
 
 
 def _bridge_narrow(C: np.ndarray, h_loc, step: float) -> np.ndarray:

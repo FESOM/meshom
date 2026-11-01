@@ -217,6 +217,47 @@ def test_real_coast_banks_follow_the_real_coast_and_clean_the_core(banana_real):
     for j in real.joins:
         d = np.min(np.linalg.norm(real.window.points[None] - win.mesh.points[j.nodes][:, None], axis=2), axis=1)
         assert d.max() < 1e-12
+    assert real.record["bank_fallback"] == [] and real.record["bank_joint"] == []
+
+
+def test_a_bank_end_near_an_island_still_takes_the_main_coast():
+    """B219: one end of the host's bank lies nearer a small island (0.6 km) than the main coast (1.6 km); the coast
+    piece is chosen for both ends together and the host's bank as the guide: the bank follows the main coast from
+    end to end (before: no real bank, "the two ends lie on different coast pieces"), and the reply says how."""
+    from meshom.insert import realcoast as rcm
+
+    km = 1e3
+    x = np.linspace(-50, 50, 201) * km
+    main = np.c_[x, np.zeros_like(x)]                                    # water on the left (north)
+    t = np.linspace(0, 2 * np.pi, 41)[:-1]
+    island = np.c_[-30 * km + 1.0 * km * np.cos(-t), 3.2 * km + 1.0 * km * np.sin(-t)]   # clockwise: water left
+    rc = rcm.RealCoast([main, island], [False, True])
+    rc.prepare(lambda q: np.full(len(q), 2.5 * km), lambda q: np.full(len(q), np.inf), 2.5 * km, 0.0, False)
+    xa, xb = np.array([-30 * km, 1.6 * km]), np.array([30 * km, 0.5 * km])
+    assert rc.nearest(xa)[0] == 1 and rc.nearest(xb)[0] == 0
+    guide = np.c_[np.linspace(xa[0], xb[0], 30), np.linspace(xa[1], xb[1], 30)]
+    arc, why = rc.arc(xa, xb, guide=guide)
+    assert arc is not None and "chosen for both ends" in why
+    assert np.abs(arc[:, 1]).max() < 1.0 and arc[0, 0] == pytest.approx(-30 * km, abs=1.0)
+    assert arc[-1, 0] == pytest.approx(30 * km, abs=1.0)
+    same, why2 = rc.arc(np.array([-30 * km, -0.5 * km]), xb, guide=guide)    # both ends nearest the main coast
+    assert same is not None and why2 == ""
+
+
+def test_a_bank_on_the_host_coast_is_reported(monkeypatch):
+    """B219: when a real bank cannot be had, the bank falls back to the host's coast and the record says so in
+    `bank_fallback` (which bank, why, its ends) and the log warns."""
+    from meshom.insert import realcoast as rcm
+
+    win, ch, path, loops = synth.strait_real(H=H, L=400e3)
+    monkeypatch.setattr(rcm.RealCoast, "arc", lambda self, xa, xb, guide=None, which="main": (None, "probe"))
+    lines = []
+    r = insert_window(win, Spec("fb", path, cells=10, stages=""), Uniform(H), real=loops,
+                      log=lambda *a, **k: lines.append(" ".join(map(str, a))))
+    fb = r.record["bank_fallback"]
+    assert [f["bank"] for f in fb] == ["S", "N"] and all(f["reason"] == "probe" for f in fb)
+    assert all(len(f["ends_lonlat"]) == 2 for f in fb) and r.record["banks"] == ["host (probe)"] * 2
+    assert sum("WARNING: bank" in s for s in lines) == 2
 
 
 def test_size_floor_caps_the_cells_across_and_says_so():
@@ -1275,3 +1316,59 @@ def test_fix_rings_relaxes_the_insert_and_holds_the_cut_and_the_host_coast():
     at_host = np.zeros(full.n_nodes, bool)
     at_host[h2n[h2n >= 0]] = True
     assert rec["host_moved"] == (mv & at_host).sum() > 0 and np.array_equal(np.sort(moved), np.flatnonzero(mv & at_host))
+    assert rec["kept"] == "after" and rec["objectives"]["after"]["q120"] < rec["objectives"]["before"]["q120"]
+
+
+def test_fix_rings_keeps_its_input_when_its_result_is_worse(monkeypatch):
+    """B220: when stage a returns a worse mesh by the insert's objectives (here a stage that jitters every free node
+    by 0.3 cells), fix_rings keeps its input: no node moves, no host node is reported moved, the record names the
+    mesh kept, the rule's reason and both sets of objectives."""
+    import meshom.meshfix.geom as geom
+    from meshom.insert import assemble
+    from meshom.insert.core import _part
+
+    win, ch, path, loops = synth.strait_real(H=H, L=400e3)
+    res = insert_window(win, Spec("fixw", path, cells=10, stages=""), Uniform(H), real=loops, log=lambda *a, **k: None)
+    full, sinfo = splice(win.mesh, win, res.window)
+    h2n = sinfo["host_to_new"]
+    cut = np.zeros(full.n_nodes, bool)
+    cut[h2n[win.old_id[win.kind == 2]]] = True
+
+    def jitter(case, opts):
+        p = case.mesh.points.copy()
+        free = case.kind == 0
+        p[free] += 0.3 * H / 6.371e6 * np.random.default_rng(3).standard_normal((free.sum(), 3))
+        p /= np.linalg.norm(p, axis=1, keepdims=True)
+        return Mesh(p, case.mesh.tris, case.mesh.quads, case.mesh.node_flag), {"info": {}}
+
+    monkeypatch.setattr(geom, "fix", jitter)
+    out, rec, moved = assemble.fix_rings(win.mesh, full, _part(full, res.window), cut, 3, 0.0, H,
+                                         res.chart.inv(np.zeros((1, 2)))[0], "fixw")
+    assert np.array_equal(out.points, full.points) and len(moved) == 0 and rec["host_moved"] == 0
+    assert rec["kept"] == "before" and rec["keep_rule"]
+    ob, oa = rec["objectives"]["before"], rec["objectives"]["after"]
+    assert oa["q120"] > ob["q120"] or oa["invalid"] > ob["invalid"]
+    assert rec["fixer_result"]["qmax"] > rec["after"]["qmax"] == rec["before"]["qmax"]
+
+
+def test_keep_after_rule():
+    """B220: the rule in its order: invalid cells, cells below the floor, the angle excess above 120 deg (the sum over
+    the quads, 0.5 deg), the worst corner (0.5 deg), then the sizes vote (ratio p99 0.005, cell / host 0.01, smallest
+    cell 1 %); a tie keeps the result."""
+    from meshom.insert.assemble import keep_after
+
+    base = {"excess_deg": 0.0, "qmax": 117.05, "q120": 0, "smallest_m": 7380.0, "below_floor": 0, "cell_host": 0.67,
+            "ratio_p99": 1.2748, "invalid": 0}
+    worse = base | {"excess_deg": 1.6, "qmax": 121.0, "q120": 2, "ratio_p99": 1.2860}  # Investigator's smoothing
+    assert keep_after(base, worse)[0] is False and keep_after(worse, base)[0] is True
+    assert keep_after(base, base | {"invalid": 1})[0] is False
+    assert keep_after(base, base | {"below_floor": 1, "qmax": 100.0})[0] is False
+    assert keep_after(base, base | {"qmax": 118.0})[0] is False and keep_after(base, base | {"qmax": 117.4})[0]
+    many = base | {"excess_deg": 41.0, "q120": 3, "qmax": 148.9}                         # three bad corners ...
+    few = base | {"excess_deg": 2.5, "q120": 5, "qmax": 121.0}                           # ... or five just above
+    assert keep_after(many, few)[0] is True and keep_after(few, many)[0] is False
+    gib = base | {"excess_deg": 30.0, "q120": 3, "qmax": 135.7}
+    assert keep_after(gib, base | {"qmax": 106.1, "ratio_p99": 1.5, "cell_host": 1.10})[0] is True
+    assert keep_after(base, base | {"ratio_p99": 1.29})[0] is False                 # the sizes, angles tied
+    assert keep_after(base, base | {"ratio_p99": 1.29, "cell_host": 0.60, "smallest_m": 7500.0})[0] is True
+    assert keep_after(base, base | {"ratio_p99": 1.2770, "cell_host": 0.675})[0] is True    # within tolerances

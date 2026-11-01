@@ -65,7 +65,7 @@ h_min_m = 1000.0                   # the size floor (default: the host mesh's sm
 | `ljoins` | true | L-shaped joins round a cape when no straight join passes (B183) |
 | `bays` | `"auto"` | a bay with a mouth of at least 3 insert cells, reaching inland at least its mouth's width, gets its own block; smaller ones are bridged; `true`: every bay with a 2-cell mouth; `false`: none (B166, B190) |
 | `collar_rings` | 10 on meshom's meshes and triangle hosts, 0 on ORCA | host cells within this many element rings of the joins are cleaned with the insert's edge rows; 0 keeps every host node and cell (B192, B193) |
-| `coast`, `coast_source`, `bank_sigma_cells` | `"real"`, the run's coast, 1.5 | the banks follow the real coastline (never the host's staircase), smoothed over 1.5 fine cells (B164) |
+| `coast`, `coast_source`, `bank_sigma_cells` | `"real"`, the run's coast, 1.5 | the banks follow the real coastline (never the host's staircase), smoothed over 1.5 fine cells (B164); a bank whose ends lie nearest to different coast pieces takes the piece that fits both ends and the host's bank; a bank still on the host's coast is listed in `bank_fallback` (B219) |
 | `width_km`, `band_km` | | strip: coast to the host chain; corridor: the full width; the fine band's width |
 | `rows` | `"harmonic"` | strip rows from a harmonic map of the band: they cannot cross (B195-B197); `"offset"` can fold and is then invalid |
 | `coast_rounds`, `coast_shift_cells` | 3, 1 | harmonic strips: extra coast smoothing round quads above 125°, moving the coast at most 1 fine cell (B198) |
@@ -77,10 +77,10 @@ h_min_m = 1000.0                   # the size floor (default: the host mesh's sm
 | `corner_split` | false | strait: each corner triangle of a join is split at the midpoint of its diagonal, the midpoint a node of the block's first row: two triangles of ~0.8 x the host cell instead of one of 1.14 x and a diagonal edge of 1.41 host edges (B208) |
 | `join_margin` | 1.0 | strait: the block's size target at the joins is capped at this many host cell sizes (0.85: the outermost rows a little finer than the host) (B209) |
 | `add_columns` | false | strait: where a block cell is above 1.1 x the host cell the size target is lowered (more columns and rows); on a side with `cells_a` / `cells_b` the counts may then rise above the neck's and the join's and come back to the join's count before the join (B207); it helps where the block fans out at a bank's turn, not at a staircase join's diagonal steps |
-| `fix_rings` | 0 | after the splice, meshom's mesh fixer stage a on the insert's cells and this many element rings round them (the host's coast and every other node held, the banks sliding); host nodes in the rings move less than a host cell and keep their host depth (B210) |
+| `fix_rings` | 0 | after the splice, meshom's mesh fixer stage a on the insert's cells and this many element rings round them (the host's coast and every other node held, the banks sliding); host nodes in the rings move less than a host cell and keep their host depth (B210); its result is kept only when it is not worse by the insert's objectives (validity and floor, the angle excess above 120° summed over the quads, the worst corner, then the sizes), else nothing moves (`fix_rings.kept`, B220) |
 | `depth_at`, `depth_smooth`, `strait_floor` | the run's | the insert's own nodes: `"node"` (box mean per node) or `"cells_deepest"`; smoothing passes among the insert's nodes only; whether the run's strait depth floors carve them (B211) |
 | `sill_level` | `""` | `"shallower"`: the insert's sill gets the shallower of the two model levels round its depth (B212); `"grid"`: the grid's own saddle between the joins is held at the deepest level not below its depth by a dam of the insert's nodes (B215) |
-| `depth_channel` | `""` | the grid's deepest channel between the joins (box means at the fine size): `"cells"`: the insert's nodes of every cell it crosses take at least its box-mean depth there; `"near"`: the insert's nodes within one spacing of it take at least the box mean of their own box centred on it; both only on the strait's narrows (B213) |
+| `depth_channel` | `""` | the grid's deepest channel between the joins (box means at the fine size; its ends the deepest box means along the joins, or the deeper basin beyond a join too shallow for the strait, kept inside the insert, B218): `"cells"`: the insert's nodes of every cell it crosses take at least its box-mean depth there; `"near"`: the insert's nodes within one spacing of it take at least the box mean of their own box centred on it; both only on the strait's narrows (B213) |
 | `depth_quantile` | 0 | the insert's nodes take this quantile of the grid's ocean cells in their node box instead of the mean (B214) |
 | `stages` | `"d,b,e,a"` | the clean-up stages on the join ring ([`cleanup.md`](cleanup.md); B162) |
 | `force` | false | build with the least-violating joins when none passes |
@@ -169,13 +169,20 @@ basins 280 m (GEBCO 300 m), the element bottom 580 m at 5.60 W and 910 m at 5.45
 **Judging a variant** (record `insert_<name>.json`, then the model files):
 
 - angles: the worst quad corner and the quads above 110 / 120 deg of the insert and its rings (`fix_rings.after`:
-  `qmax`, `q110`, `q120`; without `fix_rings`: `collar.after`);
+  `qmax`, `q110`, `q120`; without `fix_rings`: `collar.after`); `fix_rings.kept` = `"before"` means the smoothing
+  made the insert worse and was not used (`keep_rule` says why, B220);
+- banks: `banks` and `bank_fallback` (B219): a bank on the host's staircase where the real coast was asked is a
+  geometry defect to fix (join hints, or another `coast_source`);
 - sizes: the smallest new cell (`fix_rings.floor.smallest_m`, never below `h_min_m`); the largest new cell against the
   host cell next to it, by mean great-circle edge length, new cells = `meshom.insert.measure.changed_cells` (aim: at
   most 1.0 x for the insert's own cells); the neighbour size ratio (`ratio_p99`, `ratio_max`);
 - depth: sections of the written depth against the bathymetry grid: the crest depths of the sills, the level bottom
   the model uses (after `fesom_ini`: an element's bottom is the shallowest of its nodes' levels), the deepest
-  connection between the two basins, the wet width and the area of a section across the strait.
+  connection between the two basins, the wet width and the area of a section across the strait; in the record,
+  `depth.channel`: where the line's narrows lie (they must be the strait's), `end_limited` (true: the deepest
+  connection is only a lower bound, the basin beyond that join is no deeper in the grid's window) and
+  `depth.sill` (a `skipped` dam means the grid's saddle was not held). Compare variants on the same sections
+  (the same centre, direction, length and integration limits for every variant, the whole wet crossing).
 
 **Known limits:**
 

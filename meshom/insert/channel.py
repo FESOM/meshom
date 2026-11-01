@@ -8,7 +8,9 @@ rule (meshom.insert.core.insert_depth):
 
 - the channel line (`channel_line`): the deepest path between the insert's two joins on the grid's box means at the
   insert's fine size (the cost per km (D_ref / D)^CHANNEL_POWER, D_ref the deepest connection of the box means
-  between the ends), and the grid's own saddle between its ends (the deepest connection on the grid's cells);
+  between the ends), and the grid's own saddle between its ends (the deepest connection on the grid's cells); its
+  ends are the deepest box means along the joins, or the basin pool beyond a join too shallow for the strait (B218),
+  and it stays in the insert's corridor; no depth here comes from the host's nodes;
 - `depth_channel` (`line_raise`, B213): "cells": every insert node of a cell the line crosses takes at least the
   cell's channel depth (the box mean, box of the cell's area, centred on the line's points inside the cell);
   "near": every insert node within CHANNEL_NEAR of its spacings of the line takes at least the box mean centred on
@@ -37,6 +39,8 @@ CHANNEL_DIR_M = 2000.0       # B213: the line's direction at a point: the chord 
 WIDTH_CAP_M = 50000.0        # B213: the widths are first measured up to this far on each side (then up to the limit)
 WIDTH_TURN_DEG = 45.0        # B213: a width is the shortest wet crossing within this angle of the line's normal ...
 WIDTH_STEP_DEG = 15.0        # B213: ... tried every this many degrees
+END_TOL_M = 0.5              # B218: the line's search is end-limited at an end when its deepest connection lies within
+                             # this of the end's box mean
 
 
 @dataclass
@@ -184,30 +188,85 @@ def _path(grid: Grid, D: np.ndarray, a: tuple, b: tuple, d_ref: float) -> tuple[
     return np.unravel_index(np.array(p[::-1]), (ny, nx))
 
 
-def _saddle(grid: Grid, a: tuple, b: tuple) -> tuple[float, float, float]:
-    """The grid's own saddle between cells a and b (4-connected cells, the grid's depth): (depth, lon, lat) of the
-    cell of the band at the critical depth that joins the two sides (the one nearest the band's centroid)."""
+def _saddle(grid: Grid, a: tuple, b: tuple, mask: np.ndarray | None = None,
+            near: tuple | None = None) -> tuple[float, float, float]:
+    """The grid's own saddle between cells a and b (4-connected cells, the grid's depth; only the cells of `mask`
+    when given): (depth, lon, lat) of the cell of the band at the critical depth that joins the two sides (the one
+    nearest the band's centroid). When no single band component joins them (B218: several barriers at the critical
+    depth in series, common on flat shoals of integer depths), the band components on a route of alternating band
+    and deeper components from a's side to b's are the saddles, and the one nearest the cell `near` (default: the
+    first) is taken."""
+    from collections import deque
+
     from scipy import ndimage
 
-    D = np.where(grid.elev < 0, -grid.elev.astype(np.float64), np.nan)
+    wet = grid.elev < 0 if mask is None else (grid.elev < 0) & mask
+    D = np.where(wet, -grid.elev.astype(np.float64), np.nan)
     lo, hi = _maximin(D, a, b, None)
     D0 = np.where(np.isfinite(D), D, -1.0)
     lab, _ = ndimage.label(D0 >= hi)
     A = ndimage.binary_dilation(lab == lab[a]) if lab[a] else np.zeros(D.shape, bool)
     B = ndimage.binary_dilation(lab == lab[b]) if lab[b] else np.zeros(D.shape, bool)
     band, nb = ndimage.label((D0 >= lo) & (D0 < hi))
+    objs = ndimage.find_objects(band)
+    ny, nx = D.shape
+
+    def cells(k):
+        sl = objs[k - 1]
+        ii, jj = np.nonzero(band[sl] == k)
+        return ii + sl[0].start, jj + sl[1].start
+
+    def centre(k):
+        ii, jj = cells(k)
+        c = int(np.argmin((ii - ii.mean()) ** 2 + (jj - jj.mean()) ** 2))
+        return float(D0[ii[c], jj[c]]), float(grid.lon[jj[c]]), float(grid.lat[ii[c]])
+
     for k in range(1, nb + 1):
-        m = band == k
-        if (m & A).any() and (m & B).any():
-            ii, jj = np.nonzero(m)
-            c = int(np.argmin((ii - ii.mean()) ** 2 + (jj - jj.mean()) ** 2))
-            return float(D0[ii[c], jj[c]]), float(grid.lon[jj[c]]), float(grid.lat[ii[c]])
-    return float(lo), float("nan"), float("nan")
+        sl = objs[k - 1]
+        m = band[sl] == k
+        if (m & A[sl]).any() and (m & B[sl]).any():
+            return centre(k)
+    if not (lab[a] and lab[b]):
+        return float(lo), float("nan"), float("nan")
+    touch = {}                                             # band component -> the deeper components round it
+    for k in range(1, nb + 1):
+        sl = objs[k - 1]
+        i0, i1 = max(sl[0].start - 1, 0), min(sl[0].stop + 1, ny)
+        j0, j1 = max(sl[1].start - 1, 0), min(sl[1].stop + 1, nx)
+        hs = np.unique(lab[i0:i1, j0:j1][ndimage.binary_dilation(band[i0:i1, j0:j1] == k)])
+        hs = [int(h) for h in hs if h]
+        if len(hs) >= 2:
+            touch[k] = hs
+    via = {}
+    for k, hs in touch.items():
+        for h in hs:
+            via.setdefault(h, []).append(k)
+    prev = {("h", int(lab[a])): None}
+    q = deque([("h", int(lab[a]))])
+    goal = ("h", int(lab[b]))
+    while q and goal not in prev:
+        t, x = q.popleft()
+        nxt = [("b", k) for k in via.get(x, [])] if t == "h" else [("h", h) for h in touch[x]]
+        for y in nxt:
+            if y not in prev:
+                prev[y] = (t, x)
+                q.append(y)
+    if goal not in prev:
+        return float(lo), float("nan"), float("nan")
+    route, y = [], goal
+    while y is not None:
+        if y[0] == "b":
+            route.append(y[1])
+        y = prev[y]
+    if near is None:
+        return centre(route[-1])
+    dist = [float(np.min((cells(k)[0] - near[0]) ** 2 + (cells(k)[1] - near[1]) ** 2)) for k in route]
+    return centre(route[int(np.argmin(dist))])
 
 
 def _host_joins(sub: Mesh, ins: np.ndarray) -> list:
     """the host nodes of the insert's cells (the joins and the coast nodes at their ends) in connected pieces, the
-    largest first."""
+    largest first: [(nodes, edges (k, 2): the insert cells' edges between two of them)]."""
     from scipy.sparse import coo_matrix
     from scipy.sparse.csgraph import connected_components
 
@@ -230,9 +289,80 @@ def _host_joins(sub: Mesh, ins: np.ndarray) -> list:
     host &= ~ins
     r, cl = np.concatenate(rows), np.concatenate(cols)
     nc, lab = connected_components(coo_matrix((np.ones(len(r)), (r, cl)), shape=(n, n)), directed=False)
-    pieces = [np.flatnonzero(host & (lab == k)) for k in range(nc)]
-    pieces = [p for p in pieces if len(p) > 1]
-    return sorted(pieces, key=len, reverse=True)
+    pieces = [(np.flatnonzero(host & (lab == k)), np.c_[r, cl][lab[r] == k]) for k in range(nc)]
+    pieces = [p for p in pieces if len(p[0]) > 1]
+    return sorted(pieces, key=lambda p: len(p[0]), reverse=True)
+
+
+def footprint(sub: Mesh, ins: np.ndarray, grid: Grid) -> np.ndarray:
+    """(ny, nx) bool: the grid cells whose centre lies in a cell of the insert (a cell with a node of `ins`)."""
+    from meshom.straits import _elem_tree, locate
+
+    T = sub.n_tris
+    cin = np.r_[ins[sub.tris].any(1) if T else np.zeros(0, bool), ins[sub.quads].any(1)]
+    m = Mesh(sub.points, sub.tris[cin[:T]], sub.quads[cin[T:]], np.zeros(sub.n_nodes, np.int8))
+    lo, la = xyz_to_lonlat(sub.points[np.unique(np.r_[m.tris.ravel(), m.quads.ravel()])])
+    lo = grid.unwrap(lo)
+    ci, cj, _, _ = grid.boxes(np.array([lo.min(), lo.max()]), np.array([la.min(), la.max()]), np.zeros(2))
+    II, JJ = np.meshgrid(np.arange(ci.min(), ci.max() + 1), np.arange(cj.min(), cj.max() + 1), indexing="ij")
+    II, JJ = II.ravel(), JJ.ravel()
+    out = np.zeros(grid.elev.shape, bool)
+    tree = _elem_tree(m)
+    for s in range(0, len(II), 200000):
+        i, j = II[s:s + 200000], JJ[s:s + 200000]
+        out[i, j] = locate(m, lonlat_to_xyz(grid.lon[j], grid.lat[i]), tree) >= 0
+    return out
+
+
+def _join_cells(grid: Grid, points: np.ndarray, edges: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    """the grid cells (rows, columns) of samples every half grid cell along the edges (great circles)."""
+    from meshom.geo import arc_length
+
+    step = 0.5 * R_EARTH_M * np.radians(abs(grid.dlat))
+    a, b = points[edges[:, 0]], points[edges[:, 1]]
+    n = np.maximum(1, np.ceil(R_EARTH_M * arc_length(a, b) / step).astype(np.int64))
+    t = np.concatenate([np.linspace(0.0, 1.0, k + 1) for k in n])
+    e = np.repeat(np.arange(len(edges)), n + 1)
+    q = a[e] + t[:, None] * (b[e] - a[e])
+    q /= np.linalg.norm(q, axis=1, keepdims=True)
+    lo, la = xyz_to_lonlat(q)
+    ci, cj, _, _ = grid.boxes(lo, la, np.zeros(len(lo)))
+    return ci, cj
+
+
+def _pool(grid: Grid, D: np.ndarray, fp: np.ndarray, seeds: np.ndarray, join_xyz: np.ndarray, other_xyz: np.ndarray,
+          start: tuple) -> np.ndarray:
+    """B218: the basin pool beyond a join: the wet cells (finite D) outside the insert's footprint `fp` joined to the
+    join's cells (`seeds`, (ny, nx) bool: its sample cells and their 8 neighbours) through such cells, on the far side
+    of the join's chord (the great circle through its two farthest nodes `join_xyz`; the far side: away from the
+    other join's centre, `other_xyz` its nodes) and nearer to the join's nodes than to the other's, and joined to the
+    join's deepest sample `start` through cells at least as deep as it (the pool never lowers the connection).
+    (ny, nx) bool."""
+    from scipy import ndimage
+    from scipy.spatial import cKDTree
+
+    out = np.isfinite(D) & ~fp
+    lab, _ = ndimage.label(out, structure=np.ones((3, 3), bool))
+    ids = np.unique(lab[seeds & out])
+    pool = np.isin(lab, ids[ids > 0])
+    if not pool.any():
+        return pool
+    ii, jj = np.nonzero(pool)
+    q = lonlat_to_xyz(grid.lon[jj], grid.lat[ii])
+    dd = np.linalg.norm(join_xyz[:, None, :] - join_xyz[None, :, :], axis=2)
+    a, b = np.unravel_index(int(np.argmax(dd)), dd.shape)
+    nrm = np.cross(join_xyz[a], join_xyz[b])                   # the chord's great circle
+    nrm /= max(float(np.linalg.norm(nrm)), 1e-15)
+    if float(np.dot(nrm, other_xyz.mean(0))) > 0:
+        nrm = -nrm
+    beyond = q @ nrm > 0
+    near = cKDTree(join_xyz).query(q)[0] <= cKDTree(other_xyz).query(q)[0]
+    keep = beyond & near
+    pool[ii[~keep], jj[~keep]] = False
+    reach = pool | seeds
+    reach[start] = True
+    lab2, _ = ndimage.label(reach & (np.where(np.isfinite(D), D, -1.0) >= D[start]), structure=np.ones((3, 3), bool))
+    return pool & (lab2 == lab2[start])
 
 
 @dataclass
@@ -280,14 +410,17 @@ def line_widths(grid: Grid, lon: np.ndarray, lat: np.ndarray, cap_m: float) -> n
     return best
 
 
-def narrows(grid: Grid, lon: np.ndarray, lat: np.ndarray) -> tuple[np.ndarray, dict]:
+def narrows(grid: Grid, lon: np.ndarray, lat: np.ndarray, inside: np.ndarray | None = None) -> tuple[np.ndarray, dict]:
     """B213: the line's narrows: the run of its points round its narrowest one whose wet width across the line
-    (line_widths) is at most CHANNEL_WIDTH_K times the narrowest. Returns ((n,) bool, record)."""
+    (line_widths) is at most CHANNEL_WIDTH_K times the narrowest; the narrowest point is sought among the points
+    `inside` ((n,) bool: in the insert's cells, B218; None or none inside: all). Returns ((n,) bool, record)."""
+    if inside is None or not np.any(inside):
+        inside = np.ones(len(lon), bool)
     w = line_widths(grid, lon, lat, WIDTH_CAP_M)
-    lim = CHANNEL_WIDTH_K * float(w.min())
+    lim = CHANNEL_WIDTH_K * float(w[inside].min())
     if lim > WIDTH_CAP_M:                                  # every width up to the limit measured, not capped
         w = line_widths(grid, lon, lat, lim)
-    i0 = int(np.argmin(w))
+    i0 = int(np.flatnonzero(inside)[np.argmin(w[inside])])
     a = i0
     while a > 0 and w[a - 1] <= lim:
         a -= 1
@@ -303,30 +436,100 @@ def narrows(grid: Grid, lon: np.ndarray, lat: np.ndarray) -> tuple[np.ndarray, d
                "from": pt(a), "to": pt(b), "cells": int(b - a + 1)}
 
 
-def channel_line(sub: Mesh, ins: np.ndarray, depth: np.ndarray, grid: Grid, h_fine_m: float) -> Line | None:
-    """The deepest channel between the insert's two joins (module docstring): the ends are the deepest node
-    (`depth`) of the two largest pieces of host nodes on the insert's cells; the path runs on the box means of the
-    grid's ocean cells with half-width h_fine_m / 2; None when the insert has no two joins."""
+def channel_line(sub: Mesh, ins: np.ndarray, grid: Grid, h_fine_m: float) -> Line | None:
+    """The deepest channel between the insert's two joins (module docstring; B213, its ends B218). The joins: the two
+    largest pieces of host nodes on the insert's cells, sampled along their edges every half grid cell; an end is
+    the join's sample with the deepest box mean (the grid's ocean cells, half-width h_fine_m / 2); when the deepest
+    connection between the ends reaches an end's depth (within END_TOL_M: the search is end-limited there), that end
+    moves to the deepest cell of the basin pool beyond its join (_pool) when it is deeper. The path, the deepest
+    connection and the grid's saddle stay in the corridor: the insert's cells widened by one fine cell, the joins'
+    cells and the pools (the whole window when the corridor does not join the ends); when the grid's own depth limits
+    the saddle's search at an end (no saddle cell found), the saddle is sought again from the deepest grid cell of
+    each leg of the line (before and after its shallowest box mean); the narrows' narrowest point lies in the
+    insert's cells. None when the insert has no two joins."""
+    from scipy import ndimage
+
     pieces = _host_joins(sub, ins)
     if len(pieces) < 2:
         return None
-    ends = [p[int(np.argmax(depth[p]))] for p in pieces[:2]]
-    lo, la = xyz_to_lonlat(sub.points[ends])
     D = grid.smoothed(0.5 * h_fine_m)
-    a, b = _wet_cell(grid, D, lo[0], la[0]), _wet_cell(grid, D, lo[1], la[1])
-    d_ref, _ = _maximin(D, a, b, np.ones((3, 3), bool))
-    ii, jj = _path(grid, D, a, b, d_ref)
-    sd = _saddle(grid, a, b)
+    fp = footprint(sub, ins, grid)
+    sq = np.ones((3, 3), bool)
+    seeds, ends, src, join_m = [], [], [], []
+    for _, edges in pieces[:2]:
+        ci, cj = _join_cells(grid, sub.points, edges)
+        m = np.zeros(D.shape, bool)
+        m[ci, cj] = True
+        seeds.append(ndimage.binary_dilation(m, sq))
+        d = D[ci, cj]
+        if np.isfinite(d).any():
+            k = int(np.nanargmax(d))
+            ends.append((int(ci[k]), int(cj[k])))
+            src.append("join")
+            join_m.append(float(d[k]))
+        else:                                              # no wet sample on the join: the wet cell nearest its middle
+            k = len(ci) // 2
+            ends.append(_wet_cell(grid, D, float(grid.lon[cj[k]]), float(grid.lat[ci[k]])))
+            src.append("nearest wet cell")
+            join_m.append(float("nan"))
+    dy = R_EARTH_M * np.radians(abs(grid.dlat))
+    dx = R_EARTH_M * np.radians(abs(grid.dlon)) * max(np.cos(np.radians(float(np.mean(grid.lat)))), 1e-6)
+    ki, kj = int(np.ceil(h_fine_m / dy)), int(np.ceil(h_fine_m / dx))
+    wide = ndimage.maximum_filter(fp, size=(2 * ki + 1, 2 * kj + 1)) | seeds[0] | seeds[1]
+    pools = [np.zeros(D.shape, bool), np.zeros(D.shape, bool)]
+
+    def search():
+        corr = wide | pools[0] | pools[1]
+        Dc = np.where(corr, D, np.nan)
+        lab, _ = ndimage.label(np.isfinite(Dc), structure=sq)
+        a, b = ends
+        if not lab[a] or lab[a] != lab[b]:                 # the corridor does not join the ends: the whole window
+            Dc, corr = D, None
+        d_ref, _ = _maximin(Dc, a, b, sq)
+        return Dc, corr, d_ref, [bool(d_ref >= D[e] - END_TOL_M) for e in ends]
+
+    Dc, corr, d_ref, lim = search()
+    join_lim = list(lim)
+    if any(lim):
+        for s in (0, 1):
+            if not lim[s]:
+                continue
+            pools[s] = _pool(grid, D, fp, seeds[s], sub.points[pieces[s][0]], sub.points[pieces[1 - s][0]], ends[s])
+            if pools[s].any():
+                pi, pj = np.nonzero(pools[s])
+                k = int(np.argmax(D[pi, pj]))
+                if D[pi[k], pj[k]] > D[ends[s]] + END_TOL_M:
+                    ends[s] = (int(pi[k]), int(pj[k]))
+                    src[s] = "pool"
+        Dc, corr, d_ref, lim = search()
+    a, b = ends
+    ii, jj = _path(grid, Dc, a, b, d_ref)
+    k = int(np.argmin(D[ii, jj]))
+    sd = _saddle(grid, a, b, corr, near=(int(ii[k]), int(jj[k])))
+    saddle_from = "the line's ends"
+    if not np.isfinite(sd[1]) and 0 < k < len(ii) - 1:
+        # the grid's own depth limits the saddle's search at an end (an end cell no deeper than the saddle, though
+        # its box mean is): from the deepest grid cell of each leg of the line (before / after its shallowest point)
+        raw = np.where(grid.elev[ii, jj] < 0, -grid.elev[ii, jj].astype(np.float64), -1.0)
+        la_, lb_ = int(np.argmax(raw[:k])), k + 1 + int(np.argmax(raw[k + 1:]))
+        sd2 = _saddle(grid, (int(ii[la_]), int(jj[la_])), (int(ii[lb_]), int(jj[lb_])), corr,
+                      near=(int(ii[k]), int(jj[k])))
+        if np.isfinite(sd2[1]):
+            sd, saddle_from = sd2, "the deepest grid cell of each leg of the line"
     plon, plat = grid.lon[jj], grid.lat[ii]
     xyz = lonlat_to_xyz(plon, plat)
     km = float(R_EARTH_M / 1e3 * np.arccos(np.clip(np.sum(xyz[1:] * xyz[:-1], 1), -1, 1)).sum())
-    k = int(np.argmin(D[ii, jj]))
-    narrow, nrec = narrows(grid, plon, plat)
-    rec = {"ends": [[round(float(x), 4), round(float(y), 4)] for x, y in zip(lo, la)],
+    narrow, nrec = narrows(grid, plon, plat, fp[ii, jj])
+    pt = lambda c: [round(float(grid.lon[c[1]]), 4), round(float(grid.lat[c[0]]), 4)]          # noqa: E731
+    rec = {"ends": [pt(a), pt(b)], "end_from": src, "join_deepest_box_m": join_m,
+           "end_box_m": [float(D[a]), float(D[b])], "join_limited": join_lim, "end_limited": lim,
+           "corridor": corr is not None,
+           "pool_cells": [int(p.sum()) for p in pools],
            "box_half_width_m": 0.5 * h_fine_m, "cells": int(len(ii)), "km": km,
            "deepest_connection_box_m": float(d_ref),
            "shallowest_on_line": {"m": float(D[ii[k], jj[k]]), "at": [round(float(plon[k]), 4), round(float(plat[k]), 4)]},
-           "grid_saddle": {"m": sd[0], "at": [round(sd[1], 4), round(sd[2], 4)]}, "narrows": nrec}
+           "grid_saddle": {"m": sd[0], "at": [round(sd[1], 4), round(sd[2], 4)], "from": saddle_from},
+           "narrows": nrec}
     return Line(plon, plat, D[ii, jj], sd, rec, narrow)
 
 

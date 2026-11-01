@@ -34,6 +34,12 @@ RING_ROWS = 2                # B162: ... and the block's first RING_ROWS rows at
 STAGES = "d,b,e,a"           # B162: the pipeline's stages on the ring (B149's default order)
 HOST_SHIFT_H = 0.25          # B162 / B168: the host's coast outside the insert moves at most this x h_run (a gate)
 MATCH_CHORD = 1e-12
+KEEP_LIMIT_DEG = 120.0       # B220: the angle excess counts each quad's largest corner above this
+KEEP_DEG = 0.5               # B220: fix_rings keeps its result unless its angle excess (or, tied, its worst corner)
+                             # grows by more than this ...
+KEEP_RATIO = 0.005           # B220: ... ties of the angles go to the sizes: ratio p99 differences above this count,
+KEEP_CELL_HOST = 0.01        # B220: ... cell / host differences above this,
+KEEP_SMALLEST = 0.01         # B220: ... and smallest-cell differences above this fraction
 
 
 def _key(e: np.ndarray, n: int) -> np.ndarray:
@@ -432,6 +438,57 @@ class HMin:
         return np.minimum(self.a(xyz), self.b(xyz))
 
 
+def objectives(cm: Mesh, kind, host: Mesh, W: Mesh, h_min: float, hostH) -> dict:
+    """B220: the insert's objectives on the case `cm` (its cells) and the window part `W` it belongs to: the angle
+    excess (the sum over the quads of their largest corner's excess over KEEP_LIMIT_DEG 120 deg), the worst quad
+    corner and the quads above 120 deg (measure.cells), the smallest changed cell (measure.floor_check against
+    the host window, and how many lie below the floor), the largest cell / host cell (the cell's mean edge over the
+    host's node size at its centre, MeshH), the neighbour size ratio p99, and the invalid cells (inverted or
+    non-convex in the case, inverted or non-convex in the part)."""
+    from meshom.insert import measure
+    from meshom.quality.kernel import element_geometry
+
+    c = measure.cells(cm, kind)
+    fl = measure.floor_check(host, W, h_min)
+    g = element_geometry(cm)
+    me = np.r_[g.tri_edges.mean(1) if cm.n_tris else np.zeros(0), g.quad_edges.mean(1) if cm.n_quads else np.zeros(0)]
+    v = measure.validity(W)
+    qa = np.degrees(g.quad_angles).max(1) if cm.n_quads else np.zeros(0)
+    return {"excess_deg": float(np.maximum(qa - KEEP_LIMIT_DEG, 0.0).sum()),
+            "qmax": c["qmax"] or 0.0, "q120": c["q120"], "smallest_m": fl["smallest_m"] or 0.0,
+            "below_floor": fl["below"],
+            "cell_host": float((me / np.asarray(hostH(g.centroid))).max()) if len(me) else 0.0,
+            "ratio_p99": c["ratio_p99"] or 1.0, "invalid": int(c["invalid"] + v["inverted"] + v["nonconvex"])}
+
+
+def keep_after(b: dict, a: dict) -> tuple[bool, str]:
+    """B220: whether fix_rings keeps its result `a` over its input `b` (objectives), and why. In this order: more
+    invalid cells or more cells below the floor than before: the input; then the angle excess above 120 deg (the sum
+    over the quads): lower by more than KEEP_DEG wins; then the worst corner: lower by more than KEEP_DEG wins; then,
+    the angles tied, the sizes: ratio p99 (by more than KEEP_RATIO), the largest cell / host (KEEP_CELL_HOST) and the
+    smallest cell (by more than KEEP_SMALLEST of it) vote, the result is kept unless the input wins more votes."""
+    if a["invalid"] > b["invalid"]:
+        return False, f"the result has more invalid cells ({a['invalid']} > {b['invalid']})"
+    if a["below_floor"] > b["below_floor"]:
+        return False, f"the result has more cells below the floor ({a['below_floor']} > {b['below_floor']})"
+    if abs(a["excess_deg"] - b["excess_deg"]) > KEEP_DEG:
+        ok = a["excess_deg"] < b["excess_deg"]
+        return ok, (f"angle excess above 120 deg {b['excess_deg']:.1f} -> {a['excess_deg']:.1f} (quads > 120 deg "
+                    f"{b['q120']} -> {a['q120']}, worst {b['qmax']:.1f} -> {a['qmax']:.1f} deg)")
+    if abs(a["qmax"] - b["qmax"]) > KEEP_DEG:
+        ok = a["qmax"] < b["qmax"]
+        return ok, f"worst quad {b['qmax']:.2f} -> {a['qmax']:.2f} deg (angle excess tied)"
+    vote = 0
+    for k, tol, sign in (("ratio_p99", KEEP_RATIO, 1), ("cell_host", KEEP_CELL_HOST, 1),
+                         ("smallest_m", KEEP_SMALLEST * max(b["smallest_m"], 1.0), -1)):
+        d = sign * (a[k] - b[k])
+        vote += (d < -tol) - (d > tol)
+    return vote >= 0, (f"angles tied (worst {b['qmax']:.2f} / {a['qmax']:.2f} deg); sizes vote {vote:+d} for the "
+                       f"result (ratio p99 {b['ratio_p99']:.4f} -> {a['ratio_p99']:.4f}, cell/host "
+                       f"{b['cell_host']:.3f} -> {a['cell_host']:.3f}, smallest {b['smallest_m']:.0f} -> "
+                       f"{a['smallest_m']:.0f} m)")
+
+
 def fix_rings(host: Mesh, mesh: Mesh, part: np.ndarray, cut: np.ndarray, rings: int, h_min: float, h_host: float,
               centre: np.ndarray, name: str) -> tuple[Mesh, dict, np.ndarray]:
     """B210: meshom.meshfix.geom (stage a, free-node geometry) on the cells of the spliced mesh `mesh` that the insert
@@ -441,10 +498,13 @@ def fix_rings(host: Mesh, mesh: Mesh, part: np.ndarray, cut: np.ndarray, rings: 
     cut (cells touching it stay out of the case). Elements at a pinch node of the case's outline are left out until
     none is left (as ring_case). The case's boundary edges on the mesh's boundary are coast (kind 1, sliding: the
     insert's banks), the rest fixed (kind 2); the host's coast nodes are fixed too. The size field is HMin of the
-    spliced mesh's and the host's node sizes (MeshH). Returns (the mesh with the new node positions, the record:
-    the case, the stage's info, the case's cells before / after (measure.cells), the host nodes moved (count, the
-    largest move in host cells), the nodes moved and the largest move, the size floor (measure.floor_check) and the
-    validity of the window part before / after; the ids in `mesh` of the host nodes moved)."""
+    spliced mesh's and the host's node sizes (MeshH). B220: the stage's result is kept only when it is not worse
+    than its input by the insert's objectives (objectives, keep_after); else every node stays. Returns (the mesh
+    with the new node positions, the record: the case, the stage's info, which mesh was kept and why, the
+    objectives of both, the case's cells before / after (measure.cells; after = the mesh returned) and of the
+    stage's result, the host nodes moved (count, the largest move in host cells), the nodes moved and the largest
+    move, the size floor (measure.floor_check) and the validity of the window part before / after; the ids in
+    `mesh` of the host nodes moved)."""
     import time
 
     from meshom.geo import xyz_to_lonlat
@@ -505,11 +565,18 @@ def fix_rings(host: Mesh, mesh: Mesh, part: np.ndarray, cut: np.ndarray, rings: 
     t1 = time.perf_counter()
     out, frec = geom_fix(case, {})
     wall_a = time.perf_counter() - t1
-    moved = np.linalg.norm(out.points - cm.points, axis=1) > 0
     P = mesh.points.copy()
     P[wid[used]] = out.points
-    res = Mesh(P, mesh.tris, mesh.quads, mesh.node_flag, mesh.tri_zone)
     W2 = Mesh(P[wid], W.tris, W.quads, W.node_flag)
+    hostH = MeshH(host)
+    obj = {"before": objectives(cm, kind, host, W, h_min, hostH),
+           "after": objectives(out, None, host, W2, h_min, hostH)}
+    after, why = keep_after(obj["before"], obj["after"])
+    fixer = measure.cells(out)
+    if not after:                                           # B220: the smoothing made the insert worse: undone
+        out, P, W2 = Mesh(cm.points.copy(), cm.tris, cm.quads, cm.node_flag), mesh.points.copy(), W
+    moved = np.linalg.norm(out.points - cm.points, axis=1) > 0
+    res = Mesh(P, mesh.tris, mesh.quads, mesh.node_flag, mesh.tri_zone)
     hm = is_host[used] & moved
     dist = R_EARTH_M * 2 * np.arcsin(np.minimum(1.0, 0.5 * np.linalg.norm(out.points - cm.points, axis=1)))
     reach = R_EARTH_M * np.arccos(np.clip(cm.points @ (centre / np.linalg.norm(centre)), -1.0, 1.0)).max()
@@ -519,6 +586,7 @@ def fix_rings(host: Mesh, mesh: Mesh, part: np.ndarray, cut: np.ndarray, rings: 
                     "fixed": int((kind == 2).sum()), "elems": int(cm.n_elems), "quads": int(cm.n_quads),
                     "tris": int(cm.n_tris), "reach_km": float(reach / 1e3)},
            "stage_a": {"wall_s": wall_a, "info": {k: v for k, v in frec["info"].items() if k != "opts"}},
+           "kept": "after" if after else "before", "keep_rule": why, "objectives": obj, "fixer_result": fixer,
            "before": measure.cells(cm, kind), "after": measure.cells(out),
            "host_moved": int(hm.sum()),
            "host_moved_max_cells": float(dist[hm].max() / h_host) if hm.any() else 0.0,

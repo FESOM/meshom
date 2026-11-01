@@ -349,15 +349,17 @@ def insert_window(win: Window, spec: Spec, h_run, tol=0.20, gates=None, log=prin
     seed = int(stm.locate(mesh, chart.inv(prof.xy[prof.i0][None]), tree)[0])
     reg = assemble.region_between(mesh, seed, [cA, cB], win.kind)
     bS_ids, bN_ids = assemble.banks(mesh, reg, cA, cB)
-    banks_xy, bank_src, base_xy, squared = [], [], [], []
+    banks_xy, bank_src, base_xy, squared, fallback, joint = [], [], [], [], [], []
     inward = ((xy[cA[1]] - xy[cA[0]], xy[cB[1]] - xy[cB[0]]), (xy[cA[-2]] - xy[cA[-1]], xy[cB[-2]] - xy[cB[-1]]))
-    for ids, (ua, ub) in zip((bS_ids, bN_ids), inward):
+    for side, ids, (ua, ub) in zip("SN", (bS_ids, bN_ids), inward):
         b = None
         if rc is not None:
             arc, why = rc.arc(xy[ids[0]], xy[ids[-1]], guide=xy[ids])
             host_len = Polyline(xy[ids]).L
             if arc is not None and Polyline(arc).L > 3.0 * host_len + 4 * h_host:
                 arc, why = None, "the real coast between the ends is far longer than the host's (around an island)"
+            if arc is not None and why:                # B219: the piece chosen for both ends together
+                joint.append({"bank": side, "note": why})
             if arc is not None:
                 la, lb = rcm.BLEND_H * jA.h_join_m, rcm.BLEND_H * jB.h_join_m
                 if spec.bank_land_cells > 0:           # B202: square ends, today's bank kept for the measures
@@ -371,12 +373,20 @@ def insert_window(win: Window, spec: Spec, h_run, tol=0.20, gates=None, log=prin
                 bank_src.append("real")
             else:
                 bank_src.append(f"host ({why})")
+                lo_, la_ = xyz_to_lonlat(chart.inv(xy[ids[[0, -1]]]))
+                fallback.append({"bank": side, "reason": why,
+                                 "ends_lonlat": [[round(float(x), 4), round(float(y), 4)] for x, y in zip(lo_, la_)]})
+                log(f"[insert {spec.name}] WARNING: bank {side} falls back to the host's coast (the real coast was "
+                    f"asked): {why}; ends {fallback[-1]['ends_lonlat']}", flush=True)
         if b is None:
             b = bank_fn(xy[ids])
             if rc is None:
                 bank_src.append("host")
         banks_xy.append(b)
     rec["banks"] = bank_src
+    if rc is not None:                                 # B219: a real bank asked but the host's coast taken
+        rec["bank_fallback"] = fallback
+        rec["bank_joint"] = joint
     if len(base_xy) == 2 and all(b is not None for b in base_xy):
         rec["bank_land"] = land_record(rc, chart, xy[cA], xy[cB], banks_xy, base_xy) | {"squared": squared}
         log(f"[insert {spec.name}] banks into land: max {rec['bank_land']['max_km']:.2f} km, water added "
@@ -682,12 +692,15 @@ def fix_spliced(mesh: Mesh, win: Window, res: Result, full: Mesh, sinfo: dict, s
                                           prof["h_host_km"] * 1e3, neck, f"insert_{spec.name}_fix")
     w = res.window
     window = Mesh(out.points[gid], w.tris, w.quads, w.node_flag, w.tri_zone)
-    b, a = frec["before"], frec["after"]
+    b = frec["before"]
+    f = frec["fixer_result"]
     log(f"[insert {spec.name}] fix_rings {spec.fix_rings}: {frec['case']['nodes']} nodes ({frec['case']['free']} "
-        f"free, {frec['case']['sliding']} sliding), quads > 110 / > 120 {b['q110']} / {b['q120']} -> {a['q110']} / "
-        f"{a['q120']}, worst {b['qmax']:.1f} -> {a['qmax']:.1f} deg; host nodes moved {frec['host_moved']} (max "
-        f"{frec['host_moved_max_cells']:.2f} host cells); smallest cell {frec['floor']['smallest_m'] / 1e3:.3f} km "
-        f"({frec['wall_s']:.0f} s)", flush=True)
+        f"free, {frec['case']['sliding']} sliding), quads > 110 / > 120 {b['q110']} / {b['q120']} -> {f['q110']} / "
+        f"{f['q120']}, worst {b['qmax']:.1f} -> {f['qmax']:.1f} deg; kept the {frec['kept']} ({frec['keep_rule']}); "
+        f"host nodes moved {frec['host_moved']} (max {frec['host_moved_max_cells']:.2f} host cells); smallest cell "
+        f"{frec['floor']['smallest_m'] / 1e3:.3f} km ({frec['wall_s']:.0f} s)", flush=True)
+    if frec["kept"] == "before":
+        log(f"[insert {spec.name}] WARNING: fix_rings made the insert worse; its result is not used", flush=True)
     return out, frec, moved, window
 
 
@@ -819,13 +832,16 @@ def rule_depth(sub: Mesh, ins: np.ndarray, base: np.ndarray, cfg, fmt: str, stra
                log=print) -> tuple[np.ndarray, dict]:
     """An own depth rule (B211-B215) on the nodes `ins` of `sub`, a part of a mesh that holds every cell round them
     (insert_depth: the insert's own nodes; meshom.methods.m16_orca.nest_depth: the nodes inside a nest's coarse box,
-    B216); `base`: the depth of `sub`'s nodes by the run's rules. The grid rule `depth_at` ("": the run's),
-    depth_quantile (B214: a quantile of the node box instead of the mean), `depth_smooth` passes among `ins` (None:
-    the run's passes over the whole part), the run's slope limiter, the strait depth floors with `strait_floor`, the
-    depth floor and the run's regions; then depth_channel (B213: the channel line between the two largest pieces of
-    the other nodes of the cells of `ins` (the joins), box means at h_fine, None: the median spacing of `ins`) and
-    sill_level ("shallower", B212: sill_shallower; "grid", B215: meshom.insert.channel.grid_sill). `tag` heads the
-    log lines. Returns (the depth on `sub`, the rule's values on `ins`; the record)."""
+    B216); `base`: the depth of `sub`'s nodes by the run's rules (for the record only: every calculation here takes
+    its depths from the bathymetry grid, B218, never from the host's node depths). The grid rule `depth_at` ("": the
+    run's), depth_quantile (B214: a quantile of the node box instead of the mean), `depth_smooth` passes among `ins`
+    (None: the run's passes over the whole part), the run's slope limiter, the strait depth floors with
+    `strait_floor`, the depth floor and the run's regions; then depth_channel (B213: the channel line between the two
+    largest pieces of the other nodes of the cells of `ins` (the joins; its ends from the grid's box means along
+    them, B218), box means at h_fine, None: the median spacing of `ins`) and sill_level ("shallower", B212:
+    sill_shallower; "grid", B215: meshom.insert.channel.grid_sill), both on the grid rule's node depths of `sub`
+    (host nodes included). `tag` heads the log lines. Returns (the depth on `sub`, the rule's values on `ins`; the
+    record)."""
     from meshom import run as runmod
     from meshom.bathymetry import (apply_regions, cells_deepest_depth, depth_policy, levels, node_area_m2,
                                    node_depth, node_spacing_m, smooth_depth)
@@ -864,12 +880,22 @@ def rule_depth(sub: Mesh, ins: np.ndarray, base: np.ndarray, cfg, fmt: str, stra
     line = None
     if depth_channel or sill_level == "grid":
         h_f = h_fine if h_fine is not None else float(np.median(node_spacing_m(sub)[0][ins]))
-        line = chan.channel_line(sub, ins, base, grid, h_f)
+        line = chan.channel_line(sub, ins, grid, h_f)
         rec["channel"] = line.record if line is not None else {"skipped": "the insert has no two joins"}
         if line is not None:
-            log(f"{tag} channel line {line.record['km']:.0f} km (box means at {h_f / 1e3:.2f} km), "
-                f"its deepest connection {line.record['deepest_connection_box_m']:.0f} m; the grid's saddle "
-                f"{line.saddle[0]:.0f} m at {line.record['grid_saddle']['at']}", flush=True)
+            lr = line.record
+            log(f"{tag} channel line {lr['km']:.0f} km (box means at {h_f / 1e3:.2f} km) from {lr['ends'][0]} "
+                f"({lr['end_from'][0]}, {lr['end_box_m'][0]:.0f} m) to {lr['ends'][1]} ({lr['end_from'][1]}, "
+                f"{lr['end_box_m'][1]:.0f} m), its deepest connection {lr['deepest_connection_box_m']:.0f} m; the "
+                f"grid's saddle {line.saddle[0]:.0f} m at {lr['grid_saddle']['at']}; narrows "
+                f"{lr['narrows']['from']} - {lr['narrows']['to']} (narrowest {lr['narrows']['width_min_km']:.1f} km "
+                f"at {lr['narrows']['at']}){'' if lr['corridor'] else '; the corridor does not join the ends'}",
+                flush=True)
+            for s_, e_ in zip("AB", lr["end_limited"]):
+                if e_:
+                    log(f"{tag} WARNING: the channel line's search is end-limited at join {s_}: its deepest "
+                        f"connection equals that end's depth, the basin beyond the join (in the grid's window) "
+                        f"is no deeper", flush=True)
         if line is not None and depth_channel:
             d, rec["channel"]["raise"] = chan.line_raise(sub, d, ins, grid, line, depth_channel)
             r = rec["channel"]["raise"]
@@ -1099,6 +1125,6 @@ def run(run_dir: Path, spec: Spec, out_dir: Path | None = None, mesh_name: str |
     rec["timing"]["run_s"] = time.perf_counter() - t0
     stem.with_suffix(".json").write_text(json.dumps(_jsonable(rec), indent=1, default=str))
     score = {"scores": rec.get("scores"), "ring_score": rec.get("ring_score"), "validity": rec.get("validity"),
-             "joins": rec.get("joins")}
+             "joins": rec.get("joins"), "banks": rec.get("banks"), "bank_fallback": rec.get("bank_fallback")}
     stem.with_suffix(".score.json").write_text(json.dumps(_jsonable(score), indent=1, default=str))
     return rec

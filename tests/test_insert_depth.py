@@ -72,7 +72,7 @@ def line(strait):
     base, _ = node_depth(m, nc, "elevation", 30.0)
     lo, la = xyz_to_lonlat(m.points)
     grid = chan.read_window(nc, "elevation", lo, la, 8000.0)
-    return base, grid, chan.channel_line(m, ins, base, grid, DX)
+    return base, grid, chan.channel_line(m, ins, grid, DX)
 
 
 # ------------------------------------------------------------------------------------------------ B213, B215
@@ -84,7 +84,8 @@ def test_channel_line_follows_the_channel_and_its_narrows_stay_in_the_strait(str
     _, lon, lat, m, ins = strait
     base, grid, ln = line
     rec = ln.record["narrows"]
-    assert abs(ln.lon[0] + 0.65) < 0.03 and abs(ln.lon[-1] - 0.65) < 0.03          # the joins' ends, in the basins
+    assert abs(abs(ln.lon[0]) - 0.65) < 0.03 and abs(abs(ln.lon[-1]) - 0.65) < 0.03  # the joins' ends, in the basins
+    assert ln.lon[0] * ln.lon[-1] < 0
     assert 12.0 < rec["width_min_km"] < 13.5 and rec["limit_km"] == pytest.approx(6.0 * rec["width_min_km"])
     nar = ln.narrow
     assert np.abs(ln.lon[nar]).max() < 0.45 + 2 * D and np.abs(ln.lon[~nar]).min() > 0.45 - D
@@ -176,6 +177,158 @@ def test_grid_sill_caps_a_dam_through_the_saddle_from_bank_to_bank(strait, line)
     assert len(lat_rows) == 4                                    # bank to bank
     assert np.abs(lo[capped] - lo[via]).max() < 3.5 * DX / 111e3
     assert np.array_equal(out[~capped], dep[~capped])
+
+
+# ------------------------------------------------------------------------------------------------ B218
+
+def _variant(tmp_path_factory, name, edit):
+    """the strait fixture's grid with `edit(z, LO, LA)` applied, written to its own file."""
+    lon = np.arange(-1.0, 1.0, D) + D / 2
+    lat = np.arange(-0.4, 0.4, D) + D / 2
+    LO, LA = np.meshgrid(lon, lat)
+    z = np.full(LO.shape, 50.0)
+    basin = np.abs(LO) >= 0.45
+    z[basin] = -2000.0
+    z[basin & (np.abs(LA) < 0.005)] = -3500.0
+    st = (np.abs(LO) < 0.45) & (np.abs(LA) < 0.06)
+    z[st] = -150.0
+    z[st & (np.abs(LA) < 0.013)] = -600.0
+    jj = np.flatnonzero((lon > 0.10) & (lon < 0.12))
+    rr = np.flatnonzero(np.abs(lat) < 0.013)
+    z[np.ix_(rr, jj)] = -300.0
+    z[rr[1], jj[0]] = z[rr[2], jj[1]] = -450.0
+    edit(z, LO, LA)
+    return _write_grid(tmp_path_factory.mktemp(name) / f"{name}.nc", lon, lat, z)
+
+
+def _own(nc, m, ins, base):
+    from meshom.insert.core import rule_depth
+
+    return rule_depth(m, ins, base, _cfg(nc), "fesom2", None, depth_at="node", depth_smooth=0, strait_floor=False,
+                      sill_level="grid", depth_channel="near", h_fine=DX, log=QUIET)
+
+
+def test_channel_ends_come_from_the_grid_not_from_the_host_depths(strait, tmp_path_factory):
+    """B218: the west basin has a 40 m shelf north of 0.025 N, where the join's northern host node stands; the host's
+    depth (an ORCA node: the deepest of four ocean model cells) puts 3000 m there. The line's ends are the joins'
+    deepest box means (the trench), so the deepest connection and the grid's saddle are the strait's (300 m), the dam
+    is built and nothing is end-limited; the host's depths change nothing."""
+    from meshom.bathymetry import node_depth
+
+    nc = _variant(tmp_path_factory, "shelf", lambda z, LO, LA: z.__setitem__((LO <= -0.45) & (LA > 0.025), -40.0))
+    _, _, _, m, ins = strait
+    lo, la = xyz_to_lonlat(m.points)
+    base, _ = node_depth(m, nc, "elevation", 30.0)
+    shelf = int(np.flatnonzero(~ins & (lo < 0))[np.argmax(la[~ins & (lo < 0)])])
+    host = base.copy()
+    host[shelf] = 3000.0
+    d, rec = _own(nc, m, ins, host)
+    ch = rec["channel"]
+    assert ch["grid_saddle"]["m"] == pytest.approx(300.0) and 0.10 < ch["grid_saddle"]["at"][0] < 0.12
+    assert ch["deepest_connection_box_m"] > 300.0 and ch["end_limited"] == [False, False]
+    assert ch["end_from"] == ["join", "join"] and min(ch["end_box_m"]) > 2000.0
+    assert all(abs(e[1]) < 0.013 for e in ch["ends"])                              # on the trench, not the shelf
+    assert rec["sill"]["saddle_m"] == pytest.approx(300.0) and rec["sill"]["capped"] > 0
+    d2, rec2 = _own(nc, m, ins, base)
+    assert np.array_equal(d, d2) and rec2["channel"]["ends"] == ch["ends"]
+
+
+def test_channel_line_stays_in_the_insert(strait, tmp_path_factory):
+    """B218: an 800 m channel outside the insert (8.3-9.4 km north of the axis, past the mesh's outer row and its one
+    fine cell of margin) joins the two basins deeper than the strait's 300 m sill. The line, its deepest connection
+    and the saddle stay in the strait; the narrows lie on the strait's channel."""
+    def edit(z, LO, LA):
+        z[(np.abs(LO) < 0.45) & (LA > 0.075) & (LA < 0.085)] = -800.0
+
+    nc = _variant(tmp_path_factory, "side", edit)
+    _, _, _, m, ins = strait
+    from meshom.bathymetry import node_depth
+
+    base, _ = node_depth(m, nc, "elevation", 30.0)
+    _, rec = _own(nc, m, ins, base)
+    ch = rec["channel"]
+    assert abs(ch["narrows"]["at"][1]) < 0.013 and abs(ch["shallowest_on_line"]["at"][1]) < 0.06
+    assert 300.0 < ch["deepest_connection_box_m"] < 800.0 and ch["grid_saddle"]["m"] == pytest.approx(300.0)
+    assert ch["corridor"] and rec["sill"]["capped"] > 0
+
+
+def test_the_saddle_is_found_when_an_end_cell_is_shallow(strait, tmp_path_factory):
+    """B218: the grid column under the west join is a 250 m ridge one cell wide between deep water (its box mean,
+    over three columns, is ~1400 m, so the line's end sits on it); from that end cell the grid's own search is
+    end-limited and finds no saddle cell, so the saddle is sought from the deepest grid cell of each leg of the line:
+    the strait's 300 m sill, and the dam is built."""
+    from meshom.bathymetry import node_depth
+
+    def ridge(z, LO, LA):
+        lon = LO[0]
+        col = lon[np.argmin(np.abs(lon + 0.65473))]
+        z[np.isclose(LO, col)] = -250.0
+
+    nc = _variant(tmp_path_factory, "ridge1", ridge)
+    _, _, _, m, ins = strait
+    base, _ = node_depth(m, nc, "elevation", 30.0)
+    _, rec = _own(nc, m, ins, base)
+    ch = rec["channel"]
+    assert ch["grid_saddle"]["m"] == pytest.approx(300.0) and 0.10 < ch["grid_saddle"]["at"][0] < 0.12
+    assert ch["grid_saddle"]["from"] == "the deepest grid cell of each leg of the line"
+    assert ch["end_limited"] == [False, False] and rec["sill"]["capped"] > 0
+
+
+def test_the_saddle_of_two_sills_of_one_depth_in_series(strait, tmp_path_factory):
+    """B218: a second 300 m sill across the channel (0.12-0.10 W) in series with the first: no single band of grid
+    cells at the critical depth touches both sides, so the saddle is the band on the route between them nearest the
+    line's shallowest point (one of the two sills, 300 m), and the dam is built."""
+    from meshom.bathymetry import node_depth
+
+    def two(z, LO, LA):
+        z[(LO > -0.12) & (LO < -0.10) & (np.abs(LA) < 0.013)] = -300.0
+
+    nc = _variant(tmp_path_factory, "two_sills", two)
+    _, _, _, m, ins = strait
+    base, _ = node_depth(m, nc, "elevation", 30.0)
+    _, rec = _own(nc, m, ins, base)
+    ch = rec["channel"]
+    at = ch["grid_saddle"]["at"][0]
+    assert ch["grid_saddle"]["m"] == pytest.approx(300.0) and (0.10 < at < 0.12 or -0.12 < at < -0.10)
+    assert abs(at - ch["shallowest_on_line"]["at"][0]) < 0.03 and rec["sill"]["capped"] > 0
+
+
+def test_a_too_shallow_join_takes_the_basin_pool_beyond_it(strait, tmp_path_factory):
+    """B218: a 100 m ridge along the west join (0.675-0.635 W, the whole basin across) with the deep basin beyond and
+    behind it: the join's deepest box mean (100 m) is the line's deepest connection (the search is end-limited at
+    that join), so its end moves to the deepest cell of the pool beyond the join (outside the insert's cells, nearer
+    that join, joined to it through cells at least as deep as the join's end); the connection stays the ridge's,
+    now not end-limited, and the grid's saddle is found on the ridge. With the whole basin beyond the join a shelf
+    as shallow as the join, the end stays and the record says the search is end-limited there."""
+    from meshom.bathymetry import node_depth
+
+    _, _, _, m, ins = strait
+
+    def ridge(z, LO, LA):
+        z[(LO > -0.675) & (LO < -0.635) & (np.abs(LO) >= 0.45)] = -100.0
+
+    nc = _variant(tmp_path_factory, "ridge", ridge)
+    base, _ = node_depth(m, nc, "elevation", 30.0)
+    _, rec = _own(nc, m, ins, base)
+    ch = rec["channel"]
+    assert ch["grid_saddle"]["m"] == pytest.approx(100.0) and -0.675 < ch["grid_saddle"]["at"][0] < -0.635
+    west = int(np.argmin([e[0] for e in ch["ends"]]))
+    assert ch["end_from"][west] == "pool" and ch["end_from"][1 - west] == "join"
+    assert ch["join_deepest_box_m"][west] == pytest.approx(100.0, abs=1.0)
+    assert ch["join_limited"][west] and not ch["join_limited"][1 - west]
+    assert ch["ends"][west][0] < -0.6547 and ch["end_box_m"][west] > 1000.0 and ch["pool_cells"][west] > 0
+    assert ch["deepest_connection_box_m"] == pytest.approx(100.0, abs=1.0) and ch["end_limited"] == [False, False]
+
+    def shelf(z, LO, LA):
+        z[(LO <= -0.635) & (np.abs(LO) >= 0.45)] = -100.0
+
+    nc2 = _variant(tmp_path_factory, "flat", shelf)
+    base2, _ = node_depth(m, nc2, "elevation", 30.0)
+    _, rec2 = _own(nc2, m, ins, base2)
+    ch2 = rec2["channel"]
+    west = int(np.argmin([e[0] for e in ch2["ends"]]))
+    assert ch2["end_from"][west] == "join" and ch2["end_limited"][west] and not ch2["end_limited"][1 - west]
+    assert ch2["join_limited"][west]
 
 
 # ------------------------------------------------------------------------------------------------ B212, B214
@@ -485,7 +638,7 @@ def test_nest_depth_is_the_same_in_every_mesh_holding_the_box(strait, nest_run):
     run_dir, m, _, _ = nest_run
     cfg = _cfg(nc, max_slope=0.02)
     cfg.mesh.opts["nest"] = {"depth": "gebco", "depth_channel": "near", "sill_level": "grid"}
-    run_d = model_depth(m, _cfg(nc), "fesom2", [], run_dir)            # the run's depth: the line's ends
+    run_d = model_depth(m, _cfg(nc), "fesom2", [], run_dir)            # the run's depth (the record only)
     d0, rec0 = nest_depth(run_dir, m, run_d, cfg, "fesom2", log=QUIET)
     assert rec0["channel"]["raise"]["nodes_raised"] > 0 and rec0["sill"]["capped"] > 0
     extra, _ = _lattice_mesh(np.linspace(0.85, 0.95, 4), np.linspace(-0.1, 0.1, 5))   # cells outside the box

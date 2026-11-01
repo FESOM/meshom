@@ -47,7 +47,9 @@ area across the same line:
   cells the channel line crosses are never made shallower;
 - rounds: each counted section's log factor moves by AREA_GAIN x log(grid area / mesh area), at most AREA_ITERS
   rounds or until every counted section lies within AREA_TOL; the round with the least mean |log(mesh / grid)| over
-  the counted sections is kept (round 0 is the input depth).
+  the counted sections is kept (round 0 is the input depth);
+- a depth region in open water (B253, `open_ends`): the mesh's run is limited to the region's cells and an end of it
+  in water is open: the mesh's and the grid's areas are taken over the same samples there.
 """
 import numpy as np
 
@@ -105,10 +107,13 @@ def _elem_size(sub: Mesh) -> np.ndarray:
     return np.concatenate(out) if out else np.zeros(0)
 
 
-def sections(sub: Mesh, ins: np.ndarray, grid, st, p, u, reach_m: float, floor_m: float):
+def sections(sub: Mesh, ins: np.ndarray, grid, st, p, u, reach_m: float, floor_m: float, open_ends: bool = False):
     """Each station's section (module docstring): a list of dicts with `ok` (bool), `why` (the reason it does not
     count), and for a counted one `elem` / `w` (the elements of the mesh's run and their sample lengths, m),
-    `gebco_m2`, `width_m` (the mesh's run), `gebco_width_m` (the grid's wet length in the crossing)."""
+    `gebco_m2`, `width_m` (the mesh's run), `gebco_width_m` (the grid's wet length in the crossing). open_ends (B253:
+    a region in open water): the mesh's run is the samples in the insert's cells contiguous through the axis point;
+    an end of it in water (the next sample in a host cell) is open: the grid's crossing ends there too (no widening,
+    the grid's water may run on), an end on the mesh's coast is a bank as before."""
     from meshom.straits import _elem_tree, locate
 
     tree = _elem_tree(sub)
@@ -127,11 +132,15 @@ def sections(sub: Mesh, ins: np.ndarray, grid, st, p, u, reach_m: float, floor_m
         if e[i0] < 0:
             out.append({"ok": False, "why": "the axis point lies outside the mesh's water"})
             continue
+        if open_ends and not elem_ins[e[i0]]:
+            out.append({"ok": False, "why": "the axis point lies outside the region"})
+            continue
+        on = (e >= 0) & elem_ins[np.maximum(e, 0)] if open_ends else e >= 0
         a = i0
-        while a > 0 and e[a - 1] >= 0:
+        while a > 0 and on[a - 1]:
             a -= 1
         b = i0
-        while b < len(e) - 1 and e[b + 1] >= 0:
+        while b < len(e) - 1 and on[b + 1]:
             b += 1
         run = e[a:b + 1]
         rec = {"ok": False, "width_m": float((b - a + 1) * ds)}
@@ -147,6 +156,8 @@ def sections(sub: Mesh, ins: np.ndarray, grid, st, p, u, reach_m: float, floor_m
         if ga < 0 or gb > len(e) - 1:
             out.append(rec | {"why": "the grid's crossing reaches the samples' end"})
             continue
+        bank_a = not open_ends or e[a - 1] < 0                # B253: an end in water is open, on the coast a bank
+        bank_b = not open_ends or e[b + 1] < 0
         lon, lat = xyz_to_lonlat(q[ga:gb + 1])
         ci, cj, _, _ = grid.boxes(lon, lat, np.zeros(len(lon)))
         ul = grid.unwrap(lon)
@@ -154,11 +165,12 @@ def sections(sub: Mesh, ins: np.ndarray, grid, st, p, u, reach_m: float, floor_m
         z = grid.elev[ci, cj].astype(np.float64)
         wet = outside | (z < 0)
         dep = np.where(wet & ~outside, -z, 0.0)
-        lo, hi = M - m, len(wet) - 1 - (M - m)               # the crossing: the mesh's run +- m samples
+        lo = M - m if bank_a else M                          # the crossing: the mesh's run +- m samples at a bank
+        hi = len(wet) - 1 - (M - m if bank_b else M)
         lab = np.cumsum(np.r_[True, wet[1:] != wet[:-1]])    # runs of equal wetness
         core = slice(M, len(wet) - M)                        # the mesh's run itself
         cross = np.unique(lab[core][wet[core]])              # B248: only the grid's water runs the mesh's run meets
-        if np.isin(cross, [lab[0], lab[-1]]).any():
+        if (bank_a and np.isin(lab[0], cross)) or (bank_b and np.isin(lab[-1], cross)):
             out.append(rec | {"why": "the grid's water runs on past a mesh bank"})
             continue
         if outside[lo:hi + 1].any():
@@ -290,14 +302,14 @@ def axis_ends(sub: Mesh, axis: np.ndarray, h_fine: float) -> tuple | None:
 
 def area_depth(sub: Mesh, depth: np.ndarray, ins: np.ndarray, axis: np.ndarray, zbar: np.ndarray, floor_m: float,
                source, variable: str, h_fine: float, held: tuple | None = None, route: np.ndarray | None = None,
-               tag: str = "", log=print, saddle_m: float | None = None, line: np.ndarray | None = None
-               ) -> tuple[np.ndarray, dict]:
+               tag: str = "", log=print, saddle_m: float | None = None, line: np.ndarray | None = None,
+               open_ends: bool = False) -> tuple[np.ndarray, dict]:
     """B250 (module docstring) on the nodes `ins` of `sub` (the window's part of the spliced mesh, every cell round
     them in it), their depths `depth` after the other own rules; axis (K,3): the insert's centreline from one join
     to the other; held: (node ids, cap m) of the dam (B212, B215) or None; route: (N,) bool, the nodes of the cells
     the channel line crosses or None; saddle_m: the grid's saddle depth (B251: the sill band; None: the dam's capped
     nodes and the route's nodes held as before); line: (L,3) the channel line's points, which the band's chain
-    follows (None: the axis).
+    follows (None: the axis); open_ends: a region in open water (sections, B253).
     Returns (depth, record)."""
     from scipy.ndimage import gaussian_filter1d
     from scipy.spatial import cKDTree
@@ -319,12 +331,13 @@ def area_depth(sub: Mesh, depth: np.ndarray, ins: np.ndarray, axis: np.ndarray, 
     reach = float(2.0 * np.arcsin(min(dist.max() / 2.0, 1.0)) * R_EARTH_M) + (AREA_OPEN_H + 2.0) * r_max
     lo_, la_ = xyz_to_lonlat(sub.points[nodes_ins])
     grid = chan.read_window(source, variable, lo_, la_, (AREA_OPEN_H + 2.0) * r_max)
-    secs = sections(sub, ins, grid, st, p, u, reach, floor_m)
+    secs = sections(sub, ins, grid, st, p, u, reach, floor_m, open_ends)
     nrec = narrows(secs, st, p)
     for k in nrec.pop("outside"):
         secs[k] = {"ok": False, "why": "outside the strait's narrows", "width_m": secs[k]["width_m"]}
     ok = np.array([s["ok"] for s in secs])
     rec = {"sections": int(len(secs)), "counted": int(ok.sum()), "step_km": AREA_STEP_H * h_fine / 1e3,
+           "open_ends": bool(open_ends),
            "narrows": nrec,
            "skipped": {w: int(sum(1 for s in secs if s["why"] == w)) for w in sorted({s["why"] for s in secs} - {""})}}
     if not ok.any():

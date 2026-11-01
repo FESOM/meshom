@@ -263,6 +263,14 @@ depth_channel = "near"             # optional: the channel raise on the narrows
   reach other water (Nares with 220 km: the north cap ended in a Greenland fjord, 827 m, whose 15 km mouth became the
   narrows); check `depth.channel.ends` and `depth.channel.narrows` in the record. The box mean alone (no
   `depth_channel`, no `sill_level`) does not depend on the region's shape.
+- **Open water.** A channel between submerged banks (no coast on two sides of the region: the Faroe Bank Channel,
+  the Wyville Thomson Ridge) needs a path from basin A to basin B through the region (`path` or `strait`; a
+  `polygon` alone has none): the region's outer nodes split at their shallowest point on each side into the two
+  joins (round the deepest outer node near each end of the path), the rest are the dam's banks, left and right of
+  the path; the raise acts along the line inside the region, and the area rule's sections end at the region's edge
+  (B253). The region's sides should lie on the banks (shallower than the sill), its ends in the basins; a region
+  along a ridge (a band, the path across it) holds the whole crest from bank to bank, so the dam caps the crest
+  where the host crosses it elsewhere. Check `depth.open_water` (ends, col, join and bank nodes) in the record.
 - **The sill.** `sill_level = "grid"` holds the grid's saddle at the deepest level not below its depth: at Nares
   (saddle 224 m, levels 190 and 230 m) that is 190 m, a level shallower than the nearest level (230 m) the box mean
   gives without it.

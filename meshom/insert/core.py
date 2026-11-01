@@ -883,7 +883,8 @@ def insert_axis(res: Result) -> np.ndarray | None:
 def rule_depth(sub: Mesh, ins: np.ndarray, base: np.ndarray, cfg, fmt: str, straits: list | None, depth_at: str = "",
                depth_smooth: int | None = None, strait_floor: bool = True, sill_level: str = "",
                depth_channel: str = "", depth_quantile: float = 0.0, h_fine: float | None = None, tag: str = "",
-               log=print, depth_area: bool = False, axis: np.ndarray | None = None) -> tuple[np.ndarray, dict]:
+               log=print, depth_area: bool = False, axis: np.ndarray | None = None,
+               path: np.ndarray | None = None) -> tuple[np.ndarray, dict]:
     """An own depth rule (B211-B215) on the nodes `ins` of `sub`, a part of a mesh that holds every cell round them
     (insert_depth: the insert's own nodes; meshom.methods.m16_orca.nest_depth: the nodes inside a nest's coarse box,
     B216); `base`: the depth of `sub`'s nodes by the run's rules (for the record only: every calculation here takes
@@ -897,7 +898,10 @@ def rule_depth(sub: Mesh, ins: np.ndarray, base: np.ndarray, cfg, fmt: str, stra
     (host nodes included); then depth_area (B250: meshom.insert.area.area_depth along `axis` (K,3), the strait's
     centreline from one join to the other, the dam's cap kept; with the channel line the deepest connection between
     the joins within a level of the grid saddle's, B251, else the dam's capped nodes and the cells the channel line
-    crosses never made shallower). `tag` heads the log lines. Returns (the
+    crosses never made shallower). `path` ((K,3), a depth region's path, B253): when the coast of the cells of `ins`
+    gives no two banks (open water), the joins, the dam's banks and the area rule's sections come from the path and
+    the grid rule's depths at the region's outer nodes (meshom.insert.channel.open_sides). `tag` heads the log
+    lines. Returns (the
     depth on `sub`, the rule's values on `ins`; the record)."""
     from meshom import run as runmod
     from meshom.bathymetry import (apply_regions, cells_deepest_depth, depth_policy, levels, node_area_m2,
@@ -936,20 +940,34 @@ def rule_depth(sub: Mesh, ins: np.ndarray, base: np.ndarray, cfg, fmt: str, stra
                nodes=int(ins.sum()), grid=info.get("depth_m"),
                strait_depth_floor=pol.get("strait_depth_floor"),
                run_rule_m={"min": float(base[ins].min()), "max": float(base[ins].max())})
-    line = None
+    line = open_ = None
+    if path is not None and (depth_channel or grid_like or depth_area):
+        from meshom.insert import channel as chan
+
+        if isinstance(chan.banks(sub, ins), str):            # B253: open water, no two banks on the coast
+            open_ = chan.open_sides(sub, ins, d, path)
+            if isinstance(open_, str):
+                rec["open_water"] = {"skipped": open_}
+                open_ = None
+            else:
+                rec["open_water"] = open_["record"]
+            log(f"{tag} open water (B253): {rec['open_water']}", flush=True)
     if depth_channel or grid_like:
         h_f = h_fine if h_fine is not None else float(np.median(node_spacing_m(sub)[0][ins]))
-        line = chan.channel_line(sub, ins, grid, h_f)
+        line = chan.channel_line(sub, ins, grid, h_f, joins=open_["joins"] if open_ else None)
+        if line is not None and open_:                        # B253: no wet width in open water
+            line.narrow, line.record["narrows"] = chan.open_narrows(sub, ins, line)
         rec["channel"] = line.record if line is not None else {"skipped": "the insert has no two joins"}
         if line is not None:
             lr = line.record
+            nr = lr["narrows"]
+            nar = (f"{nr['from']} - {nr['to']} (narrowest {nr['width_min_km']:.1f} km at {nr['at']})"
+                   if "from" in nr else f"{nr['km']:.0f} km in the region's cells (open water)")
             log(f"{tag} channel line {lr['km']:.0f} km (box means at {h_f / 1e3:.2f} km) from {lr['ends'][0]} "
                 f"({lr['end_from'][0]}, {lr['end_box_m'][0]:.0f} m) to {lr['ends'][1]} ({lr['end_from'][1]}, "
                 f"{lr['end_box_m'][1]:.0f} m), its deepest connection {lr['deepest_connection_box_m']:.0f} m; the "
-                f"grid's saddle {line.saddle[0]:.0f} m at {lr['grid_saddle']['at']}; narrows "
-                f"{lr['narrows']['from']} - {lr['narrows']['to']} (narrowest {lr['narrows']['width_min_km']:.1f} km "
-                f"at {lr['narrows']['at']}){'' if lr['corridor'] else '; the corridor does not join the ends'}",
-                flush=True)
+                f"grid's saddle {line.saddle[0]:.0f} m at {lr['grid_saddle']['at']}; narrows {nar}"
+                f"{'' if lr['corridor'] else '; the corridor does not join the ends'}", flush=True)
             for s_, e_ in zip("AB", lr["end_limited"]):
                 if e_:
                     log(f"{tag} WARNING: the channel line's search is end-limited at join {s_}: its deepest "
@@ -967,7 +985,8 @@ def rule_depth(sub: Mesh, ins: np.ndarray, base: np.ndarray, cfg, fmt: str, stra
             log(f"{tag} sill {s['barrier_m']:.1f} m at {s['at']}: level {s['level_m']:.0f} m, "
                 f"{s['capped']} nodes capped at {s['cap_m']:.1f} m (largest cut {s['cut_max_m']:.1f} m)", flush=True)
     elif grid_like:
-        d, rec["sill"] = (chan.grid_sill(sub, d, ins, line, levels(b.levels), nearest=sill_level == "nearest")
+        d, rec["sill"] = (chan.grid_sill(sub, d, ins, line, levels(b.levels), nearest=sill_level == "nearest",
+                                         sides=open_["sides"] if open_ else None)
                           if line is not None
                           else (d, {"skipped": "no channel line"}))
         s = rec["sill"]
@@ -999,7 +1018,8 @@ def rule_depth(sub: Mesh, ins: np.ndarray, base: np.ndarray, cfg, fmt: str, stra
             d, rec["area"] = area_depth(sub, d, ins, axis, levels(b.levels), floor, Path(b.source), b.variable, h_f,
                                         held, route, tag, log,                           # B251: the band
                                         saddle_m=line.saddle[0] if line is not None else None,
-                                        line=lonlat_to_xyz(line.lon, line.lat) if line is not None else None)
+                                        line=lonlat_to_xyz(line.lon, line.lat) if line is not None else None,
+                                        open_ends=open_ is not None)
     rec["nodes_m"] = {"min": float(d[ins].min()), "max": float(d[ins].max())}
     return d, rec
 
@@ -1114,15 +1134,16 @@ def _canonical(e: np.ndarray) -> np.ndarray:
 
 def region_depth(mesh: Mesh, inside: np.ndarray, depth: np.ndarray, cfg, fmt: str, depth_channel: str = "",
                  sill_level: str = "", tag: str = "", log=print, depth_area: bool = False,
-                 axis: np.ndarray | None = None) -> tuple[np.ndarray, dict]:
+                 axis: np.ndarray | None = None, path: np.ndarray | None = None) -> tuple[np.ndarray, dict]:
     """B216, B223: the nodes `inside` take an insert's own grid rule (rule_depth, B211): the box mean per node, no
     smoothing, no strait depth floor, the run's slope limiter, the depth floor and the regions; with `depth_channel`
     the channel raise (B213) and with `sill_level` the sill (B215 / B212), the channel line between the two largest
-    pieces of the other nodes of their cells (B218); with `depth_area` the section areas (B250, the nodes `inside`
-    playing the insert's own nodes, the sections across `axis` (K,3), the strait's path; None: skipped). Computed on
-    their cells and one cell ring round them (with depth_area REGION_AREA_RINGS more, so that a section's mesh run is
-    not cut at the window's edge), nodes ordered by position and cells by their nodes, so the depth is the same in
-    every mesh that holds those cells. Every other node keeps `depth`. Returns (depth, record)."""
+    pieces of the other nodes of their cells (B218; in open water, with `path`, from the path, B253); with
+    `depth_area` the section areas (B250, the nodes `inside` playing the insert's own nodes, the sections across
+    `axis` (K,3), the strait's path; None: skipped). Computed on their cells and one cell ring round them (with
+    depth_area REGION_AREA_RINGS more, so that a section's mesh run is not cut at the window's edge), nodes ordered
+    by position and cells by their nodes, so the depth is the same in every mesh that holds those cells. Every
+    other node keeps `depth`. Returns (depth, record)."""
     T = mesh.n_tris
 
     def cells_of(nodes):
@@ -1144,7 +1165,7 @@ def region_depth(mesh: Mesh, inside: np.ndarray, depth: np.ndarray, cfg, fmt: st
     ins = inside[wid]
     d, rec = rule_depth(sub, ins, depth[wid], cfg, fmt, None, depth_at="node", depth_smooth=0, strait_floor=False,
                         sill_level=sill_level, depth_channel=depth_channel, tag=tag, log=log, depth_area=depth_area,
-                        axis=axis)
+                        axis=axis, path=path)
     out = np.array(depth, dtype=np.float64)
     out[wid[ins]] = d[ins]
     rec["change_m"] = {"min": float((d - depth[wid])[ins].min()), "max": float((d - depth[wid])[ins].max())}
@@ -1171,7 +1192,8 @@ def depth_run(run_dir: Path, spec: Spec, cfg, mesh: Mesh, src: Path, straits: li
     """B223, kind = "depth": no mesh change; the host nodes inside the polygon or within width_m / 2 of the path
     (depth_region_nodes) take the nest's grid rule (region_depth: B211's box mean per node, no smoothing, no strait
     floor; the entry's depth_channel, B213, sill_level, B215 / B212 / B249, and depth_area, B250, on sections across
-    the entry's path, none for a polygon alone), every other node keeps the host's depth (the run's rules,
+    the entry's path, none for a polygon alone; in open water the joins and banks from the path, B253, unless the
+    region is a polygon without a path), every other node keeps the host's depth (the run's rules,
     meshom.run.model_depth, or the host mesh's own saved depth when it is an insert's result, B217). Writes
     insert_<name>.npz (the host mesh), .host_to_new.npy (every node kept), .collar_moved.npy (none), .json (the
     record: `region`, `depth`) and fesom-insert_<name>/depth.npy, with model files when the run wrote them."""
@@ -1204,7 +1226,8 @@ def depth_run(run_dir: Path, spec: Spec, cfg, mesh: Mesh, src: Path, straits: li
     if spec.depth_area and len(spec.path) >= 2 and not alone:
         axis = spec.path
     out, rec["depth"] = region_depth(mesh, inside, depth, cfg, fmt, spec.depth_channel, spec.sill_level,
-                                     f"[insert {spec.name}]", log, spec.depth_area, axis)
+                                     f"[insert {spec.name}]", log, spec.depth_area, axis,
+                                     None if alone else spec.path)                # B253: open water from the path
     log(f"[insert {spec.name}] depth region {where}: {int(inside.sum())} "
         f"host nodes by the grid rule{', channel ' + spec.depth_channel if spec.depth_channel else ''}"
         f"{', sill ' + spec.sill_level if spec.sill_level else ''}{', section areas' if spec.depth_area else ''}: "

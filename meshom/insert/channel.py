@@ -22,7 +22,10 @@ rule (meshom.insert.core.insert_depth):
 - `sill_level = "grid"` (`grid_sill`, B215): the grid's saddle is held at its level: the bank-to-bank chain of the
   insert's nodes through the node nearest the saddle that follows the shallowest nodes (least sum of depths), and
   every node of a cell holding one of its nodes, capped just above the midpoint between L (the deepest level surface
-  not below the saddle's grid depth) and the next level.
+  not below the saddle's grid depth) and the next level;
+- a depth region in open water (`open_sides`, B253: a channel between submerged banks, fewer than two coast pieces on
+  its cells): the joins and the dam's banks come from the region's path and the grid's depths at its outer nodes, not
+  from the coast.
 """
 from dataclasses import dataclass
 
@@ -41,6 +44,7 @@ WIDTH_TURN_DEG = 45.0        # B213: a width is the shortest wet crossing within
 WIDTH_STEP_DEG = 15.0        # B213: ... tried every this many degrees
 END_TOL_M = 0.5              # B218: the line's search is end-limited at an end when its deepest connection lies within
                              # this of the end's box mean
+OPEN_STEP_M = 1000.0         # B253: a region's path is densified to this spacing for the open-water split
 
 
 @dataclass
@@ -436,9 +440,10 @@ def narrows(grid: Grid, lon: np.ndarray, lat: np.ndarray, inside: np.ndarray | N
                "from": pt(a), "to": pt(b), "cells": int(b - a + 1)}
 
 
-def channel_line(sub: Mesh, ins: np.ndarray, grid: Grid, h_fine_m: float) -> Line | None:
+def channel_line(sub: Mesh, ins: np.ndarray, grid: Grid, h_fine_m: float, joins: list | None = None) -> Line | None:
     """The deepest channel between the insert's two joins (module docstring; B213, its ends B218). The joins: the two
-    largest pieces of host nodes on the insert's cells, sampled along their edges every half grid cell; an end is
+    largest pieces of host nodes on the insert's cells (`joins`: given, [(nodes, edges)] * 2 as _host_joins, B253's
+    open-water joins), sampled along their edges every half grid cell; an end is
     the join's sample with the deepest box mean (the grid's ocean cells, half-width h_fine_m / 2); when the deepest
     connection between the ends reaches an end's depth (within END_TOL_M: the search is end-limited there), that end
     moves to the deepest cell of the basin pool beyond its join (_pool) when it is deeper. The path, the deepest
@@ -449,7 +454,7 @@ def channel_line(sub: Mesh, ins: np.ndarray, grid: Grid, h_fine_m: float) -> Lin
     insert's cells. None when the insert has no two joins."""
     from scipy import ndimage
 
-    pieces = _host_joins(sub, ins)
+    pieces = _host_joins(sub, ins) if joins is None else joins
     if len(pieces) < 2:
         return None
     D = grid.smoothed(0.5 * h_fine_m)
@@ -597,26 +602,39 @@ def node_quantile(sub: Mesh, depth: np.ndarray, ins: np.ndarray, grid: Grid, q: 
                "change_m": {"min": float((d - depth)[idx].min()), "max": float((d - depth)[idx].max())}}
 
 
-def banks(sub: Mesh, ins: np.ndarray):
-    """The graph of the nodes of the insert's cells (neighbours: nodes of one insert cell) and the two banks (the two
-    largest components of the insert cells' coast edges): (g csr, bank A mask, bank B mask) or a reason (str)."""
+def _ins_graph(sub: Mesh, ins: np.ndarray):
+    """the graph (csr, symmetric) of the nodes of the insert's cells: neighbours are the nodes of one insert cell."""
     from scipy.sparse import coo_matrix
-    from scipy.sparse.csgraph import connected_components
 
-    from meshom.mesh import build_topology
-
-    T = sub.n_tris
     cells = [c for c in (sub.tris, sub.quads) if len(c)]
     in_ins = [c[ins[c].any(1)] for c in cells]
     pairs = np.vstack([np.c_[c[:, i], c[:, j]] for c in in_ins for i in range(c.shape[1])
                        for j in range(i + 1, c.shape[1])])
     n = sub.n_nodes
     g = coo_matrix((np.ones(len(pairs)), (pairs[:, 0], pairs[:, 1])), shape=(n, n)).tocsr()
-    g = ((g + g.T) > 0).tocsr()
+    return ((g + g.T) > 0).tocsr()
+
+
+def _coast_edges(sub: Mesh, ins: np.ndarray) -> np.ndarray:
+    """(k, 2) the insert cells' coast edges (boundary edges of the mesh on a cell with a node of `ins`)."""
+    from meshom.mesh import build_topology
+
+    T = sub.n_tris
     topo = build_topology(sub)
     be = topo.edges[topo.edge_elems[:, 1] < 0]
     elem_ins = np.r_[ins[sub.tris].any(1) if T else np.zeros(0, bool), ins[sub.quads].any(1)]
-    ce = be[elem_ins[topo.edge_elems[topo.edge_elems[:, 1] < 0, 0]]]
+    return be[elem_ins[topo.edge_elems[topo.edge_elems[:, 1] < 0, 0]]]
+
+
+def banks(sub: Mesh, ins: np.ndarray):
+    """The graph of the nodes of the insert's cells (neighbours: nodes of one insert cell) and the two banks (the two
+    largest components of the insert cells' coast edges): (g csr, bank A mask, bank B mask) or a reason (str)."""
+    from scipy.sparse import coo_matrix
+    from scipy.sparse.csgraph import connected_components
+
+    n = sub.n_nodes
+    g = _ins_graph(sub, ins)
+    ce = _coast_edges(sub, ins)
     if not len(ce):
         return "the insert has no coast edges"
     cg = coo_matrix((np.ones(len(ce)), (ce[:, 0], ce[:, 1])), shape=(n, n))
@@ -628,6 +646,113 @@ def banks(sub: Mesh, ins: np.ndarray):
         return "the insert's coast is one piece (no two banks)"
     a, b = np.argsort(sizes)[::-1][:2]
     return g, on & (lab == a), on & (lab == b)
+
+
+def open_sides(sub: Mesh, ins: np.ndarray, depth: np.ndarray, path: np.ndarray):
+    """B253: the joins and the dam's banks of a region in open water (a channel between submerged banks: the insert
+    cells' coast gives no two banks) from its path ((K,3), basin A to basin B; densified every OPEN_STEP_M and clipped
+    to its stretch between the first and the last point whose nearest node of `sub` is one of `ins`) and `depth` (the
+    grid rule's node depths, B218). The ring: the host nodes of the insert's cells joined by the insert cells' edges
+    between two of them (as _host_joins). End a: the ring's deepest node nearer the path's first point than its last;
+    end b: the deepest nearer its last. The ring's col: the deepest depth c at which the ring's nodes at least as
+    deep join a and b (the shallowest node of the deeper way round). Join A (B): the ring's nodes deeper than c joined
+    to a (b) through such nodes, with the ring's edges between two of them. Banks: the ring's other nodes and the
+    insert cells' coast nodes, left (bank A) and right (bank B) of the path's nearest point. Returns {"joins":
+    [(nodes, edges)] * 2 as _host_joins, "sides": (graph, bank A mask, bank B mask) as banks, "record"} or a reason
+    (str)."""
+    from scipy.sparse import coo_matrix
+    from scipy.sparse.csgraph import connected_components
+    from scipy.spatial import cKDTree
+
+    from meshom import straits as stm
+
+    n = sub.n_nodes
+    d = np.asarray(depth, dtype=np.float64)
+    host = np.zeros(n, bool)
+    rows, cols = [], []
+    for c in (sub.tris, sub.quads):
+        if not len(c):
+            continue
+        c = c[ins[c].any(1)]
+        host[c.ravel()] = True
+        for i in range(c.shape[1]):
+            a_, b_ = c[:, i], c[:, (i + 1) % c.shape[1]]
+            ok = ~ins[a_] & ~ins[b_]
+            rows.append(a_[ok])
+            cols.append(b_[ok])
+    host &= ~ins
+    r, cl = np.concatenate(rows), np.concatenate(cols)
+    hn = np.flatnonzero(host)
+    p = stm.densify(np.asarray(path, dtype=np.float64), OPEN_STEP_M)
+    on = np.flatnonzero(ins[cKDTree(sub.points).query(p)[1]])
+    if len(on) < 2 or not len(hn):
+        return "the region's path does not run through it"
+    p = p[on[0]:on[-1] + 1]
+    side_a = np.linalg.norm(sub.points[hn] - p[0], axis=1) < np.linalg.norm(sub.points[hn] - p[-1], axis=1)
+    if side_a.all() or not side_a.any():
+        return "the region's outer nodes all lie nearer one end of its path"
+    a = int(hn[side_a][np.argmax(d[hn[side_a]])])
+    b = int(hn[~side_a][np.argmax(d[hn[~side_a]])])
+
+    def labels(t, strict):
+        keep = host & ((d > t) if strict else (d >= t))
+        k = keep[r] & keep[cl]
+        _, lab = connected_components(coo_matrix((np.ones(int(k.sum())), (r[k], cl[k])), shape=(n, n)),
+                                      directed=False)
+        return keep, lab
+
+    vals = np.unique(d[hn][d[hn] <= min(d[a], d[b])])
+    col, lo, hi = -np.inf, 0, len(vals) - 1
+    while lo <= hi:                                          # the deepest t with a and b joined through d >= t
+        mid = (lo + hi) // 2
+        _, lab = labels(vals[mid], False)
+        if lab[a] == lab[b]:
+            col, lo = float(vals[mid]), mid + 1
+        else:
+            hi = mid - 1
+    keep, lab = labels(col, True)
+    pieces = []
+    for e_ in (a, b):
+        nodes = np.flatnonzero(keep & (lab == lab[e_])) if keep[e_] else np.array([e_])
+        m = np.zeros(n, bool)
+        m[nodes] = True
+        pieces.append((nodes, np.c_[r, cl][m[r] & m[cl]]))
+    if len(pieces[0][0]) < 2 or len(pieces[1][0]) < 2 or set(pieces[0][0]) & set(pieces[1][0]):
+        return "no two joins on the region's outer nodes"
+    cand = host.copy()
+    ce = _coast_edges(sub, ins)
+    cand[ce.ravel()] = True
+    for nodes, _ in pieces:
+        cand[nodes] = False
+    k = cKDTree(p).query(sub.points)[1]
+    t = p[np.minimum(k + 1, len(p) - 1)] - p[np.maximum(k - 1, 0)]
+    left = np.einsum("ij,ij->i", sub.points, np.cross(p[k], t)) > 0
+    bank_a, bank_b = cand & left, cand & ~left
+    if not bank_a.any() or not bank_b.any():
+        return "the region's outer nodes leave no bank on one side of its path"
+    lo_, la_ = xyz_to_lonlat(sub.points[[a, b]])
+    rec = {"from": "the region's path and the grid's depths at its outer nodes (open water, B253)",
+           "ends": [[round(float(lo_[i]), 4), round(float(la_[i]), 4), round(float(d[e_]), 1)]
+                    for i, e_ in enumerate((a, b))], "col_m": col,
+           "join_nodes": [int(len(pieces[0][0])), int(len(pieces[1][0]))],
+           "bank_nodes": [int(bank_a.sum()), int(bank_b.sum())], "coast_nodes": int(len(np.unique(ce))),
+           "path_km": float(R_EARTH_M / 1e3 * np.arccos(np.clip(np.sum(p[1:] * p[:-1], 1), -1, 1)).sum())}
+    return {"joins": pieces, "sides": (_ins_graph(sub, ins), bank_a, bank_b), "record": rec}
+
+
+def open_narrows(sub: Mesh, ins: np.ndarray, line: Line) -> tuple[np.ndarray, dict]:
+    """B253: a region in open water has no wet width (narrows measures the grid's ocean cells across the line, and
+    between submerged banks they run on far past the region): the line's narrows are its points in the region's cells
+    (the cells with a node of `ins`). Returns ((n,) bool, record)."""
+    from meshom.straits import locate
+
+    T = sub.n_tris
+    cin = np.r_[ins[sub.tris].any(1) if T else np.zeros(0, bool), ins[sub.quads].any(1)]
+    e = locate(sub, lonlat_to_xyz(line.lon, line.lat))
+    m = (e >= 0) & cin[np.maximum(e, 0)]
+    xyz = lonlat_to_xyz(line.lon[m], line.lat[m])
+    km = float(R_EARTH_M / 1e3 * np.arccos(np.clip(np.sum(xyz[1:] * xyz[:-1], 1), -1, 1)).sum()) if m.sum() > 1 else 0.0
+    return m, {"open_water": "the line's points in the region's cells (B253)", "cells": int(m.sum()), "km": km}
 
 
 def cap_star(sub: Mesh, depth: np.ndarray, chain: np.ndarray, cap: float) -> tuple:
@@ -650,7 +775,8 @@ def cap_star(sub: Mesh, depth: np.ndarray, chain: np.ndarray, cap: float) -> tup
 def grid_sill(sub: Mesh, depth: np.ndarray, ins: np.ndarray, line: Line, zbar: np.ndarray,
               sides: tuple | None = None, nearest: bool = False) -> tuple:
     """B215 (module docstring): the grid's saddle held at its level by a dam of the insert's nodes. sides: (graph,
-    bank A mask, bank B mask) in place of `banks` (a group's route, meshom.insert.group.route_banks, B246). nearest
+    bank A mask, bank B mask) in place of `banks` (a group's route, meshom.insert.group.route_banks, B246; a region in
+    open water, open_sides, B253). nearest
     (sill_level = "nearest", B249): L is the level surface nearest the saddle's grid depth (the level GEBCO's saddle
     falls on in FESOM3's levels), not the deepest one above it. Returns (depth, record; its `held`: (the dam's node
     ids, the cap), which depth_area keeps, B250)."""

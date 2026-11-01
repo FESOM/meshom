@@ -1242,3 +1242,90 @@ def test_depth_area_on_a_depth_region(strait, tmp_path):
     rec0 = run(d, spec_from(_depth_entry(path=[], width_km=None, polygon=poly), cfg), tmp_path / "poly0", log=QUIET)
     assert np.array_equal(np.load(tmp_path / "poly" / "fesom-insert_dep" / "depth.npy"),
                           np.load(tmp_path / "poly0" / "fesom-insert_dep" / "depth.npy")) and "area" not in rec0["depth"]
+# ------------------------------------------------------------------------------------------------ B253
+
+@pytest.fixture(scope="module")
+def open_run_dir(tmp_path_factory):
+    """A channel between submerged banks: the strait fixture's grid with its land at 150 m of water (the strait's
+    channel of 600 m and its 300 m sill between banks of 150 m, the basins of 2000 m), a run folder of a 64 x 12
+    patch of 2.8 km quads over it (33.6 km across: a region round the axis touches no coast), the fine levels."""
+    from meshom import compete, config
+
+    nc = _variant(tmp_path_factory, "open", lambda z, LO, LA: np.copyto(z, -150.0, where=z > 0))
+    d = tmp_path_factory.mktemp("open_run")
+    m = structured_patch(64, 12, DX)
+    compete._save(m, d / "raw.npz")
+    cfg = config.loads(f'[mesh]\nmethod = "m00_background"\nformat = "fesom2"\n[bathymetry]\nsource = "{nc}"\n'
+                       f'levels = {ZFINE}\nmin_layers = 4\n')
+    cfg = dataclasses.replace(cfg, size=dataclasses.replace(cfg.size, layers=[config.ConstantLayer(h_m=2800.0)]))
+    config.save(cfg, d / "config.resolved.toml")
+    return nc, d, m
+
+
+def test_open_water_region_takes_its_joins_and_banks_from_the_path(open_run_dir, tmp_path):
+    """B253: a depth region 14 km wide round the path in open water (its cells hold no coast edge): the ring of host
+    nodes round it splits at its col (the shallowest ring node of the deeper way round, 150 m on the banks) into the
+    joins round the deepest ring node at each end of the path (the basins), the rest of the ring is the two banks,
+    left and right of the path. The channel line runs from basin to basin through the channel, the grid's saddle is
+    the 300 m sill, the raise acts along the line's stretch in the region (the wet width runs on past it: B213's
+    narrows would be one point), the dam reaches both banks (a chain of 7 nodes across 5 rows), and the area rule's
+    sections, limited to the region, count and come nearer the grid's area. A polygon alone (no path) keeps the
+    coast rule: no two joins, no line."""
+    from meshom.insert.core import run, spec_from
+
+    nc, d, m = open_run_dir
+    lo, la = xyz_to_lonlat(m.points)
+    off = np.maximum(np.abs(lo) - 0.6, 0.0)
+    inside = np.hypot(off, la) * np.radians(1.0) * R_EARTH_M <= 7e3
+    entry = _depth_entry(width_km=14.0, depth_channel="near", sill_level="grid", depth_area=True)
+    rec = run(d, spec_from(entry), tmp_path / "open", log=QUIET)
+    dr = rec["depth"]
+    ow = dr["open_water"]
+    assert rec["status"] == "ok" and rec["region"]["nodes"] == inside.sum()
+    assert ow["ends"][0][0] < -0.6 and ow["ends"][1][0] > 0.6 and ow["col_m"] == pytest.approx(150.0, abs=5.0)
+    assert ow["coast_nodes"] == 0 and min(ow["bank_nodes"]) > 10 and min(ow["join_nodes"]) > 3
+    ch = dr["channel"]
+    assert ch["ends"][0][0] < -0.45 and ch["ends"][1][0] > 0.45
+    assert ch["grid_saddle"]["m"] == pytest.approx(300.0) and 0.10 < ch["grid_saddle"]["at"][0] < 0.12
+    assert "open_water" in ch["narrows"] and ch["narrows"]["km"] > 100.0     # no wet width: the line in the region
+    assert ch["raise"]["nodes_raised"] > 40                    # the channel's flank rows along the whole strait
+    s = dr["sill"]
+    assert s["saddle_m"] == pytest.approx(300.0) and s["capped"] > 0 and s["chain_nodes"] >= 7   # bank to bank
+    a = dr["area"]
+    assert a["applied"] and a["open_ends"] and a["counted"] > 20 and a["after"]["mean"] <= a["before"]["mean"]
+    poly = [[-0.66, -0.063], [0.66, -0.063], [0.66, 0.063], [-0.66, 0.063]]
+    rec = run(d, spec_from(_depth_entry(path=[], width_km=None, polygon=poly, sill_level="grid")), tmp_path / "pg",
+              log=QUIET)
+    assert "open_water" not in rec["depth"] and "skipped" in rec["depth"]["channel"]
+
+
+def test_open_water_path_is_clipped_to_the_region(open_run_dir):
+    """B253: a polygon region with a path running on 0.3 deg past both its ends: the path is clipped to its stretch
+    through the region, so the joins are the ring's ends in the two basins as with the path inside, and the coast
+    rule (a patch whose region reaches the patch's edge: its boundary is coast) is kept when there are two banks."""
+    from meshom.bathymetry import node_depth
+    from meshom.insert import channel as chan
+    from meshom.size import polygon_inside
+
+    nc, _, m = open_run_dir
+    poly = lonlat_to_xyz(np.array([-0.66, 0.66, 0.66, -0.66]), np.array([-0.063, -0.063, 0.063, 0.063]))
+    ins = polygon_inside(m.points, poly)
+    base, _ = node_depth(m, nc, "elevation", 40.0)
+    long = lonlat_to_xyz(np.array([-0.95, 0.95]), np.array([0.0, 0.0]))
+    r = chan.open_sides(m, ins, base, long)
+    assert not isinstance(r, str)
+    (ja, _), (jb, _) = r["joins"]
+    lo, la = xyz_to_lonlat(m.points)
+    assert (lo[ja] < -0.4).all() and (lo[jb] > 0.4).all()
+    g, ba, bb = r["sides"]
+    assert (la[ba] > 0).all() and (la[bb] < 0).all() and (np.abs(lo[ba | bb]) < 0.66).all()
+    grid = chan.read_window(nc, "elevation", lo, la, 8000.0)
+    ln = chan.channel_line(m, ins, grid, DX, joins=r["joins"])
+    deep = np.where(ins, 600.0, base)                           # every region node below the cap: the dam shows
+    out, s = chan.grid_sill(m, deep, ins, ln, np.array(ZFINE), sides=r["sides"])
+    capped = out < deep
+    assert s["saddle_m"] == pytest.approx(300.0) and capped.sum() == s["capped"] > 0
+    assert la[capped].min() < -0.05 and la[capped].max() > 0.05          # from bank to bank across the region
+    assert np.abs(lo[capped] - s["via"][0]).max() < 6.0 * DX / 111e3   # a chain across, not along the channel
+    wide = np.abs(la) < 0.2                                     # the whole patch's width: its edges are coast
+    assert not isinstance(chan.banks(m, wide & (np.abs(lo) < 0.66)), str)

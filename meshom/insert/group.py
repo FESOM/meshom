@@ -36,7 +36,7 @@ from scipy.spatial import cKDTree
 
 from meshom.geo import R_EARTH_M, xyz_to_lonlat
 from meshom.insert.geom import Chart, Polyline, point_in_polygon
-from meshom.insert.region import InsertError
+from meshom.insert.region import MIN_CELLS_ACROSS, InsertError
 from meshom.mesh import Mesh, build_topology, signed_area
 
 GAP_JOIN_CELLS = 5           # B241: islands closer than this many floor cells (h_min) join the land by default
@@ -368,6 +368,52 @@ def chord_test(pieces: list, closed: list):
     return ok
 
 
+def fill_coast(rc, lines: list, step: float, scale: float) -> list:
+    """B257: a group's fill lines (chart polylines, drawn in the water from coast to coast). Each line's ends go to
+    the nearest points of the main-coast piece nearest to both ends; the coast between them (on a closed piece the
+    shorter way round, on an open one the run between) is replaced by the line, the coast's direction kept: the water
+    behind the line becomes land (a closed inlet, a narrowed channel). Changes rc.main (and rc.base) and their
+    polylines in place. scale: the chart's scale (chart m per sphere m). Returns one record per line."""
+    from meshom.insert.realcoast import _resample
+
+    out = []
+    for li, F0 in enumerate(lines):
+        F = _resample(np.asarray(F0, dtype=float), False, step)
+        best = None
+        for k, m in enumerate(rc.main):
+            if len(m) < 4:
+                continue
+            d = max(float(np.min(np.linalg.norm(m - F[0], axis=1))), float(np.min(np.linalg.norm(m - F[-1], axis=1))))
+            if best is None or d < best[0]:
+                best = (d, k)
+        k = best[1]
+        m, cl = rc.main[k], rc.closed[k]
+        ia, ib = int(np.argmin(np.linalg.norm(m - F[0], axis=1))), int(np.argmin(np.linalg.norm(m - F[-1], axis=1)))
+        n = len(m)
+        if cl:
+            if (ib - ia) % n > (ia - ib) % n:              # the shorter way round runs from ib to ia
+                F, ia, ib = F[::-1], ib, ia
+            R = np.roll(m, -ia, axis=0)
+            j = (ib - ia) % n
+            cut, F = R[:j + 1], np.vstack([R[:1], F[1:-1], R[j:j + 1]])
+            new = np.vstack([F, R[j + 1:]])
+        else:
+            if ia > ib:
+                F, ia, ib = F[::-1], ib, ia
+            cut, F = m[ia:ib + 1], np.vstack([m[ia:ia + 1], F[1:-1], m[ib:ib + 1]])
+            new = np.vstack([m[:ia], F, m[ib + 1:]])
+        a_km2 = abs(_shoelace(np.vstack([cut, F[::-1][1:-1]]))) / scale ** 2 / 1e6
+        rc.main[k] = new
+        rc._pl[k] = Polyline(np.vstack([new, new[:1]]) if cl else new)
+        if rc.base:
+            rc.base[k] = new
+            rc._plb[k] = Polyline(np.vstack([new, new[:1]]) if cl else new)
+        out.append({"line": li, "piece": int(k), "closed_piece": bool(cl), "coast_km": round(
+            float(np.linalg.norm(np.diff(cut, axis=0), axis=1).sum()) / scale / 1e3, 2), "land_km2": round(a_km2, 2),
+            "snap_km": round(best[0] / scale / 1e3, 2)})
+    return out
+
+
 class GroupH:
     """B243: the group's size field (sphere metres): h(x) = max(h_min, min(cap(x), min_k h_k + g_k |x - p_k|)), the
     cone over the samples p_k (the cross lines' nodes at their spacing, the joins' nodes at their host edge length, the
@@ -580,12 +626,16 @@ def build(win, chart: Chart, env_xy: np.ndarray, channels: list, real, h_min: fl
           island_km2: float, growth: float, bank_sigma_cells: float = 1.5, log=print, name: str = "group",
           fill_opts: dict | None = None, land_cells: float = 0.0, gap_cells: int = GAP_CELLS,
           bank_smooth: float = 0.0, state: dict | None = None, blend_cells: float | None = None,
-          growth_max: float | None = None) -> GroupResult:
+          growth_max: float | None = None, fill: list | None = None) -> GroupResult:
     """The group insert in the host window `win` (module docstring). real: the run's coast loops ((K,3), water on the
     left; None: the host's coast). Returns a GroupResult (window: the window mesh with the group in place of R).
     state: a dict that receives the real coast, the outline and the holes as they are built (for the maps of a
-    refusal)."""
+    refusal). fill: chart polylines whose water behind becomes land (B257, fill_coast)."""
     state = {} if state is None else state
+    for ch in channels:                                    # B258: no 1-cell channel
+        if ch.cells < MIN_CELLS_ACROSS:
+            raise InsertError(f"channel {ch.name}: {ch.cells} cell(s) across; a channel needs at least "
+                              f"{MIN_CELLS_ACROSS} cells across (one cell carries no flow, B258)")
     from meshom.insert import block as blockm
     from meshom.insert import measure
     from meshom.insert import realcoast as rcm
@@ -664,6 +714,11 @@ def build(win, chart: Chart, env_xy: np.ndarray, channels: list, real, h_min: fl
                 if rc.base:
                     rc.base[k] = m
                     rc._plb[k] = Polyline(np.vstack([m, m[:1]]))
+        if fill:                                           # B257: the water behind each fill line becomes land
+            rec["fill"] = fill_coast(rc, fill, max(rcm.STEP_CELLS * h_min * sc_e, 1.0), sc_e)
+            for f in rec["fill"]:
+                log(f"[insert {name}] fill line {f['line']}: {f['coast_km']} km of coast replaced, "
+                    f"{f['land_km2']} km^2 of water made land", flush=True)
 
     # --- the new outer boundary: joins kept, coast runs replaced by the real coast
     pieces, fallback, used_pieces = [], [], set()
@@ -1159,7 +1214,8 @@ def insert_group(win, spec, log=print, real=None, h_min: float | None = None):
         g = build(win, chart, env_xy, spec.channels, real if spec.coast == "real" else None, h_min, gap_m,
                   spec.island_km2, growth, spec.bank_sigma_cells, log, spec.name, land_cells=spec.bank_land_cells,
                   gap_cells=spec.gap_cells, bank_smooth=spec.bank_smooth_cells, state=state,
-                  blend_cells=spec.blend_cells, growth_max=spec.growth_max)
+                  blend_cells=spec.blend_cells, growth_max=spec.growth_max,
+                  fill=[chart.fwd(f) for f in spec.fill])
     except InsertError as ex:
         log(f"[insert {spec.name}] REFUSED {ex}", flush=True)
         res = Result(False, {"name": spec.name, "refused": [str(ex)]}, host_window=win, chart=chart,

@@ -62,7 +62,7 @@ h_min_m = 1000.0                   # the size floor (default: the host mesh's sm
 |---|---|---|
 | `kind` | `"strait"` | `"strait"`, `"strip"`, `"corridor"`, `"depth"` (B223) |
 | `strait` / `path` | | a listed strait, or the centreline (strait), coast line (strip), axis (corridor) |
-| `cells` / `h_fine_m` | 10 cells | cells across the neck, or the fine size (cells = round(W / h_fine_m)) (B159) |
+| `cells` / `h_fine_m` | 10 cells | cells across the neck, or the fine size (cells = round(W / h_fine_m)) (B159); at least 2: a neck, join or block row of 1 cell is refused, one cell carries no flow (B258) |
 | `h_min_m` | the host's smallest cell | size floor: the insert never makes cells below it (B165) |
 | `reach_km` | 12 host cells | growth limit per side (B159) |
 | `mouth_a`, `mouth_b` | | join hints: a line from bank to bank on side A / B |
@@ -100,6 +100,7 @@ h_min_m = 1000.0                   # the size floor (default: the host mesh's sm
 | `growth_max` | 0.5 | group: the steepest slope with which the fill's size reaches the host's at the joins; = `growth`: one slope (B252) |
 | `even_sweeps` | 40 | group: sweeps of the pass that evens the neighbour areas of the patches, blocks and two host rings; 0: off (B252) |
 | `even_blocks` | `""` | group: the blocks' nodes in that pass: `""` move, `"cross"` the cross lines held, `"block"` every block node held (B252) |
+| `fill` | | group: polylines drawn in the water from coast to coast; the coast between each line's ends is replaced by it and the water behind becomes land: a dead end closed, a channel narrowed (B257) |
 | `force` | false | build with the least-violating joins when none passes |
 
 ## Rules and refusals
@@ -351,10 +352,11 @@ Choose in this order:
    (about (host cell - channel cell) / 0.12 on every side) and with its edges in open water: a join across real land
    or an island crossing the edge is refused ("an island of the real coast crosses the group's boundary"); move the
    edge off it.
-2. **Channels.** A cross line at each end of a channel, both ends on the same two pieces of land (a channel whose
-   bank changes island, as Lombok Strait at Nusa Penida, is two channels meeting in a junction patch). `cells` is
-   the count at the narrowest; 3 is enough where 5 would force cells near the floor. Put the controlling sill inside
-   the block, not in a patch, so its dam holds.
+2. **Channels.** `cells` is at least 2 (B258: a 1-cell channel carries no flow and is refused; to lower a channel's
+   section area narrow it with fill lines or close it). A cross line at each end of a channel, both ends on the same
+   two pieces of land (a channel whose bank changes island, as Lombok Strait at Nusa Penida, is two channels meeting
+   in a junction patch). `cells` is the count at the narrowest; 3 is enough where 5 would force cells near the
+   floor. Put the controlling sill inside the block, not in a patch, so its dam holds.
 3. **Islands.** `gap_km` closes passages narrower than about 5 floor cells; lower it to keep an island inside a
    passage open; `island_km2` drops the small ones. The two banks of a channel are never joined, however narrow
    the channel (B255): a channel keeps a passage open that `gap_km` would close (the Oresund between Zealand and
@@ -362,6 +364,11 @@ Choose in this order:
    the bay search as on the mainland coast, and no pocket chord crosses another coast piece (an island, a
    channel's other bank; B256). To drop the islands a host does not have, set `island_km2` above their area (the
    Danish straits on ORCA025 v5: 125 km^2 keeps only the islands that join the land or Zealand and Funen).
+   **Fill lines** (`fill`, B257) close what the bay search leaves open: a dead end shallower than one local cell
+   (Gronsund between Falster and Mon, with Storstrom closed) holds the group's smallest cells; a line across its
+   mouth makes it land. Draw each line in the water from coast to coast, its ends at the mouth's corners so that the
+   water outside is not cut. A line along a bank, ramped from the coast and back, narrows a channel: with FESOM3's
+   30 m floor a shallow strait's section area is 2-3 times the bathymetry's, and only width brings it back.
 4. **Capes.** A block wrapping round a thin cape folds; `bank_smooth_cells = 1-2` cuts the cape (the block covers
    it). `bank_sigma_cells = 0.5` keeps islands near a coast from overlapping it after the smoothing.
 5. **`fix_rings = 3`** relaxes the angles of the patches and of the host rings round them (B210, B220);
@@ -385,7 +392,7 @@ of its nodes' levels) leaves a channel one or two levels shallower than its dam.
 
 ## Config keys used
 
-- `[[inserts]]` (group): `envelope`, `channels`, `gap_km`, `island_km2`, `gap_cells`, `growth`, `bank_smooth_cells`, `routes`, `blend_cells`, `split_deg`, `growth_max`, `even_sweeps`, `even_blocks`
+- `[[inserts]]` (group): `envelope`, `channels`, `gap_km`, `island_km2`, `gap_cells`, `growth`, `bank_smooth_cells`, `routes`, `blend_cells`, `split_deg`, `growth_max`, `even_sweeps`, `even_blocks`, `fill`
 - `[[inserts]]`: `name`, `kind`, `strait`, `path`, `cells`, `h_fine_m`, `h_min_m`, `reach_km`, `mouth_a`, `mouth_b`, `ljoins`, `bays`, `collar_rings`, `coast`, `coast_source`, `bank_sigma_cells`, `width_km`, `band_km`, `rows`, `coast_rounds`, `coast_shift_cells`, `cells_a`, `cells_b`, `growth_a`, `growth_b`, `bank_land_cells`, `fill`, `fill_rows`, `corner_steps`, `corner_split`, `join_margin`, `add_columns`, `fix_rings`, `depth_at`, `depth_smooth`, `strait_floor`, `sill_level`, `depth_channel`, `depth_quantile`, `stages`, `force`
 
 ## Sources
@@ -399,4 +406,5 @@ of its nodes' levels) leaves a channel one or two levels shallower than its dam.
 - Decisions: B158-B169, B180-B186, B190, B192-B220, B250.
 - Decisions: B158-B169, B180-B186, B190, B192-B223.
 - Decisions: B158-B169, B180-B186, B190, B192-B212, B240-B249, B252.
-- Decisions: B254 (a refusal after the joins is a record, exit code 2), B255, B256 (group inserts).
+- Decisions: B254 (a refusal after the joins is a record, exit code 2), B255, B256, B257 (group inserts), B258 (at
+  least 2 cells across every channel), B259 (block nodes on one point merged).

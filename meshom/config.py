@@ -48,7 +48,7 @@ docs/config.md has the full description and an example. Tables (units: metres, k
               (B250); kind "depth": a depth region, the mesh unchanged (width_km round the path, or
               polygon; B223); group: envelope,
               channels (B240, B242), gap_km, island_km2 (B241), growth, gap_cells (B243), bank_smooth_cells (B245),
-              routes (B246), blend_cells (B247), growth_max, even_sweeps, even_blocks (B252)
+              routes (B246), blend_cells (B247), growth_max, even_sweeps, even_blocks (B252), fill (B257)
               (meshom.config.InsertCfg)
     [size]    grad_max (|grad h| limit of the gradient limiter, default 0.1; inf = no limiting), h_min_m / h_max_m
               (optional global clip), preview_deg (UI preview grid), limiter_max_nodes (grid size cap), from (an h
@@ -273,7 +273,9 @@ class InsertCfg:
     fill: list = field(default_factory=list)          # strait: fill lines [[[lon, lat], ...], ...]: each replaces the
                                                        # real coast between its ends (snapped onto it) where it lies
                                                        # seaward; the water cut off is meshed as a strip of its own
-                                                       # hanging off that bank (B204)
+                                                       # hanging off that bank (B204); group: the coast between
+                                                       # the line's ends is replaced by it, the water behind
+                                                       # becomes land (a closed inlet, a narrower channel; B257)
     fill_rows: int | None = None                       # rows of that strip (None: its depth / the local cell, >= 1)
     corner_steps: bool = False                         # strait: a join from a hint cuts every convex step of its
                                                        # host staircase by a corner triangle, not only its bends (B206)

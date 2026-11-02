@@ -16,7 +16,7 @@ from meshom.geo import R_EARTH_M, arc_length, lonlat_to_xyz, xyz_to_lonlat
 from meshom.insert import assemble, block, measure, region
 from meshom.insert.geom import Axis, Chart, Polyline, smooth_bank
 from meshom.insert.host import Window, coast_neighbours, cut_window, graph, splice
-from meshom.insert.region import InsertError
+from meshom.insert.region import MIN_CELLS_ACROSS, InsertError
 from meshom.mesh import Mesh
 
 WINDOW_PAD_H = 10.0          # B159: the window = the path, 1.5 x the reach and this many host cells around it
@@ -139,7 +139,7 @@ def spec_from(cfg_entry, cfg=None) -> Spec:
                             for k, r in enumerate(e.routes)], blend_cells=e.blend_cells, split_deg=e.split_deg,
                     growth_max=e.growth_max,
                     even_sweeps=EVEN_SWEEPS if e.even_sweeps is None else int(e.even_sweeps),
-                    even_blocks=e.even_blocks)
+                    even_blocks=e.even_blocks, fill=[_ll(f) for f in e.fill])
     if e.kind not in ("strait", "depth"):
         if path is None or e.width_km is None:
             raise InsertError(f"an insert of kind {e.kind!r} needs a path and width_km")
@@ -210,6 +210,10 @@ def insert_window(win: Window, spec: Spec, h_run, tol=0.20, gates=None, log=prin
 
     t0 = time.perf_counter()
     rec = {"name": spec.name, "timing": {}}
+    for what, n in (("the neck", spec.cells), ("the join of side A", spec.cells_a), ("the join of side B", spec.cells_b)):
+        if n is not None and n < MIN_CELLS_ACROSS:                         # B258: no 1-cell channel
+            raise InsertError(f"{spec.name}: {n} cell(s) across {what}; a channel needs at least {MIN_CELLS_ACROSS} "
+                              "cells across (one cell carries no flow, B258)")
     mesh = win.mesh
     c, half = _path_frame(spec.path)
     chart = Chart(c)
@@ -444,6 +448,9 @@ def insert_window(win: Window, spec: Spec, h_run, tol=0.20, gates=None, log=prin
                       split=spec.corner_split, margin=spec.join_margin)                    # B208, B209
     rec["timing"]["block_s"] = time.perf_counter() - t
     rec["block"] = blk.info
+    if int(blk.N.min()) < MIN_CELLS_ACROSS:                                 # B258: no row of the block one cell wide
+        raise InsertError(f"{spec.name}: the block has {int(blk.N.min())} cell(s) across at its narrowest row; a channel "
+                          f"needs at least {MIN_CELLS_ACROSS} cells across (one cell carries no flow, B258)")
     log(f"[insert {spec.name}] block: {blk.M} rows, counts {blk.N.min()}-{blk.N.max()}, {len(blk.tris)} Y-splits, "
         f"fine lattice {blk.info['fine']} ({rec['timing']['block_s']:.0f} s)", flush=True)
     if rc is not None and any(b.meshed for b in rc.bays):

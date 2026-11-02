@@ -1081,6 +1081,22 @@ def test_a_rule_failing_after_the_joins_is_a_refusal_record(depth_run_dir, tmp_p
     assert code == 2
 
 
+@pytest.mark.parametrize("counts", [{"cells": 1}, {"cells": 5, "cells_a": 1}])
+def test_a_strait_of_one_cell_across_is_refused(depth_run_dir, tmp_path, counts):
+    """B258: a strait's neck or join of fewer than 2 cells across is refused (a refusal record naming the insert and
+    the count, no mesh): one cell carries no flow."""
+    from meshom.config import InsertCfg, _build, load
+    from meshom.insert import core
+
+    d, m = depth_run_dir
+    e = _build(InsertCfg, {"name": "one", "path": [[-0.6, 0.0], [0.6, 0.0]], "coast": "host"} | counts, "insert")
+    rec = core.run(d, core.spec_from(e, load(d / "config.resolved.toml")), tmp_path, log=QUIET)
+    assert rec["status"] == "refused"
+    assert "one: 1 cell(s) across" in rec["refused"][0] and "B258" in rec["refused"][0]
+    assert json.loads((tmp_path / "insert_one.json").read_text())["status"] == "refused"
+    assert not (tmp_path / "insert_one.npz").exists()
+
+
 def test_depth_region_on_the_plain_host(strait, depth_run_dir, tmp_path):
     """B223: kind = "depth" leaves the mesh as it is; the host nodes within width_km / 2 of the path (or inside the
     polygon) take the nest's grid rule (the box mean per node, no smoothing, no strait floor, at least the floor; with

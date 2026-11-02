@@ -47,6 +47,8 @@ CORNER_CHORD_H = 1.5               # B158: the chain's direction at its end: cho
 BANK_CHORD_H = 3.0                 # B158: the bank's direction: chord over this many join cells along the coast
                                    # (a staircase coast has a direction only over several of its steps)
 DEFAULT_CELLS = 10                 # B159: cells across the neck when the spec gives neither cells nor h_fine_m
+MIN_CELLS_ACROSS = 2               # B258: a channel (a strait's neck and block, a group's channel) has at least
+                                   # this many cells across: one cell carries no flow
 REACH_H = 12.0                     # B159: default growth limit per side, in host cells at the neck
 STEP_H = 0.5                       # B159: candidate spacing along the axis, in host cells
 BEND_SIGMA_H = 1.5                 # B158: the bend rule's wide window (half length), in join cells

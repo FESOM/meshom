@@ -205,6 +205,96 @@ def test_the_chord_test_rejects_chords_across_other_land():
     assert ok(0, np.array([-20e3, 1e3]), np.array([20e3, 1e3]))              # below it, in the water
     assert ok(1, np.array([-6e3, 10.5e3]), np.array([6e3, 10.5e3]))          # the island's own chord
 
+
+# ------------------------------------------------------------------------------------------------ B258
+
+def test_a_channel_of_one_cell_across_is_refused():
+    """B258: a group's channel block of fewer than 2 cells across is refused, the error naming the channel and its
+    count: one cell carries no flow."""
+    from meshom.insert.region import InsertError
+    win, ch, loops = _two_channels()
+    env = np.array([[-330e3, -110e3], [330e3, -110e3], [330e3, 110e3], [-330e3, 110e3]])
+    chans = [group.Channel("north", ch.inv(np.array([[-80e3, 15e3], [-80e3, 95e3]])),
+                           ch.inv(np.array([[80e3, 15e3], [80e3, 95e3]])), 1),
+             group.Channel("south", ch.inv(np.array([[-80e3, -95e3], [-80e3, -15e3]])),
+                           ch.inv(np.array([[80e3, -95e3], [80e3, -15e3]])), 5)]
+    with pytest.raises(InsertError, match=r"channel north: 1 cell\(s\) across.*B258"):
+        group.build(win, ch, env, chans, loops, h_min=2e3, gap_m=9.9e3, island_km2=10.0, growth=0.12,
+                    log=lambda *a, **k: None, fill_opts={"verbose": False})
+
+
+# ------------------------------------------------------------------------------------------------ B257
+
+INLET = (8e3, 19e3)                    # an inlet into the island's east end: half-width, depth from the mouth (m)
+
+
+def _inlet_island():
+    """The separating island (ISLAND) with an inlet 16 km wide and 19 km deep cut into its east end (shallower than
+    one local cell, 20 km: the bay search keeps it open), clockwise (water left); returns (loop, the mouth's x)."""
+    a, b = ISLAND
+    hw, dep = INLET
+    t0 = np.arcsin(hw / b)
+    xm = a * np.cos(t0)
+    t = np.linspace(t0, 2 * np.pi - t0, 400)
+    ell = np.c_[a * np.cos(t), b * np.sin(t)]
+    x0 = xm - dep
+    slot = np.vstack([np.c_[np.linspace(ell[-1, 0], x0, 20), np.full(20, -hw)][1:],
+                      np.c_[np.full(8, x0), np.linspace(-hw, hw, 8)][1:-1],
+                      np.c_[np.linspace(x0, ell[0, 0], 20), np.full(20, hw)][:-1]])
+    return np.vstack([ell, slot])[::-1], xm
+
+
+def _inlet_build(fill):
+    win, ch, loops = _two_channels()
+    isl, xm = _inlet_island()
+    loops[2] = ch.inv(isl)
+    env = np.array([[-330e3, -110e3], [330e3, -110e3], [330e3, 110e3], [-330e3, 110e3]])
+    chans = [group.Channel("north", ch.inv(np.array([[-80e3, 15e3], [-80e3, 95e3]])),
+                           ch.inv(np.array([[80e3, 15e3], [80e3, 95e3]])), 5),
+             group.Channel("south", ch.inv(np.array([[-80e3, -95e3], [-80e3, -15e3]])),
+                           ch.inv(np.array([[80e3, -95e3], [80e3, -15e3]])), 5)]
+    kw = {"fill": [np.array([[xm, -INLET[0]], [xm, INLET[0]]])]} if fill else {}
+    res = group.build(win, ch, env, chans, loops, h_min=2e3, gap_m=9.9e3, island_km2=10.0, growth=0.12,
+                      bank_sigma_cells=0.3, log=lambda *a, **k: None, fill_opts={"verbose": False}, **kw)
+    assert res.ok, res.record.get("refused") or res.record.get("invalid")
+    out = res.window
+    xy = ch.fwd(out.points)
+    cen = np.r_[xy[out.tris].mean(1) if out.n_tris else np.zeros((0, 2)), xy[out.quads].mean(1)]
+    inside = (cen[:, 0] > xm - INLET[1] + 2e3) & (cen[:, 0] < xm - 2e3) & (np.abs(cen[:, 1]) < INLET[0] - 1e3)
+    return res, int(inside.sum())
+
+
+def test_a_fill_line_makes_the_water_behind_it_land():
+    """B257: an inlet the bay search keeps open (shallower than one local cell) holds cells; a fill line across its
+    mouth replaces the coast behind it: no cell inside, the record gives the land made (about the inlet's area)."""
+    _, n_open = _inlet_build(False)
+    assert n_open > 0
+    res, n = _inlet_build(True)
+    assert n == 0
+    f = res.record["fill"]
+    assert len(f) == 1 and f[0]["closed_piece"] and 200.0 < f[0]["land_km2"] < 400.0     # the inlet: 304 km^2
+    assert res.record["floor"]["below"] == 0
+
+
+class _Main:
+    def __init__(self, main, closed):
+        from meshom.insert.geom import Polyline
+        self.main, self.closed, self.base, self._plb = list(main), list(closed), [], []
+        self._pl = [Polyline(np.vstack([m, m[:1]]) if c else m) for m, c in zip(main, closed)]
+
+
+def test_a_fill_line_on_an_open_coast_keeps_its_direction():
+    """B257: on an open piece the run between the line's ends is replaced, the line taken in the coast's direction
+    whichever way it was drawn; the land made is the area between."""
+    coast = np.c_[np.linspace(-50e3, 50e3, 201), np.zeros(201)]
+    line = np.array([[-20e3, 0.0], [-10e3, 5e3], [10e3, 5e3], [20e3, 0.0]])
+    for F in (line, line[::-1]):
+        rc = _Main([coast], [False])
+        rec = group.fill_coast(rc, [F], 500.0, 1.0)
+        m = rc.main[0]
+        assert np.all(np.diff(m[:, 0]) > 0)                                  # the coast's direction
+        assert abs(m[:, 1].max() - 5e3) < 1.0 and abs(rec[0]["land_km2"] - 150.0) < 1.0
+
 # ------------------------------------------------------------------------------------------------ B246, B247
 
 LEVELS = [0.0, 10.0, 20.0, 30.0, 50.0, 100.0, 150.0, 200.0, 250.0, 300.0, 350.0, 400.0, 500.0, 600.0, 800.0,

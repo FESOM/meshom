@@ -778,8 +778,9 @@ def grid_sill(sub: Mesh, depth: np.ndarray, ins: np.ndarray, line: Line, zbar: n
     bank A mask, bank B mask) in place of `banks` (a group's route, meshom.insert.group.route_banks, B246; a region in
     open water, open_sides, B253). nearest
     (sill_level = "nearest", B249): L is the level surface nearest the saddle's grid depth (the level GEBCO's saddle
-    falls on in FESOM3's levels), not the deepest one above it. Returns (depth, record; its `held`: (the dam's node
-    ids, the cap), which depth_area keeps, B250)."""
+    falls on in FESOM3's levels), not the deepest one above it. Only nodes of `ins` are capped: a host node of the
+    dam's cells keeps its depth, those deeper than the cap counted (`host_deeper_than_cap`, B262). Returns (depth,
+    record; its `held`: (the dam's node ids in `ins`, the cap), which depth_area keeps, B250)."""
     from scipy.sparse.csgraph import dijkstra
 
     from meshom.straits import locate
@@ -820,10 +821,13 @@ def grid_sill(sub: Mesh, depth: np.ndarray, ins: np.ndarray, line: Line, zbar: n
     L, Ln = float(z[max(k, 0)]), float(z[min(k + 1, len(z) - 1)])
     cap = 0.5 * (L + Ln) - SILL_MARGIN_M
     out, low, nb = cap_star(sub, depth, chain, cap)
+    host = low & ~ins                                         # B262: host nodes keep their depth (only the
+    out[host] = depth[host]                                   # insert's nodes are saved)
+    low &= ins
     lon, lat = xyz_to_lonlat(sub.points[via][None])
-    return out, {"held": (np.flatnonzero(nb), cap),
+    return out, {"held": (np.flatnonzero(nb & ins), cap),
                  "rule": "nearest" if nearest else "grid", "saddle_m": sd,
                  "saddle_at": [round(slon, 4), round(slat, 4)], "level_m": L,
                  "next_level_m": Ln, "cap_m": cap, "via": [round(float(lon[0]), 4), round(float(lat[0]), 4)],
-                 "chain_nodes": int(len(chain)), "capped": int(low.sum()), "capped_host_nodes": int((low & ~ins).sum()),
+                 "chain_nodes": int(len(chain)), "capped": int(low.sum()), "host_deeper_than_cap": int(host.sum()),
                  "cut_max_m": float((depth - out).max())}

@@ -170,7 +170,7 @@ def test_grid_sill_caps_a_dam_through_the_saddle_from_bank_to_bank(strait, line)
     assert (rec["saddle_m"], rec["level_m"], rec["next_level_m"]) == (pytest.approx(300.0), 280.0, 340.0)
     assert rec["cap_m"] == 0.5 * (280.0 + 340.0) - chan.SILL_MARGIN_M == 309.0
     capped = out < dep
-    assert capped.sum() == rec["capped"] and rec["capped_host_nodes"] == 0
+    assert capped.sum() == rec["capped"] and rec["host_deeper_than_cap"] == 0
     assert (out[capped] == 309.0).all() and capped[via]
     dam = capped[m.quads].all(1)                                 # the cells round the chain: every node capped
     assert dam.sum() >= 3 and (out[m.quads[dam]].mean(1) < 310.0).all()
@@ -178,6 +178,24 @@ def test_grid_sill_caps_a_dam_through_the_saddle_from_bank_to_bank(strait, line)
     assert len(lat_rows) == 4                                    # bank to bank
     assert np.abs(lo[capped] - lo[via]).max() < 3.5 * DX / 111e3
     assert np.array_equal(out[~capped], dep[~capped])
+
+
+def test_grid_sill_caps_only_the_insert_nodes(strait, line):
+    """B262: when the dam's cells hold host nodes (here the insert's own nodes are only the two inner rows, the
+    bank rows are host nodes at 600 m), only the insert's nodes are capped: a host node keeps its depth (only the
+    insert's nodes are saved), those deeper than the cap are counted, and `held` names only the insert's nodes."""
+    from meshom.insert import channel as chan
+
+    _, _, _, m, ins = strait
+    base, _, ln = line
+    _, la = xyz_to_lonlat(m.points)
+    ins2 = ins & (np.abs(la) < np.abs(la).max() - 1e-6)
+    dep = np.where(ins, 600.0, base)
+    out, rec = chan.grid_sill(m, dep, ins2, ln, np.array(ZBAR))
+    capped = out < dep
+    assert rec["cap_m"] == 309.0 and capped.sum() == rec["capped"] > 0
+    assert np.array_equal(out[~ins2], dep[~ins2]) and rec["host_deeper_than_cap"] >= 2
+    assert ins2[rec["held"][0]].all() and (out[capped] == 309.0).all()
 
 
 # ------------------------------------------------------------------------------------------------ B218
@@ -213,7 +231,8 @@ def test_channel_ends_come_from_the_grid_not_from_the_host_depths(strait, tmp_pa
     """B218: the west basin has a 40 m shelf north of 0.025 N, where the join's northern host node stands; the host's
     depth (an ORCA node: the deepest of four ocean model cells) puts 3000 m there. The line's ends are the joins'
     deepest box means (the trench), so the deepest connection and the grid's saddle are the strait's (300 m), the dam
-    is built and nothing is end-limited; the host's depths change nothing."""
+    is built and nothing is end-limited; the host's depths change nothing on the insert's nodes (a host node keeps
+    its own depth, B262)."""
     from meshom.bathymetry import node_depth
 
     nc = _variant(tmp_path_factory, "shelf", lambda z, LO, LA: z.__setitem__((LO <= -0.45) & (LA > 0.025), -40.0))
@@ -231,7 +250,8 @@ def test_channel_ends_come_from_the_grid_not_from_the_host_depths(strait, tmp_pa
     assert all(abs(e[1]) < 0.013 for e in ch["ends"])                              # on the trench, not the shelf
     assert rec["sill"]["saddle_m"] == pytest.approx(300.0) and rec["sill"]["capped"] > 0
     d2, rec2 = _own(nc, m, ins, base)
-    assert np.array_equal(d, d2) and rec2["channel"]["ends"] == ch["ends"]
+    assert np.array_equal(d[ins], d2[ins]) and rec2["channel"]["ends"] == ch["ends"]
+    assert np.array_equal(d[~ins], host[~ins]) and np.array_equal(d2[~ins], base[~ins])
 
 
 def test_channel_line_stays_in_the_insert(strait, tmp_path_factory):
@@ -353,7 +373,7 @@ def test_sill_rounded_to_the_shallower_level():
     assert rec["cap_m"] == 265.0 - SILL_MARGIN_M == 264.0
     capped = out < dep
     assert np.array_equal(np.flatnonzero(capped), np.flatnonzero(np.isin(col, [13, 15])))
-    assert rec["capped"] == 8 and rec["capped_host_nodes"] == 0 and rec["chain_nodes"] == 4
+    assert rec["capped"] == 8 and rec["host_deeper_than_cap"] == 0 and rec["chain_nodes"] == 4
     near = np.isin(col, [13, 14, 15])
     cells = near[m.quads].all(1)
     assert (out[m.quads[cells]].mean(1) < 265.0).all()
@@ -390,7 +410,8 @@ def test_node_quantile_of_the_box(strait, tmp_path):
 def test_own_rule_box_mean_without_smoothing_or_strait_floor(strait):
     """B211: depth_at "node", depth_smooth 0, strait_floor false: the insert's nodes take the box mean per node (at
     least the floor), not the run's smoothed value nor the run's strait depth floor; depth_smooth > 0 smooths among
-    the insert's nodes only; None takes the run's passes over the whole part."""
+    the insert's nodes only; None takes the run's passes over the whole part (the other nodes keep the depth given,
+    B262)."""
     from meshom.bathymetry import node_depth
     from meshom.insert.core import rule_depth
     from meshom.run import depth_floor_m
@@ -414,7 +435,7 @@ def test_own_rule_box_mean_without_smoothing_or_strait_floor(strait):
     assert (d1[ins] >= d0[ins]).all() and (d0[on] < 1500.0).all() and (d1[on] == 1500.0).all()
     d2, r2 = rule_depth(m, ins, box, cfg, "fesom2", straits, depth_smooth=None, strait_floor=False, log=QUIET)
     assert r2["rule"]["smooth_passes"] == 4 and r2["rule"]["smooth_among"] == "run"
-    assert not np.allclose(d2[ins], d0[ins]) and not np.allclose(d2[~ins], box[~ins])
+    assert not np.allclose(d2[ins], d0[ins]) and np.array_equal(d2[~ins], box[~ins])
     d3, r3 = rule_depth(m, ins, box, cfg, "fesom2", straits, depth_smooth=2, strait_floor=False, log=QUIET)
     assert r3["rule"]["smooth_among"] == "insert" and np.array_equal(d3[~ins], np.maximum(box[~ins], floor))
     assert not np.allclose(d3[ins], d0[ins])
@@ -863,6 +884,32 @@ def test_depth_area_brings_the_sections_to_the_grids_area(strait, rows):
     assert dam.sum() >= rows and (bot1[dam] <= r1["sill"]["level_m"]).all()
     assert a["route_nodes"] > 0 and _deepest_connection(m, bot1) == _deepest_connection(m, bot0) == 300.0
     assert a["factor"]["max_step"] < 0.35 and a["nodes_changed"] > 50
+
+
+def test_depth_area_sections_see_the_host_depth_that_is_kept(strait):
+    """B262: the section areas are taken on the depth that is saved, the host's own depth on its nodes, not the grid
+    rule's there. The 5-row mesh with only its three inner rows as the insert's own nodes and the host's bank rows in
+    the strait at 450 m (the grid rule gives 150 m): the record's sections are the saved mesh's within 5 % (the two
+    samplings differ by about 3 %; before: the record 16 % below the saved mesh) and the saved sections within 10 %
+    of the grid's (before: 20 % above); the host nodes keep their depth."""
+    nc = strait[0]
+    m, ins, cfg, base = _wide_strait(nc, 5)
+    from meshom.insert.core import rule_depth
+
+    lo, la = xyz_to_lonlat(m.points)
+    outer = np.abs(la) > np.abs(la).max() - 1e-6
+    ins2 = ins & ~outer
+    kept = base.copy()
+    kept[outer & (np.abs(lo) < 0.45)] += 300.0
+    axis = lonlat_to_xyz(np.linspace(-0.8, 0.8, 33), np.zeros(33))
+    d1, r1 = rule_depth(m, ins2, kept, cfg, "fesom2", None, depth_at="node", depth_smooth=0, strait_floor=False,
+                        sill_level="grid", depth_channel="near", h_fine=DX, log=QUIET, depth_area=True, axis=axis)
+    assert np.array_equal(d1[~ins2], kept[~ins2]) and r1["host_kept"]["grid_rule_off_max_m"] >= 300.0 - 1e-6
+    ok = [c for c in r1["area"]["curve"] if c["ok"]]
+    for lon_at in (-0.30, -0.20, 0.30):
+        ma, g = _section_areas(m, d1, nc, lon_at)
+        k = min(ok, key=lambda c: abs(c["lonlat"][0] - lon_at))
+        assert abs(k["after_km2"] / ma - 1.0) < 0.05 and abs(ma / g - 1.0) < 0.10, (lon_at, k["after_km2"], ma, g)
 
 
 def _narrow_strait(tmp_path_factory):
@@ -1491,7 +1538,7 @@ def test_orca_depth_gebco_keeps_the_run_rules_on_the_orca_nodes(strait, tmp_path
 def test_box_factor_scales_the_node_box(strait):
     """B222: `[bathymetry] box_factor` multiplies the node box's half-width (half the node's mean edge length): 2 gives
     the box means of a box twice as wide each way (4 times the area); the default 1 is the rule as before, bit for
-    bit, in mesh_depth and in an insert's own rule."""
+    bit, in mesh_depth and in an insert's own rule (on its nodes; the others keep the depth given, B262)."""
     from meshom.bathymetry import box_means, node_spacing_m
     from meshom.insert.core import rule_depth
     from meshom.run import mesh_depth
@@ -1510,4 +1557,4 @@ def test_box_factor_scales_the_node_box(strait):
     cfg2 = _cfg(nc, box_factor=2.0)
     d, _ = rule_depth(m, ins, base, cfg2, "fesom2", None, depth_at="node", depth_smooth=0, strait_floor=False,
                       log=QUIET)
-    assert np.array_equal(d, two)
+    assert np.array_equal(d[ins], two[ins]) and np.array_equal(d[~ins], base[~ins])

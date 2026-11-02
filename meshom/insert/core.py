@@ -896,8 +896,9 @@ def rule_depth(sub: Mesh, ins: np.ndarray, base: np.ndarray, cfg, fmt: str, stra
                path: np.ndarray | None = None) -> tuple[np.ndarray, dict]:
     """An own depth rule (B211-B215) on the nodes `ins` of `sub`, a part of a mesh that holds every cell round them
     (insert_depth: the insert's own nodes; meshom.methods.m16_orca.nest_depth: the nodes inside a nest's coarse box,
-    B216); `base`: the depth of `sub`'s nodes by the run's rules (for the record only: every calculation here takes
-    its depths from the bathymetry grid, B218, never from the host's node depths). The grid rule `depth_at` ("": the
+    B216); `base`: the depth of `sub`'s nodes as the caller keeps them (on `ins` the run's rules, for the record
+    only; every other node is saved with it, so the channel raise, the dam and the section areas see it there,
+    B262; the grid rule, the channel line and the saddle take their depths from the bathymetry grid, B218). The grid rule `depth_at` ("": the
     run's), depth_quantile (B214: a quantile of the node box instead of the mean), `depth_smooth` passes among `ins`
     (None: the run's passes over the whole part), the run's slope limiter, the strait depth floors with
     `strait_floor`, the depth floor and the run's regions; then depth_channel (B213: the channel line between the two
@@ -964,6 +965,10 @@ def rule_depth(sub: Mesh, ins: np.ndarray, base: np.ndarray, cfg, fmt: str, stra
             else:
                 rec["open_water"] = open_["record"]
             log(f"{tag} open water (B253): {rec['open_water']}", flush=True)
+    host = ~ins                                               # B262: only `ins` is saved; the channel raise, the
+    rec["host_kept"] = {"nodes": int(host.sum()),             # dam and the section areas see the host's own depth
+                        "grid_rule_off_max_m": float(np.abs(d[host] - base[host]).max()) if host.any() else 0.0}
+    d = np.where(ins, d, base)
     if depth_channel or grid_like:
         h_f = h_fine if h_fine is not None else float(np.median(node_spacing_m(sub)[0][ins]))
         line = chan.channel_line(sub, ins, grid, h_f, joins=open_["joins"] if open_ else None)
@@ -1120,13 +1125,13 @@ def sill_shallower(sub: Mesh, depth: np.ndarray, ins: np.ndarray, zbar: np.ndarr
     nb[sub.tris[star[:T]].ravel()] = True
     nb[sub.quads[star[T:]].ravel()] = True
     out = depth.copy()
-    low = nb & (out > cap)
+    low = nb & (out > cap) & ins                              # B262: host nodes keep their depth
     out[low] = cap
     top = chain[int(np.argmax(depth[chain]))]
-    return out, {"held": (np.flatnonzero(nb), cap),
+    return out, {"held": (np.flatnonzero(nb & ins), cap),
                  "barrier_m": B, "level_m": L, "next_level_m": Ln, "cap_m": cap, "chain_nodes": int(len(chain)),
                  "at": [round(float(v[0]), 4) for v in xyz_to_lonlat(sub.points[top][None])],
-                 "capped": int(low.sum()), "capped_host_nodes": int((low & ~ins).sum()),
+                 "capped": int(low.sum()), "host_deeper_than_cap": int((nb & ~ins & (depth > cap)).sum()),
                  "cut_max_m": float((depth - out).max()), "nodes_star": int(nb.sum())}
 
 

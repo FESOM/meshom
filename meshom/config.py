@@ -327,7 +327,8 @@ class InsertCfg:
     gap_cells: int = 3                                 # group: the least fill cells across any passage (B243)
     split_deg: float | None = None                     # group: after fix_rings, each patch quad (an own cell, not a
                                                        # block's) whose largest corner exceeds this (deg) becomes
-                                                       # two triangles along the diagonal from that corner (B243)
+                                                       # two triangles along the diagonal from that corner (B243);
+                                                       # strait: each quad with an own node (B243)
     bank_smooth_cells: float = 0.0                     # group: each block's banks smoothed by a Gaussian of this many
                                                        # of its cells, ends held: capes cut, pockets filled (B245)
     routes: list = field(default_factory=list)        # group: [{name, a = [lon, lat], b = [lon, lat], via =

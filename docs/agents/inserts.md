@@ -96,7 +96,7 @@ h_min_m = 1000.0                   # the size floor (default: the host mesh's sm
 | `bank_smooth_cells` | 0 | group: each block bank smoothed over this many block cells, ends held: capes cut (B245) |
 | `routes` | | group: `[[inserts.routes]]` tables `name`, `a`, `b` (points in the basins at the strait's ends), optional `via`, `corridor_km`: the channel raise, the dam (across islands, every passage) and the section areas act along each route's line over blocks and patches (B246) |
 | `blend_cells` | 2 | group: the real coast blends onto a join's end node over this many join cells; 1 keeps the real coast on short coast runs (B247) |
-| `split_deg` | | group: after fix_rings, patch quads with a corner above this become two triangles (B243) |
+| `split_deg` | | group: after fix_rings, patch quads with a corner above this become two triangles; strait: every quad with an own node (B243) |
 | `growth_max` | 0.5 | group: the steepest slope with which the fill's size reaches the host's at the joins; = `growth`: one slope (B252) |
 | `even_sweeps` | 40 | group: sweeps of the pass that evens the neighbour areas of the patches, blocks and two host rings; 0: off (B252) |
 | `even_blocks` | `""` | group: the blocks' nodes in that pass: `""` move, `"cross"` the cross lines held, `"block"` every block node held (B252) |

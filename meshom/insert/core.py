@@ -170,7 +170,7 @@ def spec_from(cfg_entry, cfg=None) -> Spec:
                 e.coast_shift_cells, e.cells_a, e.cells_b, e.growth_a, e.growth_b, e.bank_land_cells,
                 [_ll(f) for f in e.fill], e.fill_rows, e.corner_steps, e.add_columns, e.corner_split, e.join_margin,
                 e.fix_rings, e.depth_at, e.depth_smooth, e.strait_floor, e.sill_level, e.depth_channel,
-                e.depth_quantile, e.depth_area, _ll(e.polygon))
+                e.depth_quantile, e.depth_area, _ll(e.polygon), split_deg=e.split_deg)
 
 
 def _path_frame(path: np.ndarray):
@@ -458,6 +458,8 @@ def insert_window(win: Window, spec: Spec, h_run, tol=0.20, gates=None, log=prin
     m = assemble.merge_net(mesh, reg, cA, cB, net, new_xyz)
     rec["merge"] = {"removed_host_elems": int(reg.sum()), "block_quads": int(m.block_q.sum()),
                     "block_tris": int(m.block_t.sum()), "inverted_block_cells": m.inverted}
+    if m.coincident:                                   # B259: block nodes on one point merged
+        rec["merge"]["coincident_nodes_merged"] = m.coincident
     sp, sh = net.samples
     h_ins = assemble.InsertH(h_run, chart.inv(sp), sh, max(g_side))     # B201: the faster side's slope
     bsx = net.bank_s if net.bank_s is not None else banks_xy[0]
@@ -1340,6 +1342,15 @@ def run(run_dir: Path, spec: Spec, out_dir: Path | None = None, mesh_name: str |
                      **{f"{w}{k}": v for k, (b, x) in enumerate(res.group_ids) for w, v in (("block", b), ("cross", x))})
         if spec.fix_rings > 0 and res.record.get("valid"):           # B210: stage a on the insert and its rings
             full, rec["fix_rings"], moved, res.window = fix_spliced(mesh, win, res, full, sinfo, spec, h_min, log)
+        if spec.kind == "strait" and res.record.get("valid") and spec.split_deg:    # B243 on a strait insert
+            from meshom.insert.group import split_obtuse
+
+            own = np.zeros(full.n_nodes, bool)
+            own[full.n_nodes - sinfo["appended_nodes"]:] = True
+            own[np.asarray(cfid, np.int64)] = False
+            full, res.window, rec["split_obtuse"] = split_obtuse(full, res.window, own, [], spec.split_deg)
+            log(f"[insert {spec.name}] split_deg {spec.split_deg:g}: {rec['split_obtuse']['split']} quads split into "
+                f"two triangles (worst corner {rec['split_obtuse']['worst_deg']:.1f} deg)", flush=True)
         if spec.kind == "group" and res.record.get("valid") and (spec.even_sweeps or spec.split_deg):
             from meshom.insert.group import even_group, split_obtuse
 

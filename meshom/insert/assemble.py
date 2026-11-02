@@ -120,6 +120,7 @@ class Merged:
     inverted: int
     host_node: np.ndarray | None = None   # (N,) bool: the node is a host window node at its own position
     join_ends: np.ndarray | None = None   # the joins' coast end nodes (cA[0], cA[-1], cB[0], cB[-1])
+    coincident: int = 0                   # B259: network nodes merged into another one on the same point
 
 
 def merge(win_mesh: Mesh, reg: np.ndarray, cA: np.ndarray, cB: np.ndarray, blk, new_xyz: np.ndarray,
@@ -143,13 +144,13 @@ def merge_net(win_mesh: Mesh, reg: np.ndarray, cA: np.ndarray, cB: np.ndarray, n
     n0 = win_mesh.n_nodes
     loc[inner] = n0 + np.arange(inner.sum())
     pts = np.vstack([win_mesh.points, new_xyz[inner]])
-    bq, bt = loc[net.quads], loc[net.tris]
+    bq, bt, cq, ct, n_co = merge_coincident(pts, loc[net.quads], loc[net.tris], np.asarray(net.core_q, bool),
+                                            np.asarray(net.core_t, bool))
     tmp = Mesh(pts, bt, bq, np.zeros(len(pts), np.int8))
     a = signed_area(tmp)
     if (a < 0).sum() > len(a) / 2:
         bq, bt = bq[:, ::-1].copy(), bt[:, ::-1].copy()
         a = -a
-    ct, cq = np.asarray(net.core_t, bool), np.asarray(net.core_q, bool)
     tris = np.vstack([win_mesh.tris[~reg[:T]], bt]).astype(np.int64)
     quads = np.vstack([win_mesh.quads[~reg[T:]], bq]).astype(np.int64)
     used = np.zeros(len(pts), bool)
@@ -164,7 +165,37 @@ def merge_net(win_mesh: Mesh, reg: np.ndarray, cA: np.ndarray, cB: np.ndarray, n
     return Merged(out, np.r_[np.zeros(kt, bool), np.ones(len(bt), bool)],
                   np.r_[np.zeros(kq, bool), np.ones(len(bq), bool)], np.r_[np.zeros(kt, bool), ct],
                   np.r_[np.zeros(kq, bool), cq], re[np.r_[cA, cB]], int((a <= 0).sum()), keep < n0,
-                  re[np.array([c[e] for c in (cA, cB) if len(c) for e in (0, -1)])])
+                  re[np.array([c[e] for c in (cA, cB) if len(c) for e in (0, -1)])], n_co)
+
+
+def merge_coincident(pts: np.ndarray, quads: np.ndarray, tris: np.ndarray, core_q: np.ndarray,
+                     core_t: np.ndarray) -> tuple:
+    """B259: the network's nodes that stand on one point (within MATCH_CHORD; the harmonic map can put the bank nodes
+    of two adjacent rows on one bank point: Tsugaru and Hormuz on ORCA025 v5) become one node, the smallest id (a
+    join's host node before an appended one); a quad with two equal adjacent corners becomes a triangle of the other
+    three, a cell left with fewer than three corners (or a quad with equal opposite corners) is dropped. No-op
+    without such nodes. Returns (quads, tris, core_q, core_t, merged node count)."""
+    u = np.unique(np.r_[quads.ravel(), tris.ravel()])
+    pr = cKDTree(pts[u]).query_pairs(MATCH_CHORD, output_type="ndarray")
+    if not len(pr):
+        return quads, tris, core_q, core_t, 0
+    _, lab = connected_components(coo_matrix((np.ones(len(pr)), (pr[:, 0], pr[:, 1])), shape=(len(u), len(u))),
+                                  directed=False)
+    first = np.full(lab.max() + 1, len(pts), np.int64)
+    np.minimum.at(first, lab, u)
+    rep = np.arange(len(pts))
+    rep[u] = first[lab]
+    q, t = rep[quads], rep[tris]
+    eq = q == np.roll(q, -1, axis=1)                         # corner k on corner k + 1
+    opp = (q[:, 0] == q[:, 2]) | (q[:, 1] == q[:, 3])
+    keep_q = ~eq.any(1) & ~opp
+    to_t = (eq.sum(1) == 1) & ~opp
+    k = np.argmax(eq[to_t], axis=1)                          # drop corner k + 1, keep the order of the rest
+    sel = (np.arange(4)[None, :] != ((k + 1) % 4)[:, None])
+    t2 = q[to_t][sel].reshape(-1, 3)
+    keep_t = (t[:, 0] != t[:, 1]) & (t[:, 1] != t[:, 2]) & (t[:, 2] != t[:, 0])
+    return (q[keep_q], np.vstack([t[keep_t], t2]).astype(np.int64), core_q[keep_q],
+            np.r_[core_t[keep_t], core_q[to_t]], int((rep[u] != u).sum()))
 
 
 class InsertH:

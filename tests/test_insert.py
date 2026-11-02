@@ -1372,3 +1372,39 @@ def test_keep_after_rule():
     assert keep_after(base, base | {"ratio_p99": 1.29})[0] is False                 # the sizes, angles tied
     assert keep_after(base, base | {"ratio_p99": 1.29, "cell_host": 0.60, "smallest_m": 7500.0})[0] is True
     assert keep_after(base, base | {"ratio_p99": 1.2770, "cell_host": 0.675})[0] is True    # within tolerances
+
+
+def test_block_nodes_on_one_point_become_one_node(monkeypatch):
+    """B259: the harmonic map put the bank nodes of two adjacent rows on one bank point (Tsugaru and Hormuz on ORCA025
+    v5); the merged window then held a quad with a zero-length edge, and the cleaning crashed (ZeroDivisionError in
+    meshom.smooth, then in the stages' node fit). The two nodes become one, the quad a triangle: the insert builds, no
+    two nodes coincide and every cell has distinct corners."""
+    from scipy.spatial import cKDTree
+
+    build = block.build
+
+    def twin_bank_node(*a, **k):
+        b = build(*a, **k)
+        b.xy[b.off[2]] = b.xy[b.off[1]]                   # rows 1 and 2 start on one point of bank S
+        return b
+
+    monkeypatch.setattr(block, "build", twin_bank_node)
+    win, ch, path = synth.banana(H=H, L=400e3)
+    r = insert_window(win, Spec("twin", path, cells=10, stages="a", bank_cap_h=10.0), Uniform(H),
+                      log=lambda *a, **k: None)
+    w = r.window
+    assert not len(cKDTree(w.points).query_pairs(1e-12))
+    assert (np.sort(w.quads, axis=1)[:, 1:] != np.sort(w.quads, axis=1)[:, :-1]).all()
+    assert (np.sort(w.tris, axis=1)[:, 1:] != np.sort(w.tris, axis=1)[:, :-1]).all()
+    assert r.ok and r.record["valid"]
+    assert r.record["merge"]["coincident_nodes_merged"] == 1
+
+
+def test_split_deg_reaches_a_strait_insert():
+    """B243 on a strait insert: `split_deg` of a strait entry reaches its Spec (run() splits its quads with an own node
+    above it after fix_rings; before, only a group's Spec took it and a strait entry's value was dropped)."""
+    from meshom.config import InsertCfg, _build
+    from meshom.insert.core import spec_from
+
+    e = _build(InsertCfg, {"name": "s", "path": [[0.0, 0.0], [1.0, 0.0]], "cells": 5, "split_deg": 120.0}, "insert")
+    assert spec_from(e).split_deg == 120.0

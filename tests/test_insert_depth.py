@@ -1006,6 +1006,35 @@ def test_depth_area_counts_only_the_strait_narrows(tmp_path_factory):
     assert all(c["ok"] for c in cur if abs(c["lonlat"][0]) < 0.4)
 
 
+def test_depth_area_factor_tapers_past_the_axis_ends(tmp_path_factory):
+    """B261: B250's factor tapers to 1 past the axis's ends as past its outer sections: an axis that ends inside the
+    strait (its outer sections at its ends) on nodes twice too deep makes the strait shallower and leaves the nodes
+    more than AREA_TAPER_H fine cells past its ends (the rest of the strait, the 400 m basins) at their depth."""
+    from meshom.bathymetry import node_depth
+    from meshom.insert.area import AREA_TAPER_H, area_depth
+
+    lon = np.arange(-1.0, 1.0, D) + D / 2
+    lat = np.arange(-0.6, 0.6, D) + D / 2
+    LO, LA = np.meshgrid(lon, lat)
+    z = np.full(LO.shape, 50.0)
+    z[(np.abs(LO) >= 0.45) & (np.abs(LA) < 0.37)] = -400.0
+    z[(np.abs(LO) < 0.45) & (np.abs(LA) < 0.06)] = -150.0
+    nc = _write_grid(tmp_path_factory.mktemp("ends") / "ends.nc", lon, lat, z)
+    m = structured_patch(64, 30, DX)
+    lo, la = xyz_to_lonlat(m.points)
+    ins = np.abs(lo) < 0.7
+    d0, _ = node_depth(m, nc, "elevation", 40.0)
+    d0 = np.where(d0 > 40.0, 40.0 + 2.0 * (d0 - 40.0), d0)
+    axis = lonlat_to_xyz(np.linspace(-0.3, 0.3, 13), np.zeros(13))
+    d1, a = area_depth(m, d0, ins, axis, np.array(ZFINE), 40.0, nc, "elevation", DX, log=QUIET)
+    assert a["applied"] and a["factor"]["max"] < 0.9
+    assert (d1[ins & (np.abs(lo) < 0.25)] < d0[ins & (np.abs(lo) < 0.25)] - 1.0).any()
+    past = np.degrees((AREA_TAPER_H + 0.5) * DX / R_EARTH_M)
+    far = ins & (np.abs(lo) > 0.3 + past)
+    assert far.sum() > 100
+    np.testing.assert_allclose(d1[far], d0[far])
+
+
 def test_depth_area_skipped_without_an_axis_and_read_from_the_config(strait):
     """B250: an insert without an axis (no profile: a strip or a corridor) keeps the other rules' depth and says so;
     `depth_area` is read from an [[inserts]] entry into the insert's Spec; the axis is the profile's centreline
@@ -1095,6 +1124,60 @@ def test_a_strait_of_one_cell_across_is_refused(depth_run_dir, tmp_path, counts)
     assert "one: 1 cell(s) across" in rec["refused"][0] and "B258" in rec["refused"][0]
     assert json.loads((tmp_path / "insert_one.json").read_text())["status"] == "refused"
     assert not (tmp_path / "insert_one.npz").exists()
+
+
+def test_an_insert_removes_elements_with_fewer_than_two_neighbours(depth_run_dir, tmp_path, monkeypatch):
+    """B260: FESOM3 refuses an element with fewer than two edge neighbours; at the end of an insert run every such
+    element goes, in passes, with the nodes no element uses any more (the depth, host_to_new and the record follow).
+    The splice here leaves a chain of two coast triangles on one host edge (as the Danish group's one-cell inlet of
+    Kalundborg Fjord): the outer has one neighbour, then the inner: two passes of one."""
+    import shutil
+
+    from meshom import compete
+    from meshom import run as runmod
+    from meshom.config import InsertCfg, _build, load
+    from meshom.insert import core
+    from meshom.mesh import Mesh, build_topology
+
+    d0, m = depth_run_dir
+    d = tmp_path / "run"
+    shutil.copytree(d0, d)
+    (d / "fesom").mkdir()
+    real_splice = core.splice
+
+    def splice(mesh, win, new):
+        full, info = real_splice(mesh, win, new)
+        topo = build_topology(full)
+        lo, la = xyz_to_lonlat(full.points)
+        bd = topo.edges[(topo.edge_elems[:, 1] < 0) & (lo[topo.edges].max(1) < -0.7) & (la[topo.edges].min(1) > 0.0)]
+        a, b = bd[0]                                       # a host coast edge far from the insert, north side
+        out = 1.0 if la[a] > 0.05 else -1.0
+        mid = np.array([(lo[a] + lo[b]) / 2, (la[a] + la[b]) / 2])
+        c = lonlat_to_xyz(np.array([mid[0], lo[b]]), np.array([mid[1] + 0.01 * out, la[b] + 0.012 * out]))
+        n = full.n_nodes
+        tris = np.vstack([full.tris, [[a, b, n], [b, n + 1, n]]])
+        full = Mesh(np.vstack([full.points, c]), tris, full.quads, np.r_[full.node_flag, [1, 1]].astype(np.int8))
+        info = info | {"nodes": n + 2, "appended_nodes": info["appended_nodes"] + 2}
+        return full, info
+
+    def no_files(mesh, fmt, path, depth, level_set):
+        assert len(depth) == mesh.n_nodes
+        return {}
+
+    monkeypatch.setattr(core, "splice", splice)
+    monkeypatch.setattr(runmod, "write_files", no_files)
+    e = _build(InsertCfg, {"name": "de", "path": [[-0.6, 0.0], [0.6, 0.0]], "cells": 6, "h_min_m": 1000.0,
+                           "coast": "host"}, "insert")
+    rec = core.run(d, core.spec_from(e, load(d / "config.resolved.toml")), tmp_path / "o", log=QUIET)
+    assert rec["status"] == "ok"
+    out = compete._load(tmp_path / "o" / "insert_de.npz")
+    assert (build_topology(out).elem_neighbours >= 2).all()
+    assert rec["deadends"]["passes"] == [1, 1] and rec["deadends"]["removed"] == 2
+    assert rec["deadends"]["nodes_removed"] == 2
+    assert len(np.load(tmp_path / "o" / "fesom-insert_de" / "depth.npy")) == out.n_nodes
+    h2n = np.load(tmp_path / "o" / "insert_de.host_to_new.npy")
+    kept = h2n >= 0
+    assert np.allclose(out.points[h2n[kept]], m.points[kept])
 
 
 def test_depth_region_on_the_plain_host(strait, depth_run_dir, tmp_path):

@@ -110,6 +110,39 @@ def splice(mesh: Mesh, win: Window, new: Mesh, tri_zone_new: np.ndarray | None =
     return out, info
 
 
+def drop_deadends(mesh: Mesh) -> tuple[Mesh, np.ndarray, dict]:
+    """FESOM3's dead-end rule (B260, as meshom's ORCA rule 12): passes until no element has fewer than two edge
+    neighbours, each pass removing every such element; the nodes of a removed element that stay get flag 1, nodes no
+    element uses any more go; nodes and elements keep their order. Returns (mesh, old_to_new (-1: dropped), record
+    {"passes", "removed", "nodes_removed", "at": the removed elements' centres [lon, lat]})."""
+    from meshom.geo import xyz_to_lonlat
+
+    o2n = np.arange(mesh.n_nodes, dtype=np.int64)
+    passes, at = [], []
+    while True:
+        dead = build_topology(mesh).elem_neighbours < 2
+        if not dead.any():
+            break
+        T = mesh.n_tris
+        passes.append(int(dead.sum()))
+        gone = [mesh.tris[i] if i < T else mesh.quads[i - T] for i in np.flatnonzero(dead)]
+        lo, la = xyz_to_lonlat(np.array([mesh.points[e].mean(0) for e in gone]))
+        at += np.round(np.c_[lo, la], 5).tolist()
+        flag = mesh.node_flag.copy()
+        flag[np.concatenate(gone)] = 1
+        tris, quads = mesh.tris[~dead[:T]], mesh.quads[~dead[T:]]
+        used = np.zeros(mesh.n_nodes, bool)
+        used[tris.ravel()] = True
+        used[quads.ravel()] = True
+        new = np.full(mesh.n_nodes, -1, np.int64)
+        new[used] = np.arange(int(used.sum()))
+        tz = None if mesh.tri_zone is None else np.asarray(mesh.tri_zone)[~dead[:T]]
+        mesh = Mesh(mesh.points[used], new[tris].reshape(-1, 3), new[quads].reshape(-1, 4), flag[used], tz)
+        o2n = np.where(o2n >= 0, new[np.maximum(o2n, 0)], -1)
+    return mesh, o2n, {"passes": passes, "removed": int(sum(passes)), "nodes_removed": int((o2n < 0).sum()),
+                       "at": at}
+
+
 @dataclass
 class Graph:
     edges: np.ndarray            # (E,2)

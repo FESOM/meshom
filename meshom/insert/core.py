@@ -15,7 +15,7 @@ from scipy.spatial import cKDTree
 from meshom.geo import R_EARTH_M, arc_length, lonlat_to_xyz, xyz_to_lonlat
 from meshom.insert import assemble, block, measure, region
 from meshom.insert.geom import Axis, Chart, Polyline, smooth_bank
-from meshom.insert.host import Window, coast_neighbours, cut_window, graph, splice
+from meshom.insert.host import Window, coast_neighbours, cut_window, drop_deadends, graph, splice
 from meshom.insert.region import MIN_CELLS_ACROSS, InsertError
 from meshom.mesh import Mesh
 
@@ -1269,7 +1269,8 @@ def run(run_dir: Path, spec: Spec, out_dir: Path | None = None, mesh_name: str |
     insert's own rule, B211-B215; on another insert's result its saved depth on the host nodes, B217). With fix_rings
     the spliced mesh is smoothed first (fix_spliced, B210). Also <out>/insert_<name>.host_to_new.npy (host node id ->
     id in the result, -1 dropped) and .collar_moved.npy (2, K): the ids in the result and the host ids of the host
-    nodes the collar moved (B217). Returns the record."""
+    nodes the collar moved (B217). At the end every element with fewer than two edge neighbours goes (B260,
+    drop_deadends). Returns the record."""
     from meshom import compete
     from meshom import run as runmod
     from meshom.config import load as load_cfg
@@ -1401,12 +1402,9 @@ def run(run_dir: Path, spec: Spec, out_dir: Path | None = None, mesh_name: str |
         stem.with_suffix(".json").write_text(json.dumps(_jsonable(rec), indent=1))
         return rec
     h2n = sinfo.pop("host_to_new")
-    np.save(stem.parent / (stem.name + ".host_to_new.npy"), h2n)
-    np.save(stem.parent / (stem.name + ".collar_moved.npy"), np.stack([cfid, chid]))
     rec["splice"] = sinfo
-    rec["validity"] = {"host": measure.validity(mesh), "final": measure.validity(full)}
-    compete._save(full, stem.with_suffix(".npz"))
     rec["status"] = "ok" if res.record.get("valid") else "invalid"
+    depth = None
     if write and rec["status"] == "ok" and (run_dir / "fesom").exists():
         t = time.perf_counter()
         fmt = cfg.mesh.format
@@ -1433,6 +1431,26 @@ def run(run_dir: Path, spec: Spec, out_dir: Path | None = None, mesh_name: str |
             depth, rec["depth"]["branches"] = branch_depth(
                 full, depth, res.group_ids, cfg, spec.sill_level, spec.depth_channel,
                 [c["cell_min_km"] * 1e3 for c in res.record["channels"]], log, f"[insert {spec.name}]")
+    full, o2n, rec["deadends"] = drop_deadends(full)            # B260: FESOM3 refuses an element with < 2 neighbours
+    if rec["deadends"]["removed"]:
+        log(f"[insert {spec.name}] dead ends: {rec['deadends']['removed']} element(s) with fewer than two edge "
+            f"neighbours removed in {len(rec['deadends']['passes'])} pass(es), {rec['deadends']['nodes_removed']} "
+            f"node(s) with them, at {rec['deadends']['at']}", flush=True)
+        h2n = np.where(h2n >= 0, o2n[np.maximum(h2n, 0)], -1)
+        cfid, chid = np.asarray(cfid, np.int64), np.asarray(chid, np.int64)
+        keep = o2n[cfid] >= 0
+        cfid, chid = o2n[cfid[keep]], chid[keep]
+        if depth is not None:
+            depth = depth[o2n >= 0]
+        if getattr(res, "group_ids", None) is not None:              # B244's block ids, renumbered
+            g = [tuple(o2n[np.asarray(v, np.int64)] for v in bx) for bx in res.group_ids]
+            np.savez(stem.parent / (stem.name + ".group.npz"),
+                     **{f"{w}{k}": v[v >= 0] for k, (b, x) in enumerate(g) for w, v in (("block", b), ("cross", x))})
+    np.save(stem.parent / (stem.name + ".host_to_new.npy"), h2n)
+    np.save(stem.parent / (stem.name + ".collar_moved.npy"), np.stack([cfid, chid]))
+    rec["validity"] = {"host": measure.validity(mesh), "final": measure.validity(full)}
+    compete._save(full, stem.with_suffix(".npz"))
+    if depth is not None:
         fdir = out_dir / f"fesom-insert_{spec.name}"
         fdir.mkdir(exist_ok=True)
         np.save(fdir / "depth.npy", depth)

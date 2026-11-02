@@ -416,6 +416,11 @@ def area_depth(sub: Mesh, depth: np.ndarray, ins: np.ndarray, axis: np.ndarray, 
     sig = AREA_SMOOTH_H * h_fine / max(st[1] - st[0], 1e-9) if len(st) > 1 else 0.0
     taper = AREA_TAPER_H * h_fine
     lg = np.log(AREA_FACTOR)
+    past = np.zeros(sub.n_nodes)                           # B261: a node's arc past an end of the axis
+    for k_ in (0, len(dense) - 1):
+        m_ = jn == k_
+        past[m_] = 2.0 * np.arcsin(np.minimum(np.linalg.norm(sub.points[m_] - pd[k_], axis=1) / 2.0, 1.0)) * R_EARTH_M
+    w_end = np.clip(1.0 - past / taper, 0.0, 1.0)
 
     def field(g):
         G = np.interp(st, st[iv], g)
@@ -424,7 +429,7 @@ def area_depth(sub: Mesh, depth: np.ndarray, ins: np.ndarray, axis: np.ndarray, 
         return gaussian_filter1d(G, sig, mode="nearest") if sig > 0 else G
 
     def apply(G):
-        f = np.exp(np.interp(s_ax, st, G))
+        f = np.exp(np.interp(s_ax, st, G) * w_end)
         d = d0.copy()
         d[own] = np.maximum(floor_m + (d0[own] - floor_m) * f[own], lb[own])
         if cap is not None:

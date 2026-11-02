@@ -125,6 +125,7 @@ coast shift against the real coast), `insert_<name>.score.json`, `insert_<name>.
 `insert_<name>.profile.png`, `insert_<name>.collar.png`, and `fesom-insert_<name>/` (model files of the whole mesh,
 depth by the run's rules) when the run wrote model files.
 
+- Every element left with fewer than two edge neighbours (FESOM3 refuses one) is removed at the end, in passes, with the nodes no element uses any more; `deadends` in the record counts them (B260).
 - Exit code 0 when every entry was built, 2 when one was refused (also when a rule fails after the joins were
   chosen, forced ones included: B254).
 - `status`: `ok` (valid), `refused` (a rule failed: no mesh), `invalid` (built but failed the validity gate, e.g.
@@ -192,7 +193,8 @@ grid lines as they are. Choose in this order; the worked examples are the `gibra
    shallow strait whose banks moved into land (Dover) and a strait with 3-4 cells across and its capes cut (Bab el
    Mandeb: the channel's cells fill most of the section) stay larger than the bathymetry's (B250). Gibraltar: the
    sections on its narrows off by 13 % on average -> 6.5 %, the section at 5.53 W 1.13 -> 0.95 x GEBCO, the deepest
-   connection 280 m before and after.
+   connection 280 m before and after. Past either end of the axis (a group's route ends in its basins) the factor
+   tapers to 1 within two fine cells, so the basins beyond keep their depth (B261).
 
 Gibraltar with this recipe (the `gibraltar` entry): neck 14.7 km, smallest cell 2.51 km, worst quad 106 deg, 0 above
 110 deg, the insert's cells at most 0.93 x the host cell next to them; at 5.75 W 29 km wide (GEBCO 30 km), 5.0 km^2 in
@@ -407,4 +409,5 @@ of its nodes' levels) leaves a channel one or two levels shallower than its dam.
 - Decisions: B158-B169, B180-B186, B190, B192-B223.
 - Decisions: B158-B169, B180-B186, B190, B192-B212, B240-B249, B252.
 - Decisions: B254 (a refusal after the joins is a record, exit code 2), B255, B256, B257 (group inserts), B258 (at
-  least 2 cells across every channel), B259 (block nodes on one point merged).
+  least 2 cells across every channel), B259 (block nodes on one point merged), B260 (no element with fewer
+  than two edge neighbours), B261 (the section-area factor tapers to 1 past the axis's ends).
